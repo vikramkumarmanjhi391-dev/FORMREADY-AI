@@ -144,7 +144,7 @@ object PortalDatabase {
             category = "Civil Services",
             officialUrl = "https://onlinebpsc.bihar.gov.in",
             sourceDocumentTitle = "BPSC Online Application Guidelines and Dimensions",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v1.8",
             documents = listOf(
@@ -398,7 +398,7 @@ object PortalDatabase {
             category = "RTPS / Services",
             officialUrl = "https://serviceonline.bihar.gov.in",
             sourceDocumentTitle = "Bihar RTPS Document Attachment Guidelines",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v1.5",
             documents = listOf(
@@ -446,7 +446,7 @@ object PortalDatabase {
             category = "Identity",
             officialUrl = "https://passportindia.gov.in",
             sourceDocumentTitle = "Passport Seva Photo Specifications and Document Upload Rules",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Jan 2025",
             version = "v2.2",
             documents = listOf(
@@ -489,9 +489,9 @@ object PortalDatabase {
             year = "2025",
             category = "RTPS / Services",
             officialUrl = "https://sarathi.parivahan.gov.in",
-            sourceDocumentTitle = "Parivahan Citizen Portal Upload Parameters",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
-            lastVerifiedDate = "Jan 2025",
+            sourceDocumentTitle = "Parivahan Citizen Portal Upload Parameters (State-specific variations)",
+            verificationStatus = VerificationStatus.NEEDS_REVERIFICATION,
+            lastVerifiedDate = "Mid 2024 (Re-verify with state RTO)",
             version = "v1.9",
             documents = listOf(
                 DocumentRule(

@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Security
@@ -67,6 +68,7 @@ fun StatusBadge(
         VerificationStatus.OFFICIALLY_VERIFIED -> Triple(Color(0xFFE8F5E9), VerifiedGreen, Icons.Default.Verified)
         VerificationStatus.OFFICIAL_SOURCE_REVIEW -> Triple(Color(0xFFFFF3E0), WarningAmber, Icons.Default.Info)
         VerificationStatus.USER_SUPPLIED -> Triple(Color(0xFFE3F2FD), InfoBlue, Icons.Default.Description)
+        VerificationStatus.UNVERIFIED_RULE -> Triple(Color(0xFFEDE7F6), Color(0xFF5E35B1), Icons.Default.HelpOutline)
         VerificationStatus.NEEDS_REVERIFICATION -> Triple(Color(0xFFFFEBEE), ErrorRed, Icons.Default.Warning)
         VerificationStatus.OUTDATED -> Triple(Color(0xFFECEFF1), Color.Gray, Icons.Default.Error)
     }
@@ -179,11 +181,19 @@ fun PortalCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Source: ${portal.lastVerifiedDate}",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Column {
+                    Text(
+                        text = "Source: ${portal.sourceDocumentTitle.take(30)}…",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "Verified: ${portal.lastVerifiedDate}",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
 
                 Button(
                     onClick = onPrepareClick,

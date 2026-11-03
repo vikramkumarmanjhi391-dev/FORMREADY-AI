@@ -5,7 +5,6 @@ import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -30,14 +29,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.OpenInBrowser
-import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Verified
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -71,12 +70,14 @@ import com.example.data.model.DocumentType
 import com.example.data.model.FileFormat
 import com.example.data.model.LockerItem
 import com.example.ui.theme.EmeraldTertiary
-import com.example.ui.theme.InfoBlue
 import com.example.ui.theme.NavyPrimary
 import com.example.ui.theme.SaffronSecondary
 import com.example.ui.theme.VerifiedGreen
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
 
 @Composable
@@ -87,56 +88,8 @@ fun DocumentLockerScreen() {
     var selectedCategory by remember { mutableStateOf("All") }
     val categories = listOf("All", "Identity", "Education", "Reservation", "Disability", "Employment")
 
-    val lockerItems = remember {
-        mutableStateListOf(
-            LockerItem(
-                id = "doc_aadhaar_01",
-                title = "Aadhaar Card (Original PDF)",
-                documentType = DocumentType.AADHAAR_CARD,
-                filePath = "",
-                fileFormat = FileFormat.PDF,
-                fileSizeKb = 340.0,
-                notes = "Masked Aadhaar copy with last 4 digits visible",
-                isMasked = true
-            ),
-            LockerItem(
-                id = "doc_pan_02",
-                title = "PAN Card Copy",
-                documentType = DocumentType.PAN_CARD,
-                filePath = "",
-                fileFormat = FileFormat.JPG,
-                fileSizeKb = 120.0,
-                notes = "Self-attested scan copy"
-            ),
-            LockerItem(
-                id = "doc_c10_03",
-                title = "Class 10 CBSE Marksheet",
-                documentType = DocumentType.CLASS_10_MARKSHEET,
-                filePath = "",
-                fileFormat = FileFormat.PDF,
-                fileSizeKb = 250.0,
-                notes = "Date of Birth proof document"
-            ),
-            LockerItem(
-                id = "doc_obc_04",
-                title = "OBC-NCL Certificate (Central Format)",
-                documentType = DocumentType.CASTE_OBC_NCL_CENTRAL,
-                filePath = "",
-                fileFormat = FileFormat.PDF,
-                fileSizeKb = 290.0,
-                notes = "Valid for UPSC & Central recruitment 2025"
-            ),
-            LockerItem(
-                id = "doc_domicile_05",
-                title = "Residential / Domicile Certificate",
-                documentType = DocumentType.DOMICILE_RESIDENCE,
-                filePath = "",
-                fileFormat = FileFormat.PDF,
-                fileSizeKb = 180.0,
-                notes = "Issued by Circle Officer / SDO"
-            )
-        )
-    }
+    // Real on-device locker records without fake sample placeholders
+    val lockerItems = remember { mutableStateListOf<LockerItem>() }
 
     var showAddDialog by remember { mutableStateOf(false) }
     var showAadhaarStudioDialog by remember { mutableStateOf(false) }
@@ -185,7 +138,7 @@ fun DocumentLockerScreen() {
                                 color = MaterialTheme.colorScheme.onPrimary
                             )
                             Text(
-                                text = "Secure on-device vault • Reuse documents across all exams",
+                                text = "Private on-device storage • Store & reuse documents across exams",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.85f)
                             )
@@ -213,11 +166,12 @@ fun DocumentLockerScreen() {
                             onClick = { showAddDialog = true },
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
                             border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.5f)),
-                            shape = RoundedCornerShape(10.dp)
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.testTag("add_doc_to_locker_btn")
                         ) {
                             Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Add Doc", fontSize = 12.sp)
+                            Text("Add Document", fontSize = 12.sp)
                         }
                     }
                 }
@@ -249,55 +203,122 @@ fun DocumentLockerScreen() {
             Spacer(modifier = Modifier.height(6.dp))
         }
 
-        items(filteredItems) { item ->
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 5.dp),
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+        if (filteredItems.isEmpty()) {
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 12.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(28.dp)
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer,
-                                modifier = Modifier.size(36.dp)
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = Icons.Default.Description,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                        modifier = Modifier.size(18.dp)
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                            modifier = Modifier.size(60.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.FolderOpen,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(30.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Text(
+                            text = "Your Document Locker is Empty",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        Text(
+                            text = "No documents stored yet. Save your genuine certificates, marksheets, and identity proofs here to reuse them quickly across UPSC, SSC, and state applications.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Button(
+                            onClick = { showAddDialog = true },
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Store a Real Document", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        } else {
+            items(filteredItems) { item ->
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 5.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                    modifier = Modifier.size(36.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Default.Description,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(item.title, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    Text(
+                                        text = "${item.documentType.category} • ${item.fileFormat.extension.uppercase()} (${String.format(Locale.US, "%.1f", item.fileSizeKb)} KB)",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Column {
-                                Text(item.title, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                Text("${item.documentType.category} • ${item.fileFormat.extension.uppercase()} (${String.format(Locale.US, "%.0f", item.fileSizeKb)} KB)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                            IconButton(onClick = { lockerItems.remove(item) }) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = "Delete",
+                                    tint = Color.Gray,
+                                    modifier = Modifier.size(18.dp)
+                                )
                             }
                         }
 
-                        if (item.isMasked) {
-                            Surface(
-                                color = Color(0xFFE8F5E9),
-                                shape = RoundedCornerShape(6.dp)
-                            ) {
-                                Text("Masked", color = VerifiedGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
-                            }
+                        if (item.notes.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text("Note: ${item.notes}", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
                         }
-                    }
-
-                    if (item.notes.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text("Note: ${item.notes}", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
@@ -422,10 +443,43 @@ fun AddDocumentDialog(
     onDismiss: () -> Unit,
     onAdd: (LockerItem) -> Unit
 ) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
     var title by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     var selectedType by remember { mutableStateOf(DocumentType.CLASS_10_MARKSHEET) }
-    var isMasked by remember { mutableStateOf(false) }
+    var pickedFileUri by remember { mutableStateOf<Uri?>(null) }
+    var measuredFileSizeBytes by remember { mutableStateOf(0L) }
+    var detectedFormat by remember { mutableStateOf(FileFormat.PDF) }
+
+    val filePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            pickedFileUri = uri
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    val stream = context.contentResolver.openInputStream(uri)
+                    val bytes = stream?.readBytes()
+                    stream?.close()
+                    if (bytes != null) {
+                        measuredFileSizeBytes = bytes.size.toLong()
+                        val mime = context.contentResolver.getType(uri) ?: ""
+                        detectedFormat = if (mime.contains("png", ignoreCase = true)) {
+                            FileFormat.PNG
+                        } else if (mime.contains("jpg", ignoreCase = true) || mime.contains("jpeg", ignoreCase = true)) {
+                            FileFormat.JPG
+                        } else {
+                            FileFormat.PDF
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -436,7 +490,7 @@ fun AddDocumentDialog(
                     value = title,
                     onValueChange = { title = it },
                     label = { Text("Document Title") },
-                    placeholder = { Text("e.g. Class 12 Certificate") },
+                    placeholder = { Text("e.g. Class 10 Passing Certificate") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
@@ -446,29 +500,47 @@ fun AddDocumentDialog(
                     value = notes,
                     onValueChange = { notes = it },
                     label = { Text("Notes (Optional)") },
-                    placeholder = { Text("e.g. Issued 2024, valid for all UPSC exams") },
+                    placeholder = { Text("e.g. Verified copy for UPSC 2025") },
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedButton(
+                    onClick = { filePicker.launch(arrayOf("application/pdf", "image/jpeg", "image/png")) },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        if (pickedFileUri != null) "File Attached (${String.format(Locale.US, "%.1f", measuredFileSizeBytes / 1024.0)} KB)"
+                        else "Attach Genuine Document File"
+                    )
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
+                    val actualKb = (measuredFileSizeBytes / 1024.0).coerceAtLeast(0.1)
                     val item = LockerItem(
                         id = "user_doc_${System.currentTimeMillis()}",
                         title = title.ifBlank { "Saved Document" },
                         documentType = selectedType,
-                        filePath = "",
-                        fileFormat = FileFormat.PDF,
-                        fileSizeKb = 200.0,
+                        filePath = pickedFileUri?.toString() ?: "",
+                        uriString = pickedFileUri?.toString(),
+                        fileFormat = detectedFormat,
+                        fileSizeKb = actualKb,
                         notes = notes,
-                        isMasked = isMasked
+                        isMasked = false
                     )
                     onAdd(item)
                 },
+                enabled = title.isNotBlank() && pickedFileUri != null,
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Text("Save")
+                Text("Save to Vault")
             }
         },
         dismissButton = {

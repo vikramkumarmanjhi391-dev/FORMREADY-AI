@@ -52,8 +52,18 @@ enum class VerificationStatus(val label: String, val isOfficiallyVerified: Boole
     OFFICIALLY_VERIFIED("Officially Verified", true),
     OFFICIAL_SOURCE_REVIEW("Official Source Found (Review)", false),
     USER_SUPPLIED("User Supplied", false),
+    UNVERIFIED_RULE("Unverified Rule", false),
     NEEDS_REVERIFICATION("Needs Re-verification", false),
     OUTDATED("Outdated / Archive", false)
+}
+
+enum class PreparationStatus(val label: String) {
+    SUCCESS_PREPARED("Successfully Prepared"),
+    SIZE_EXCEEDED("File Size Exceeded"),
+    SIZE_BELOW_MIN("File Size Too Small"),
+    DIMENSIONS_MISMATCH("Dimensions Mismatch"),
+    CONFLICT_LIMITS("Requirements Conflict"),
+    FAILED("Processing Failed")
 }
 
 data class DocumentRule(
@@ -108,7 +118,11 @@ data class ProcessedFileResult(
     val heightPx: Int,
     val pageCount: Int = 1,
     val isCompliant: Boolean,
-    val validationMessages: List<String>
+    val validationMessages: List<String>,
+    val status: PreparationStatus = if (isCompliant) PreparationStatus.SUCCESS_PREPARED else PreparationStatus.SIZE_EXCEEDED,
+    val aspectRatio: Float = if (heightPx > 0) widthPx.toFloat() / heightPx.toFloat() else 1.0f,
+    val hasConflict: Boolean = false,
+    val conflictReason: String? = null
 )
 
 data class ValidationIssue(

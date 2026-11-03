@@ -29,12 +29,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -51,6 +52,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -71,13 +73,20 @@ import com.example.data.model.ColorMode
 import com.example.data.model.DocumentRule
 import com.example.data.model.DocumentType
 import com.example.data.model.FileFormat
+import com.example.data.model.PreparationStatus
 import com.example.data.model.ProcessedFileResult
 import com.example.processing.ImageProcessor
 import com.example.ui.theme.EmeraldTertiary
 import com.example.ui.theme.NavyPrimary
 import com.example.ui.theme.SaffronSecondary
+import com.example.ui.theme.VerifiedGreen
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 data class SignaturePreset(
@@ -96,8 +105,9 @@ val SIGNATURE_PRESETS = listOf(
     SignaturePreset("BPSC English Sign", DocumentType.SIGNATURE_ENGLISH, 220, 100, 5, 15, "Strictly under 15 KB"),
     SignaturePreset("BPSC Hindi Sign (हस्ताक्षर)", DocumentType.SIGNATURE_HINDI, 220, 100, 5, 15, "Hindi signature under 15 KB"),
     SignaturePreset("Left Thumb (LTI)", DocumentType.THUMB_IMPRESSION_LEFT, 240, 240, 20, 50, "Left thumb impression 20-50 KB"),
+    SignaturePreset("Right Thumb (RTI)", DocumentType.THUMB_IMPRESSION_RIGHT, 240, 240, 20, 50, "Right thumb impression 20-50 KB"),
     SignaturePreset("CTET Sign (35x15 mm)", DocumentType.SIGNATURE_ENGLISH, 350, 150, 3, 30, "3.5 x 1.5 cm format"),
-    SignaturePreset("Custom Size", DocumentType.SIGNATURE_ENGLISH, 200, 100, 10, 30, "Custom width, height, and KB")
+    SignaturePreset("Custom Dimensions", DocumentType.SIGNATURE_ENGLISH, 200, 100, 10, 30, "Custom width, height, and KB")
 )
 
 @Composable
@@ -112,13 +122,19 @@ fun SignatureStudioScreen(
     var isProcessing by remember { mutableStateOf(false) }
 
     var selectedPreset by remember { mutableStateOf(SIGNATURE_PRESETS[0]) }
-    var autoCropBlankMargins by remember { mutableStateOf(true) }
-    var enhanceContrastWhiteBg by remember { mutableStateOf(true) }
 
-    var customWidthPx by remember { mutableIntStateOf(140) }
-    var customHeightPx by remember { mutableIntStateOf(60) }
+    var autoCropBlankMargins by remember { mutableStateOf(true) }
+    var preserveInkColor by remember { mutableStateOf(true) }
+    var contrastFactor by remember { mutableFloatStateOf(1.2f) }
+    var inkThreshold by remember { mutableIntStateOf(180) }
+
+    var customWidthPx by remember { mutableStateOf("140") }
+    var customHeightPx by remember { mutableStateOf("60") }
     var targetMinKb by remember { mutableIntStateOf(10) }
     var targetMaxKb by remember { mutableIntStateOf(20) }
+    var selectedFormat by remember { mutableStateOf(FileFormat.JPG) }
+
+    var saveStatusMessage by remember { mutableStateOf<String?>(null) }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -129,6 +145,42 @@ fun SignatureStudioScreen(
                 if (bmp != null) {
                     sourceBitmap = bmp
                     processedResult = null
+                    saveStatusMessage = null
+                } else {
+                    Toast.makeText(context, "Could not open selected signature image.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    // Storage Access Framework: Save to Device
+    val saveDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument(selectedFormat.mimeType)
+    ) { destinationUri: Uri? ->
+        if (destinationUri != null && processedResult != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    val srcFile = File(processedResult!!.processedFilePath)
+                    if (srcFile.exists()) {
+                        context.contentResolver.openOutputStream(destinationUri)?.use { outStream ->
+                            FileInputStream(srcFile).use { inStream ->
+                                inStream.copyTo(outStream)
+                            }
+                        }
+                        withContext(Dispatchers.Main) {
+                            saveStatusMessage = "Successfully saved signature to device (${String.format(Locale.US, "%.1f", processedResult!!.fileSizeKb)} KB)"
+                            Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "Processed file not found. Please reprocess.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }
@@ -150,14 +202,14 @@ fun SignatureStudioScreen(
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                text = "Auto-crop blank white margins, clean paper shadows, darken ink, and compress to exact KB limits for English, Hindi, and Thumb impressions.",
+                text = "Auto-crop blank white margins, clean paper shadows, darken ink without losing fine strokes, and compress strictly to portal limits.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Preview Box
+            // Signature Display Box
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -168,16 +220,34 @@ fun SignatureStudioScreen(
             ) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     if (sourceBitmap != null) {
+                        val displayBmp = processedResult?.processedFilePath?.let { File(it) }?.takeIf { it.exists() }?.let {
+                            android.graphics.BitmapFactory.decodeFile(it.absolutePath)
+                        } ?: sourceBitmap
+
                         Image(
-                            bitmap = (processedResult?.processedFilePath?.let { File(it) }?.takeIf { it.exists() }?.let {
-                                android.graphics.BitmapFactory.decodeFile(it.absolutePath)
-                            } ?: sourceBitmap)!!.asImageBitmap(),
+                            bitmap = displayBmp!!.asImageBitmap(),
                             contentDescription = "Signature Preview",
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(12.dp),
                             contentScale = ContentScale.Fit
                         )
+
+                        Surface(
+                            color = if (processedResult != null) EmeraldTertiary else NavyPrimary,
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(10.dp)
+                        ) {
+                            Text(
+                                text = if (processedResult != null) "Cleaned & Verified" else "Original Sample",
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
                     } else {
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
@@ -205,7 +275,7 @@ fun SignatureStudioScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Black or blue ink on plain white paper",
+                                text = "Blue/black pen ink on clean white paper. Original file is never modified.",
                                 fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -242,8 +312,8 @@ fun SignatureStudioScreen(
                         selected = selectedPreset.title == preset.title,
                         onClick = {
                             selectedPreset = preset
-                            customWidthPx = preset.widthPx
-                            customHeightPx = preset.heightPx
+                            customWidthPx = preset.widthPx.toString()
+                            customHeightPx = preset.heightPx.toString()
                             targetMinKb = preset.minKb
                             targetMaxKb = preset.maxKb
                         },
@@ -255,7 +325,7 @@ fun SignatureStudioScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Signature Clean-up Settings
+            // Signature Tuning & Controls
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -263,7 +333,7 @@ fun SignatureStudioScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "Smart Signature Tuning",
+                        text = "Signature Cleanup & Controls",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold
                     )
@@ -277,7 +347,7 @@ fun SignatureStudioScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Auto-Crop Blank Margins", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Detects inked area and crops out empty paper borders", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Detects inked boundary and removes empty outer margins", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Switch(
                             checked = autoCropBlankMargins,
@@ -293,19 +363,71 @@ fun SignatureStudioScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Whiten Background & Deepen Ink", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Removes desk shadows, enhances contrast for clear portal upload", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Preserve Pen Ink Color", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Whitens paper background while keeping blue/black ink tones", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Switch(
-                            checked = enhanceContrastWhiteBg,
-                            onCheckedChange = { enhanceContrastWhiteBg = it }
+                            checked = preserveInkColor,
+                            onCheckedChange = { preserveInkColor = it }
                         )
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Text(
-                        text = "Target Size: $targetMinKb - $targetMaxKb KB • Dimensions: $customWidthPx x $customHeightPx px",
+                        text = "Ink Contrast Boost: ${String.format(Locale.US, "%.1f", contrastFactor)}x",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Slider(
+                        value = contrastFactor,
+                        onValueChange = { contrastFactor = it },
+                        valueRange = 0.8f..2.2f,
+                        steps = 14,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Text(
+                        text = "Paper Whitening Threshold: $inkThreshold",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Slider(
+                        value = inkThreshold.toFloat(),
+                        onValueChange = { inkThreshold = it.toInt() },
+                        valueRange = 120f..230f,
+                        steps = 22,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = customWidthPx,
+                            onValueChange = { customWidthPx = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("Width (px)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true
+                        )
+                        OutlinedTextField(
+                            value = customHeightPx,
+                            onValueChange = { customHeightPx = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("Height (px)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Text(
+                        text = "Target KB Range: $targetMinKb - $targetMaxKb KB",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
@@ -323,7 +445,7 @@ fun SignatureStudioScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Process Actions
+            // Action Buttons
             if (sourceBitmap != null) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -331,30 +453,43 @@ fun SignatureStudioScreen(
                 ) {
                     Button(
                         onClick = {
+                            val w = customWidthPx.toIntOrNull() ?: 140
+                            val h = customHeightPx.toIntOrNull() ?: 60
+
+                            if (w <= 0 || h <= 0) {
+                                Toast.makeText(context, "Please enter valid positive dimensions.", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+
                             coroutineScope.launch {
                                 isProcessing = true
-                                var bmp = sourceBitmap!!
-                                if (enhanceContrastWhiteBg) {
-                                    bmp = ImageProcessor.applyMagicDocFilter(bmp)
-                                }
+                                saveStatusMessage = null
+
                                 val rule = DocumentRule(
                                     id = "sign_rule_${System.currentTimeMillis()}",
                                     documentType = selectedPreset.type,
+                                    allowedFormats = listOf(selectedFormat),
                                     minKb = targetMinKb,
                                     maxKb = targetMaxKb,
-                                    exactWidthPx = customWidthPx,
-                                    exactHeightPx = customHeightPx,
-                                    targetAspectRatio = customWidthPx.toFloat() / customHeightPx.toFloat(),
+                                    exactWidthPx = w,
+                                    exactHeightPx = h,
+                                    targetAspectRatio = w.toFloat() / h.toFloat(),
                                     requiresWhiteBackground = true
                                 )
+
                                 processedResult = ImageProcessor.processImageForRule(
                                     context = context,
-                                    originalBitmap = bmp,
+                                    originalBitmap = sourceBitmap!!,
                                     rule = rule,
-                                    autoCropMargins = autoCropBlankMargins
+                                    customTargetKb = targetMaxKb,
+                                    customWidthPx = w,
+                                    customHeightPx = h,
+                                    autoCropMargins = autoCropBlankMargins,
+                                    contrastFactor = contrastFactor,
+                                    inkThreshold = inkThreshold,
+                                    preserveInkColor = preserveInkColor
                                 )
                                 isProcessing = false
-                                Toast.makeText(context, "Signature ready: ${String.format(Locale.US, "%.1f", processedResult?.fileSizeKb)} KB", Toast.LENGTH_SHORT).show()
                             }
                         },
                         enabled = !isProcessing,
@@ -362,13 +497,13 @@ fun SignatureStudioScreen(
                         modifier = Modifier.weight(1f).testTag("process_signature_btn")
                     ) {
                         if (isProcessing) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Processing...")
+                            Text("Processing...", fontSize = 12.sp)
                         } else {
                             Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Process & Clean")
+                            Text("Process & Clean", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
 
@@ -382,55 +517,107 @@ fun SignatureStudioScreen(
                     ) {
                         Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Replace")
+                        Text("Replace", fontSize = 12.sp)
                     }
                 }
             }
 
-            // Results Card
+            // Results, Validation, Save to Device & Share Card
             processedResult?.let { res ->
                 Spacer(modifier = Modifier.height(16.dp))
+
+                val isSuccess = res.status == PreparationStatus.SUCCESS_PREPARED
+                val cardBg = if (isSuccess) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
+                val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
+
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("sign_result_card"),
                     shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldTertiary)
+                    colors = CardDefaults.cardColors(containerColor = cardBg),
+                    border = androidx.compose.foundation.BorderStroke(1.2.dp, statusColor)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldTertiary)
+                            Icon(
+                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = statusColor
+                            )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Signature Prepared Successfully!",
+                                text = res.status.label,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = EmeraldTertiary
+                                color = statusColor
                             )
                         }
+
                         Spacer(modifier = Modifier.height(8.dp))
+
                         Text(
-                            text = "Size: ${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB (Allowed: $targetMinKb - $targetMaxKb KB)",
+                            text = "Measured Size: ${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB (Allowed: $targetMinKb - $targetMaxKb KB)",
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 13.sp
                         )
                         Text(
-                            text = "Dimensions: ${res.widthPx} x ${res.heightPx} px • Format: ${res.fileFormat.extension.uppercase()}",
+                            text = "Actual Resolution: ${res.widthPx} x ${res.heightPx} px • Format: ${res.fileFormat.extension.uppercase()}",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
 
-                        Button(
-                            onClick = {
-                                sharePreparedFiles(context, listOf(File(res.processedFilePath)))
-                            },
-                            shape = RoundedCornerShape(10.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
-                            modifier = Modifier.fillMaxWidth().testTag("share_signature_btn")
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        res.validationMessages.forEach { msg ->
+                            Text(
+                                text = "• $msg",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+
+                        if (saveStatusMessage != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "✓ $saveStatusMessage",
+                                fontSize = 12.sp,
+                                color = VerifiedGreen,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        // Save to Device & Share row
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Save / Export Signature")
+                            Button(
+                                onClick = {
+                                    val suggestedName = "signature_${res.widthPx}x${res.heightPx}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.${res.fileFormat.extension}"
+                                    saveDocumentLauncher.launch(suggestedName)
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                modifier = Modifier.weight(1f).testTag("save_signature_device_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Save to Device", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    sharePreparedFiles(context, listOf(File(res.processedFilePath)))
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.testTag("share_signature_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
