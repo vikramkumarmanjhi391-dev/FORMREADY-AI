@@ -1,11 +1,13 @@
 package com.example.ui.screens
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -105,6 +107,21 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+class CreateCustomDocumentContract : ActivityResultContract<Pair<String, String>, Uri?>() {
+    override fun createIntent(context: Context, input: Pair<String, String>): Intent {
+        val (mimeType, fileName) = input
+        return Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = if (mimeType.isBlank()) "*/*" else mimeType
+            putExtra(Intent.EXTRA_TITLE, fileName)
+        }
+    }
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Uri? {
+        return if (intent == null || resultCode != Activity.RESULT_OK) null else intent.data
+    }
+}
+
 @Composable
 fun DocumentLockerScreen(
     viewModel: DocumentLockerViewModel = viewModel(factory = DocumentLockerViewModel.Factory)
@@ -125,21 +142,11 @@ fun DocumentLockerScreen(
     // SAF CreateDocument for exporting
     var exportTargetDoc by remember { mutableStateOf<LockerDocumentEntity?>(null) }
     val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+        contract = CreateCustomDocumentContract()
     ) { destinationUri: Uri? ->
         val doc = exportTargetDoc
         if (destinationUri != null && doc != null) {
-            coroutineScope.launch(Dispatchers.IO) {
-                try {
-                    context.contentResolver.openOutputStream(destinationUri)?.use { stream ->
-                        viewModel.exportDocument(doc.id, stream)
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Export error: ${e.message}", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
+            viewModel.exportDocumentToUri(doc.id, destinationUri)
         }
     }
 
@@ -466,7 +473,10 @@ fun DocumentLockerScreen(
                             "pdf"
                         }
                         val safeName = item.title.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                        exportLauncher.launch("$safeName.$ext")
+                        val mime = item.mimeType.ifBlank {
+                            if (ext == "pdf") "application/pdf" else "image/$ext"
+                        }
+                        exportLauncher.launch(mime to "$safeName.$ext")
                     },
                     onEdit = { editingDocument = item },
                     onDelete = { deletingDocument = item }

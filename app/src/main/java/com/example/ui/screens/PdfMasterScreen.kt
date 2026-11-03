@@ -409,13 +409,11 @@ fun ImagesToPdfSection() {
                                     try {
                                         val repo = com.example.data.repository.DocumentLockerRepository(context)
                                         if (pdfFile.exists()) {
-                                            val bytes = pdfFile.readBytes()
-                                            val importRes = repo.importBytes(
-                                                bytes = bytes,
+                                            val importRes = repo.importFile(
+                                                file = pdfFile,
                                                 title = "Certificate Document (${pickedBitmaps.size} Pages)",
                                                 documentType = com.example.data.model.DocumentType.OTHER_SUPPORTING,
                                                 originalFileName = pdfFile.name,
-                                                format = com.example.data.model.FileFormat.PDF,
                                                 notes = "Generated from ${pickedBitmaps.size} image pages in PDF Master"
                                             )
                                             withContext(Dispatchers.Main) {
@@ -654,13 +652,11 @@ fun CompressPdfSection() {
                                     try {
                                         val repo = com.example.data.repository.DocumentLockerRepository(context)
                                         if (compFile.exists()) {
-                                            val bytes = compFile.readBytes()
-                                            val importRes = repo.importBytes(
-                                                bytes = bytes,
+                                            val importRes = repo.importFile(
+                                                file = compFile,
                                                 title = "Compressed PDF (< ${targetMaxKb} KB)",
                                                 documentType = com.example.data.model.DocumentType.OTHER_SUPPORTING,
                                                 originalFileName = compFile.name,
-                                                format = com.example.data.model.FileFormat.PDF,
                                                 notes = "Compressed via PDF Master"
                                             )
                                             withContext(Dispatchers.Main) {
@@ -891,13 +887,11 @@ fun FrontBackMergeSection() {
                                     try {
                                         val repo = com.example.data.repository.DocumentLockerRepository(context)
                                         if (pdfFile.exists()) {
-                                            val bytes = pdfFile.readBytes()
-                                            val importRes = repo.importBytes(
-                                                bytes = bytes,
+                                            val importRes = repo.importFile(
+                                                file = pdfFile,
                                                 title = "ID Card (Front & Back Merged)",
                                                 documentType = com.example.data.model.DocumentType.AADHAAR_CARD,
                                                 originalFileName = pdfFile.name,
-                                                format = com.example.data.model.FileFormat.PDF,
                                                 notes = "Front and Back sides combined into single A4 PDF"
                                             )
                                             withContext(Dispatchers.Main) {

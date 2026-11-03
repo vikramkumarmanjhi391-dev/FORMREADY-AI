@@ -165,6 +165,32 @@ class DocumentLockerViewModel @JvmOverloads constructor(
         }
     }
 
+    fun exportDocumentToUri(id: String, destinationUri: Uri, onSuccess: (Long) -> Unit = {}) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            val result = repository.exportDocumentToUri(id, destinationUri)
+            result.fold(
+                onSuccess = { bytesWritten ->
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            statusMessage = "Document successfully saved to device ($bytesWritten bytes)"
+                        )
+                    }
+                    onSuccess(bytesWritten)
+                },
+                onFailure = { error ->
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            errorMessage = "Export failed: ${error.localizedMessage ?: "Unknown error"}"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
     fun exportDocument(id: String, destinationOutputStream: OutputStream, onSuccess: () -> Unit = {}) {
         viewModelScope.launch {
             val result = repository.exportDocumentToStream(id, destinationOutputStream)

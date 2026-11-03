@@ -2,7 +2,9 @@ package com.example
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.example.storage.AndroidKeystoreKeyProvider
 import com.example.storage.DocumentEncryptionManager
+import com.example.storage.TestSoftwareKeyProvider
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -21,13 +23,28 @@ import java.io.File
 @Config(sdk = [36])
 class DocumentEncryptionTest {
 
-    private lateinit var encryptionManager: DocumentEncryptionManager
     private lateinit var context: Context
+    private lateinit var encryptionManager: DocumentEncryptionManager
+    private lateinit var testKeyProvider: TestSoftwareKeyProvider
 
     @Before
     fun setup() {
         context = ApplicationProvider.getApplicationContext()
-        encryptionManager = DocumentEncryptionManager(context)
+        testKeyProvider = TestSoftwareKeyProvider.create()
+        encryptionManager = DocumentEncryptionManager(context, testKeyProvider)
+    }
+
+    @Test
+    fun keystoreProvider_failsClosedWhenHardwareKeystoreUnavailable() {
+        val keystoreProvider = AndroidKeystoreKeyProvider()
+        try {
+            val key = keystoreProvider.getSecretKey()
+            // If the environment supports hardware KeyStore, key must be non-null and AES
+            assertEquals("AES", key.algorithm)
+        } catch (e: SecurityException) {
+            // In environments lacking KeyStore, it must FAIL CLOSED with SecurityException
+            assertTrue(e.message?.contains("Keystore") == true || e.message?.contains("keystore") == true)
+        }
     }
 
     @Test
@@ -78,23 +95,72 @@ class DocumentEncryptionTest {
     }
 
     @Test
-    fun modifiedCiphertext_throwsSecurityException() {
-        val original = "Tamper Detection Test Content".toByteArray(Charsets.UTF_8)
-        val encryptedOut = ByteArrayOutputStream()
-        encryptionManager.encryptStream(ByteArrayInputStream(original), encryptedOut)
-        val encryptedBytes = encryptedOut.toByteArray()
+    fun modifiedCiphertext_throwsSecurityException_andReleasesZeroPlaintext() {
+        val testDir = File(context.cacheDir, "tamper_test").apply { mkdirs() }
+        val sourceFile = File(testDir, "source.txt").apply { writeText("Secret User Identity Data") }
+        val vaultFile = File(testDir, "doc.vault")
+        val destinationPlain = File(testDir, "dest_plain.txt")
 
-        // Tamper with one byte in the ciphertext body
-        val tamperedBytes = encryptedBytes.clone()
-        val tamperIndex = tamperedBytes.size - 5
-        tamperedBytes[tamperIndex] = (tamperedBytes[tamperIndex].toInt() xor 0xFF).toByte()
+        try {
+            encryptionManager.encryptFileAtomically(sourceFile, vaultFile)
+            assertTrue(vaultFile.exists())
+
+            // Tamper with bytes in ciphertext
+            val vaultBytes = vaultFile.readBytes()
+            vaultBytes[vaultBytes.size - 5] = (vaultBytes[vaultBytes.size - 5].toInt() xor 0xFF).toByte()
+            vaultFile.writeBytes(vaultBytes)
+
+            // Attempt authenticated decryption
+            try {
+                encryptionManager.decryptFile(vaultFile, destinationPlain)
+                fail("Expected SecurityException on tampered ciphertext/auth tag")
+            } catch (e: SecurityException) {
+                // Verified exception thrown
+            }
+
+            // CRITICAL: Ensure destination plain file was NEVER created or written
+            assertFalse("Tampered file must NEVER write plaintext to destination", destinationPlain.exists())
+
+            // Test decryptAndStreamAuthenticated also releases ZERO bytes to destination stream
+            val outputStream = ByteArrayOutputStream()
+            try {
+                encryptionManager.decryptAndStreamAuthenticated(vaultFile, outputStream)
+                fail("Expected SecurityException from decryptAndStreamAuthenticated")
+            } catch (e: SecurityException) {
+                // Expected
+            }
+            assertEquals("Destination stream must have received 0 bytes on authentication failure", 0, outputStream.size())
+        } finally {
+            sourceFile.delete()
+            vaultFile.delete()
+            destinationPlain.delete()
+        }
+    }
+
+    @Test
+    fun truncatedHeader_throwsSecurityException() {
+        val truncatedHeader = byteArrayOf(0x46, 0x52, 0x56) // Only "FRV" (3 bytes instead of 8)
+        try {
+            val decryptedOut = ByteArrayOutputStream()
+            encryptionManager.decryptStream(ByteArrayInputStream(truncatedHeader), decryptedOut)
+            fail("Expected SecurityException on truncated header")
+        } catch (e: SecurityException) {
+            assertTrue(e.message?.contains("header") == true || e.message?.contains("vault") == true)
+        }
+    }
+
+    @Test
+    fun truncatedIV_throwsSecurityException() {
+        val magicHeader = "FRVAULT1".toByteArray(Charsets.US_ASCII)
+        val shortIv = ByteArray(5) { 0x01 } // Only 5 bytes instead of 12
+        val malformedStream = magicHeader + shortIv
 
         try {
             val decryptedOut = ByteArrayOutputStream()
-            encryptionManager.decryptStream(ByteArrayInputStream(tamperedBytes), decryptedOut)
-            fail("Expected SecurityException on tampered ciphertext/auth tag")
+            encryptionManager.decryptStream(ByteArrayInputStream(malformedStream), decryptedOut)
+            fail("Expected SecurityException on truncated IV")
         } catch (e: SecurityException) {
-            assertTrue(e.message?.contains("integrity") == true || e.message?.contains("authentication") == true)
+            assertTrue(e.message?.contains("IV") == true || e.message?.contains("vault") == true)
         }
     }
 

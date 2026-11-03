@@ -17,6 +17,8 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
 
@@ -32,7 +34,10 @@ data class StorageReconciliationReport(
     val totalRecords: Int,
     val availableCount: Int,
     val missingFilesCount: Int,
-    val orphanedCleanedCount: Int
+    val integrityFailedCount: Int,
+    val orphanedVaultFilesCount: Int,
+    val orphanedVaultFileNames: List<String> = emptyList(),
+    val abandonedTempCleanedCount: Int
 )
 
 class DocumentLockerRepository(
@@ -40,15 +45,22 @@ class DocumentLockerRepository(
     private val dao: LockerDocumentDao = FormReadyDatabase.getInstance(context).lockerDocumentDao(),
     private val encryptionManager: DocumentEncryptionManager = DocumentEncryptionManager(context)
 ) {
+    companion object {
+        const val STATUS_AVAILABLE = "AVAILABLE"
+        const val STATUS_MISSING_FILE = "MISSING_FILE"
+        const val STATUS_INTEGRITY_FAILED = "INTEGRITY_FAILED"
+        const val STATUS_PENDING_DELETE = "PENDING_DELETE"
+    }
+
     // Encrypted vault folder in private no_backup storage to exclude from auto-backups
-    private val vaultDir: File by lazy {
+    val vaultDir: File by lazy {
         File(context.noBackupFilesDir, "document_locker").apply {
             if (!exists()) mkdirs()
         }
     }
 
     // Temporary cache folder for sharing & previewing decrypted files
-    private val decryptedCacheDir: File by lazy {
+    val decryptedCacheDir: File by lazy {
         File(context.cacheDir, "decrypted_shares").apply {
             if (!exists()) mkdirs()
         }
@@ -84,9 +96,6 @@ class DocumentLockerRepository(
         }
     }
 
-    /**
-     * Checks if a document matching this file's SHA-256 hash already exists in the locker.
-     */
     suspend fun checkDuplicate(uri: Uri): LockerDocumentEntity? = withContext(Dispatchers.IO) {
         val validation = DocumentValidationManager.validateUri(context, uri)
         if (validation.isValid && validation.sha256Hex.isNotBlank()) {
@@ -96,20 +105,29 @@ class DocumentLockerRepository(
         }
     }
 
+    suspend fun checkDuplicateFile(file: File): LockerDocumentEntity? = withContext(Dispatchers.IO) {
+        val validation = DocumentValidationManager.validateFile(file)
+        if (validation.isValid && validation.sha256Hex.isNotBlank()) {
+            dao.getDocumentByHash(validation.sha256Hex)
+        } else {
+            null
+        }
+    }
+
     /**
-     * Imports a genuine document from an Android Storage Access Framework URI into the encrypted vault.
-     * Validates magic bytes, streams encryption to disk, and persists metadata in Room.
+     * Imports a genuine document from a disk [File] into the encrypted vault without loading into RAM.
+     * Validates deep format, stream-encrypts directly to vault, and persists metadata in Room.
      */
-    suspend fun importDocument(
-        uri: Uri,
+    suspend fun importFile(
+        file: File,
         title: String,
         documentType: DocumentType,
-        notes: String = "",
-        isMasked: Boolean = false
+        originalFileName: String = file.name,
+        notes: String = ""
     ): Result<LockerDocumentEntity> = withContext(Dispatchers.IO) {
         try {
-            // 1. Validate source file
-            val validation = DocumentValidationManager.validateUri(context, uri)
+            // 1. Deep validate source file
+            val validation = DocumentValidationManager.validateFile(file)
             if (!validation.isValid) {
                 return@withContext Result.failure(
                     IllegalArgumentException(validation.errorMessage ?: "File validation failed")
@@ -117,30 +135,14 @@ class DocumentLockerRepository(
             }
 
             val format = validation.detectedFormat ?: FileFormat.PDF
-            val originalName = uri.lastPathSegment?.substringAfterLast('/') ?: "document.${format.extension}"
-
             val docId = "doc_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
             val encryptedFileName = "$docId.vault"
             val targetEncryptedFile = File(vaultDir, encryptedFileName)
-            val tempEncryptedFile = File(vaultDir, "$encryptedFileName.tmp")
 
-            // 2. Stream-encrypt from URI to temporary file
-            val inStream = context.contentResolver.openInputStream(uri)
-                ?: return@withContext Result.failure(IllegalStateException("Cannot open input stream for URI"))
-
+            // 2. Stream-encrypt from file directly to target vault file atomically
             try {
-                inStream.use { input ->
-                    FileOutputStream(tempEncryptedFile).use { output ->
-                        encryptionManager.encryptStream(input, output)
-                    }
-                }
-                // Atomically move to final vault file
-                if (!tempEncryptedFile.renameTo(targetEncryptedFile)) {
-                    tempEncryptedFile.copyTo(targetEncryptedFile, overwrite = true)
-                    tempEncryptedFile.delete()
-                }
+                encryptionManager.encryptFileAtomically(file, targetEncryptedFile)
             } catch (e: Exception) {
-                if (tempEncryptedFile.exists()) tempEncryptedFile.delete()
                 if (targetEncryptedFile.exists()) targetEncryptedFile.delete()
                 return@withContext Result.failure(e)
             }
@@ -148,10 +150,10 @@ class DocumentLockerRepository(
             // 3. Persist metadata entity in Room
             val entity = LockerDocumentEntity(
                 id = docId,
-                title = title.ifBlank { originalName.substringBeforeLast('.') },
+                title = title.ifBlank { originalFileName.substringBeforeLast('.') },
                 documentType = documentType.name,
                 category = documentType.category,
-                originalFileName = originalName,
+                originalFileName = originalFileName,
                 storedEncryptedFileName = encryptedFileName,
                 mimeType = validation.mimeType,
                 fileFormat = format.name,
@@ -160,8 +162,8 @@ class DocumentLockerRepository(
                 createdAt = System.currentTimeMillis(),
                 lastUpdatedAt = System.currentTimeMillis(),
                 notes = notes,
-                isMasked = isMasked,
-                integrityStatus = "AVAILABLE"
+                isMasked = false,
+                integrityStatus = STATUS_AVAILABLE
             )
 
             try {
@@ -177,7 +179,54 @@ class DocumentLockerRepository(
     }
 
     /**
-     * Imports in-memory byte array directly into the vault (e.g. from Photo Studio, Signature Studio, or PDF Master).
+     * Imports a genuine document from an Android Storage Access Framework URI into the encrypted vault.
+     */
+    suspend fun importDocument(
+        uri: Uri,
+        title: String,
+        documentType: DocumentType,
+        notes: String = "",
+        isMasked: Boolean = false
+    ): Result<LockerDocumentEntity> = withContext(Dispatchers.IO) {
+        val stagingFile = File(context.cacheDir, "import_stage_${UUID.randomUUID()}.tmp")
+        try {
+            val inStream = context.contentResolver.openInputStream(uri)
+                ?: return@withContext Result.failure(IllegalStateException("Cannot open input stream for URI"))
+
+            FileOutputStream(stagingFile).use { outStream ->
+                val buffer = ByteArray(16384)
+                var bytesRead: Int
+                var total = 0L
+                inStream.use { input ->
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        outStream.write(buffer, 0, bytesRead)
+                        total += bytesRead
+                        if (total > DocumentValidationManager.MAX_FILE_SIZE_BYTES) {
+                            return@withContext Result.failure(
+                                IllegalArgumentException("Document exceeds maximum permitted size of 50 MB")
+                            )
+                        }
+                    }
+                }
+            }
+
+            val originalName = uri.lastPathSegment?.substringAfterLast('/') ?: "document"
+            importFile(
+                file = stagingFile,
+                title = title,
+                documentType = documentType,
+                originalFileName = originalName,
+                notes = notes
+            )
+        } catch (e: Exception) {
+            Result.failure(e)
+        } finally {
+            if (stagingFile.exists()) stagingFile.delete()
+        }
+    }
+
+    /**
+     * Backward-compatible byte array importer (streams through temporary file, never keeping duplicate buffers).
      */
     suspend fun importBytes(
         bytes: ByteArray,
@@ -187,72 +236,19 @@ class DocumentLockerRepository(
         format: FileFormat,
         notes: String = ""
     ): Result<LockerDocumentEntity> = withContext(Dispatchers.IO) {
+        val stagingFile = File(context.cacheDir, "import_bytes_${UUID.randomUUID()}.${format.extension}")
         try {
-            val docId = "doc_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
-            val encryptedFileName = "$docId.vault"
-            val targetEncryptedFile = File(vaultDir, encryptedFileName)
-            val tempEncryptedFile = File(vaultDir, "$encryptedFileName.tmp")
-
-            // Validate stream
-            val validation = ByteArrayInputStream(bytes).use { stream ->
-                DocumentValidationManager.validateStream(stream, bytes.size.toLong(), originalFileName)
-            }
-            if (!validation.isValid) {
-                return@withContext Result.failure(
-                    IllegalArgumentException(validation.errorMessage ?: "Validation failed on generated bytes")
-                )
-            }
-
-            // Encrypt
-            try {
-                ByteArrayInputStream(bytes).use { input ->
-                    FileOutputStream(tempEncryptedFile).use { output ->
-                        encryptionManager.encryptStream(input, output)
-                    }
-                }
-                if (!tempEncryptedFile.renameTo(targetEncryptedFile)) {
-                    tempEncryptedFile.copyTo(targetEncryptedFile, overwrite = true)
-                    tempEncryptedFile.delete()
-                }
-            } catch (e: Exception) {
-                if (tempEncryptedFile.exists()) tempEncryptedFile.delete()
-                if (targetEncryptedFile.exists()) targetEncryptedFile.delete()
-                return@withContext Result.failure(e)
-            }
-
-            val entity = LockerDocumentEntity(
-                id = docId,
-                title = title.ifBlank { originalFileName.substringBeforeLast('.') },
-                documentType = documentType.name,
-                category = documentType.category,
-                originalFileName = originalFileName,
-                storedEncryptedFileName = encryptedFileName,
-                mimeType = format.mimeType,
-                fileFormat = format.name,
-                fileSizeBytes = bytes.size.toLong(),
-                sha256Hash = validation.sha256Hex,
-                createdAt = System.currentTimeMillis(),
-                lastUpdatedAt = System.currentTimeMillis(),
-                notes = notes,
-                isMasked = false,
-                integrityStatus = "AVAILABLE"
-            )
-
-            try {
-                dao.insertDocument(entity)
-                Result.success(entity)
-            } catch (e: Exception) {
-                if (targetEncryptedFile.exists()) targetEncryptedFile.delete()
-                Result.failure(e)
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
+            FileOutputStream(stagingFile).use { it.write(bytes) }
+            importFile(stagingFile, title, documentType, originalFileName, notes)
+        } finally {
+            if (stagingFile.exists()) stagingFile.delete()
         }
     }
 
     /**
      * Decrypts a stored document into a temporary file in `cacheDir/decrypted_shares`
      * for previewing or sharing via FileProvider.
+     * Enforces authenticated AES-GCM verification before releasing the file.
      */
     suspend fun decryptToTempFile(id: String): Result<File> = withContext(Dispatchers.IO) {
         try {
@@ -261,7 +257,7 @@ class DocumentLockerRepository(
 
             val encryptedFile = File(vaultDir, entity.storedEncryptedFileName)
             if (!encryptedFile.exists()) {
-                dao.updateIntegrityStatus(id, "MISSING_FILE")
+                dao.updateIntegrityStatus(id, STATUS_MISSING_FILE)
                 return@withContext Result.failure(IllegalStateException("Encrypted document file is missing from vault"))
             }
 
@@ -273,16 +269,73 @@ class DocumentLockerRepository(
             val safeName = entity.title.replace(Regex("[^a-zA-Z0-9._-]"), "_")
             val tempFile = File(decryptedCacheDir, "preview_${id}_$safeName.$ext")
 
-            encryptionManager.decryptFile(encryptedFile, tempFile)
-            Result.success(tempFile)
+            try {
+                encryptionManager.decryptFile(encryptedFile, tempFile)
+                dao.updateIntegrityStatus(id, STATUS_AVAILABLE)
+                Result.success(tempFile)
+            } catch (e: SecurityException) {
+                dao.updateIntegrityStatus(id, STATUS_INTEGRITY_FAILED)
+                Result.failure(e)
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
     /**
-     * Streams decrypted document directly to an external destination [OutputStream]
-     * (used by SAF CreateDocument without creating intermediate unencrypted disk copies).
+     * Exports a document to an external URI (SAF) with full authenticated decryption.
+     * Guaranteed never to release unverified plaintext bytes if authentication fails.
+     */
+    suspend fun exportDocumentToUri(id: String, destinationUri: Uri): Result<Long> = withContext(Dispatchers.IO) {
+        try {
+            val entity = dao.getDocumentByIdSync(id)
+                ?: return@withContext Result.failure(NoSuchElementException("Document record not found"))
+
+            val encryptedFile = File(vaultDir, entity.storedEncryptedFileName)
+            if (!encryptedFile.exists()) {
+                dao.updateIntegrityStatus(id, STATUS_MISSING_FILE)
+                return@withContext Result.failure(IllegalStateException("Vault file missing on disk"))
+            }
+
+            // Stage 1: Authenticated decryption into private temp file
+            val verifiedTemp = File(context.cacheDir, "export_verified_${UUID.randomUUID()}.tmp")
+            try {
+                encryptionManager.decryptFile(encryptedFile, verifiedTemp)
+                dao.updateIntegrityStatus(id, STATUS_AVAILABLE)
+            } catch (secEx: SecurityException) {
+                dao.updateIntegrityStatus(id, STATUS_INTEGRITY_FAILED)
+                if (verifiedTemp.exists()) verifiedTemp.delete()
+                return@withContext Result.failure(secEx)
+            }
+
+            // Stage 2: Write verified plaintext to destination URI output stream
+            try {
+                val outStream = context.contentResolver.openOutputStream(destinationUri)
+                    ?: return@withContext Result.failure(IOException("Cannot open output stream for destination URI"))
+
+                var bytesWritten = 0L
+                outStream.use { output ->
+                    FileInputStream(verifiedTemp).use { input ->
+                        val buffer = ByteArray(16384)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            bytesWritten += read
+                        }
+                        output.flush()
+                    }
+                }
+                Result.success(bytesWritten)
+            } finally {
+                if (verifiedTemp.exists()) verifiedTemp.delete()
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Backward-compatible stream exporter with authenticated decryption staging.
      */
     suspend fun exportDocumentToStream(id: String, outputStream: OutputStream): Result<Long> = withContext(Dispatchers.IO) {
         try {
@@ -291,22 +344,21 @@ class DocumentLockerRepository(
 
             val encryptedFile = File(vaultDir, entity.storedEncryptedFileName)
             if (!encryptedFile.exists()) {
-                dao.updateIntegrityStatus(id, "MISSING_FILE")
+                dao.updateIntegrityStatus(id, STATUS_MISSING_FILE)
                 return@withContext Result.failure(IllegalStateException("Vault file missing on disk"))
             }
 
-            FileInputStream(encryptedFile).use { inStream ->
-                encryptionManager.decryptStream(inStream, outputStream)
-            }
-            Result.success(entity.fileSizeBytes)
+            val bytesWritten = encryptionManager.decryptAndStreamAuthenticated(encryptedFile, outputStream)
+            dao.updateIntegrityStatus(id, STATUS_AVAILABLE)
+            Result.success(bytesWritten)
+        } catch (e: SecurityException) {
+            dao.updateIntegrityStatus(id, STATUS_INTEGRITY_FAILED)
+            Result.failure(e)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    /**
-     * Updates document metadata without needing to re-encrypt the file content.
-     */
     suspend fun updateMetadata(
         id: String,
         title: String,
@@ -329,17 +381,31 @@ class DocumentLockerRepository(
     }
 
     /**
-     * Permanently deletes a document from the vault and removes its Room database entry.
+     * Permanently deletes a document:
+     * - First marks status as PENDING_DELETE in Room
+     * - Deletes encrypted vault file from disk, verifying result
+     * - If file deletion fails, preserves database record and reports error
+     * - Removes database record only after file is confirmed deleted
      */
     suspend fun deleteDocument(id: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val entity = dao.getDocumentByIdSync(id)
-            if (entity != null) {
-                val file = File(vaultDir, entity.storedEncryptedFileName)
-                if (file.exists()) {
-                    file.delete()
+                ?: return@withContext Result.failure(NoSuchElementException("Document record not found"))
+
+            // 1. Mark as PENDING_DELETE in database
+            dao.updateIntegrityStatus(id, STATUS_PENDING_DELETE)
+
+            val file = File(vaultDir, entity.storedEncryptedFileName)
+            if (file.exists()) {
+                val deleted = file.delete()
+                if (!deleted) {
+                    return@withContext Result.failure(
+                        IOException("Failed to delete encrypted vault file from storage. Database record preserved.")
+                    )
                 }
             }
+
+            // 2. Remove Room record now that file is deleted
             dao.deleteDocumentById(id)
             Result.success(Unit)
         } catch (e: Exception) {
@@ -348,50 +414,91 @@ class DocumentLockerRepository(
     }
 
     /**
-     * Reconciles on-disk files with database records:
-     * - Marks missing files as MISSING_FILE
-     * - Cleans up abandoned `.tmp` files
+     * Storage reconciliation:
+     * - Identifies missing files and marks MISSING_FILE
+     * - Preserves INTEGRITY_FAILED states
+     * - Identifies orphaned .vault files without database records
+     * - Resolves PENDING_DELETE records
+     * - Cleans abandoned .tmp files older than 1 hour
      */
     suspend fun reconcileStorage(): StorageReconciliationReport = withContext(Dispatchers.IO) {
         val records = dao.getAllDocumentsSync()
         var availableCount = 0
         var missingCount = 0
-        var cleanedOrphans = 0
+        var integrityFailedCount = 0
+        var pendingDeleteResolved = 0
+        var abandonedTempCleaned = 0
+
+        val knownVaultFiles = mutableSetOf<String>()
 
         for (doc in records) {
             val file = File(vaultDir, doc.storedEncryptedFileName)
+            knownVaultFiles.add(doc.storedEncryptedFileName)
+
+            if (doc.integrityStatus == STATUS_PENDING_DELETE) {
+                if (file.exists()) {
+                    if (file.delete()) {
+                        dao.deleteDocumentById(doc.id)
+                        pendingDeleteResolved++
+                    }
+                } else {
+                    dao.deleteDocumentById(doc.id)
+                    pendingDeleteResolved++
+                }
+                continue
+            }
+
             if (!file.exists()) {
                 missingCount++
-                dao.updateIntegrityStatus(doc.id, "MISSING_FILE")
+                if (doc.integrityStatus != STATUS_MISSING_FILE) {
+                    dao.updateIntegrityStatus(doc.id, STATUS_MISSING_FILE)
+                }
             } else {
-                availableCount++
-                if (doc.integrityStatus != "AVAILABLE") {
-                    dao.updateIntegrityStatus(doc.id, "AVAILABLE")
+                if (doc.integrityStatus == STATUS_INTEGRITY_FAILED) {
+                    integrityFailedCount++
+                } else {
+                    availableCount++
+                    if (doc.integrityStatus != STATUS_AVAILABLE) {
+                        dao.updateIntegrityStatus(doc.id, STATUS_AVAILABLE)
+                    }
                 }
             }
         }
 
-        // Clean up temporary files in vaultDir
+        // Identify orphaned .vault files (never deleted silently)
+        val orphanedVaultFiles = mutableListOf<String>()
         vaultDir.listFiles()?.forEach { file ->
-            if (file.name.endsWith(".tmp")) {
-                file.delete()
-                cleanedOrphans++
+            if (file.isFile && file.name.endsWith(".vault")) {
+                if (!knownVaultFiles.contains(file.name)) {
+                    orphanedVaultFiles.add(file.name)
+                }
             }
         }
 
-        // Clean up old temporary decrypted shares older than 24 hours
-        val cutoff = System.currentTimeMillis() - (24 * 60 * 60 * 1000)
+        // Clean abandoned temporary files (> 1 hour old)
+        val oneHourAgo = System.currentTimeMillis() - (60 * 60 * 1000L)
+        vaultDir.listFiles()?.forEach { file ->
+            if (file.isFile && (file.name.endsWith(".tmp") || file.name.contains("_stage_"))) {
+                if (file.lastModified() < oneHourAgo) {
+                    if (file.delete()) abandonedTempCleaned++
+                }
+            }
+        }
+
         decryptedCacheDir.listFiles()?.forEach { file ->
-            if (file.lastModified() < cutoff) {
-                file.delete()
+            if (file.isFile && file.lastModified() < oneHourAgo) {
+                if (file.delete()) abandonedTempCleaned++
             }
         }
 
         StorageReconciliationReport(
-            totalRecords = records.size,
+            totalRecords = records.size - pendingDeleteResolved,
             availableCount = availableCount,
             missingFilesCount = missingCount,
-            orphanedCleanedCount = cleanedOrphans
+            integrityFailedCount = integrityFailedCount,
+            orphanedVaultFilesCount = orphanedVaultFiles.size,
+            orphanedVaultFileNames = orphanedVaultFiles,
+            abandonedTempCleanedCount = abandonedTempCleaned
         )
     }
 

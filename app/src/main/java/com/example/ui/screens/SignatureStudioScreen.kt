@@ -630,13 +630,11 @@ fun SignatureStudioScreen(
                                         val repo = com.example.data.repository.DocumentLockerRepository(context)
                                         val file = File(res.processedFilePath)
                                         if (file.exists()) {
-                                            val bytes = file.readBytes()
-                                            val importRes = repo.importBytes(
-                                                bytes = bytes,
+                                            val importRes = repo.importFile(
+                                                file = file,
                                                 title = "${selectedPreset.title} (${res.widthPx}x${res.heightPx})",
                                                 documentType = selectedPreset.type,
                                                 originalFileName = file.name,
-                                                format = res.fileFormat,
                                                 notes = "Generated in Signature Studio"
                                             )
                                             withContext(Dispatchers.Main) {
