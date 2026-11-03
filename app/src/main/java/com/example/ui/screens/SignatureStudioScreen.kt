@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Tune
@@ -618,6 +619,47 @@ fun SignatureStudioScreen(
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("Share", fontSize = 12.sp)
                             }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    try {
+                                        val repo = com.example.data.repository.DocumentLockerRepository(context)
+                                        val file = File(res.processedFilePath)
+                                        if (file.exists()) {
+                                            val bytes = file.readBytes()
+                                            val importRes = repo.importBytes(
+                                                bytes = bytes,
+                                                title = "${selectedPreset.title} (${res.widthPx}x${res.heightPx})",
+                                                documentType = selectedPreset.type,
+                                                originalFileName = file.name,
+                                                format = res.fileFormat,
+                                                notes = "Generated in Signature Studio"
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                if (importRes.isSuccess) {
+                                                    Toast.makeText(context, "Saved to Personal Document Locker!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "Locker save failed: ${importRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "Locker error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("add_signature_to_locker_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save to Document Locker Vault", fontSize = 12.sp)
                         }
                     }
                 }

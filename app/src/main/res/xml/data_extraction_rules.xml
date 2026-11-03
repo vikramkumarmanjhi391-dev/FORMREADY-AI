@@ -5,15 +5,15 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="no_backup" path="document_locker" />
+        <exclude domain="database" path="formready_locker.db" />
+        <exclude domain="database" path="formready_locker.db-wal" />
+        <exclude domain="database" path="formready_locker.db-shm" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="no_backup" path="document_locker" />
+        <exclude domain="database" path="formready_locker.db" />
+        <exclude domain="database" path="formready_locker.db-wal" />
+        <exclude domain="database" path="formready_locker.db-shm" />
     </device-transfer>
-    -->
 </data-extraction-rules>

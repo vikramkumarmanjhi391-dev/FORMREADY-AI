@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Share
@@ -399,6 +400,46 @@ fun ImagesToPdfSection() {
                                 Text("Share", fontSize = 12.sp)
                             }
                         }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    try {
+                                        val repo = com.example.data.repository.DocumentLockerRepository(context)
+                                        if (pdfFile.exists()) {
+                                            val bytes = pdfFile.readBytes()
+                                            val importRes = repo.importBytes(
+                                                bytes = bytes,
+                                                title = "Certificate Document (${pickedBitmaps.size} Pages)",
+                                                documentType = com.example.data.model.DocumentType.OTHER_SUPPORTING,
+                                                originalFileName = pdfFile.name,
+                                                format = com.example.data.model.FileFormat.PDF,
+                                                notes = "Generated from ${pickedBitmaps.size} image pages in PDF Master"
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                if (importRes.isSuccess) {
+                                                    Toast.makeText(context, "Saved to Personal Document Locker!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "Locker save failed: ${importRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "Locker error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("add_pdf_to_locker_btn"),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save to Document Locker Vault", fontSize = 12.sp)
+                        }
                     }
                 }
             }
@@ -604,6 +645,46 @@ fun CompressPdfSection() {
                                 Text("Share", fontSize = 12.sp)
                             }
                         }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    try {
+                                        val repo = com.example.data.repository.DocumentLockerRepository(context)
+                                        if (compFile.exists()) {
+                                            val bytes = compFile.readBytes()
+                                            val importRes = repo.importBytes(
+                                                bytes = bytes,
+                                                title = "Compressed PDF (< ${targetMaxKb} KB)",
+                                                documentType = com.example.data.model.DocumentType.OTHER_SUPPORTING,
+                                                originalFileName = compFile.name,
+                                                format = com.example.data.model.FileFormat.PDF,
+                                                notes = "Compressed via PDF Master"
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                if (importRes.isSuccess) {
+                                                    Toast.makeText(context, "Saved to Personal Document Locker!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "Locker save failed: ${importRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "Locker error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("add_compressed_pdf_to_locker_btn"),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save to Document Locker Vault", fontSize = 12.sp)
+                        }
                     }
                 }
             }
@@ -800,6 +881,46 @@ fun FrontBackMergeSection() {
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("Share", fontSize = 12.sp)
                             }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    try {
+                                        val repo = com.example.data.repository.DocumentLockerRepository(context)
+                                        if (pdfFile.exists()) {
+                                            val bytes = pdfFile.readBytes()
+                                            val importRes = repo.importBytes(
+                                                bytes = bytes,
+                                                title = "ID Card (Front & Back Merged)",
+                                                documentType = com.example.data.model.DocumentType.AADHAAR_CARD,
+                                                originalFileName = pdfFile.name,
+                                                format = com.example.data.model.FileFormat.PDF,
+                                                notes = "Front and Back sides combined into single A4 PDF"
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                if (importRes.isSuccess) {
+                                                    Toast.makeText(context, "Saved to Personal Document Locker!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "Locker save failed: ${importRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "Locker error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("add_merged_card_to_locker_btn"),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save to Document Locker Vault", fontSize = 12.sp)
                         }
                     }
                 }
