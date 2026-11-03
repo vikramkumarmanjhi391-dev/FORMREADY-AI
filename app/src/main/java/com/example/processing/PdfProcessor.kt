@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
@@ -71,6 +72,15 @@ object PdfProcessor {
         FileOutputStream(outFile).use { pdfDocument.writeTo(it) }
         pdfDocument.close()
         outFile
+    }
+
+    /**
+     * Rotates a bitmap by a specified angle (e.g. 90, 180, 270 degrees).
+     */
+    fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        if (degrees % 360f == 0f) return bitmap
+        val matrix = Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     /**
@@ -210,6 +220,84 @@ object PdfProcessor {
             e.printStackTrace()
         }
         results
+    }
+
+    /**
+     * Extracts all pages of a PDF as individual image files on disk.
+     */
+    suspend fun renderPdfPagesToImages(
+        context: Context,
+        pdfFile: File
+    ): List<File> = withContext(Dispatchers.IO) {
+        val outputFiles = mutableListOf<File>()
+        try {
+            val pfd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            val renderer = PdfRenderer(pfd)
+            val outDir = File(context.cacheDir, "extracted_pages").apply { mkdirs() }
+
+            for (i in 0 until renderer.pageCount) {
+                val page = renderer.openPage(i)
+                val bmp = Bitmap.createBitmap(page.width * 2, page.height * 2, Bitmap.Config.ARGB_8888)
+                bmp.eraseColor(Color.WHITE)
+                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                page.close()
+
+                val imgFile = File(outDir, "${pdfFile.nameWithoutExtension}_page_${i + 1}.jpg")
+                FileOutputStream(imgFile).use { out ->
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                }
+                outputFiles.add(imgFile)
+            }
+            renderer.close()
+            pfd.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        outputFiles
+    }
+
+    /**
+     * Merges multiple PDF files into one combined PDF.
+     */
+    suspend fun mergePdfs(
+        context: Context,
+        pdfFiles: List<File>,
+        outputFileName: String = "merged_${System.currentTimeMillis()}.pdf"
+    ): File = withContext(Dispatchers.IO) {
+        val pdfDoc = PdfDocument()
+        var totalPageIndex = 0
+
+        pdfFiles.forEach { file ->
+            try {
+                val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                val renderer = PdfRenderer(pfd)
+                for (p in 0 until renderer.pageCount) {
+                    val page = renderer.openPage(p)
+                    val bmp = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
+                    bmp.eraseColor(Color.WHITE)
+                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                    page.close()
+
+                    val pageInfo = PdfDocument.PageInfo.Builder(A4_WIDTH_POINTS, A4_HEIGHT_POINTS, totalPageIndex + 1).create()
+                    val pdfPage = pdfDoc.startPage(pageInfo)
+                    pdfPage.canvas.drawColor(Color.WHITE)
+                    val dest = Rect(0, 0, A4_WIDTH_POINTS, A4_HEIGHT_POINTS)
+                    pdfPage.canvas.drawBitmap(bmp, null, dest, Paint(Paint.FILTER_BITMAP_FLAG))
+                    pdfDoc.finishPage(pdfPage)
+                    totalPageIndex++
+                }
+                renderer.close()
+                pfd.close()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
+        val outFile = File(outDir, outputFileName)
+        FileOutputStream(outFile).use { pdfDoc.writeTo(it) }
+        pdfDoc.close()
+        outFile
     }
 
     suspend fun getPdfPageCount(pdfFile: File): Int = withContext(Dispatchers.IO) {

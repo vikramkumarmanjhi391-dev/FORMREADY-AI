@@ -30,12 +30,16 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.Button
@@ -81,7 +85,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 @Composable
@@ -108,7 +115,7 @@ fun PdfMasterScreen() {
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                text = "Convert certificates to PDF, compress down to 100-300 KB, merge pages, and combine front & back ID cards.",
+                text = "Convert certificates to PDF, compress down to 100-300 KB, merge pages, and combine front & back ID cards with real Save to Device.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -152,15 +159,42 @@ fun ImagesToPdfSection() {
     val pickedBitmaps = remember { mutableStateListOf<Bitmap>() }
     var generatedPdfFile by remember { mutableStateOf<File?>(null) }
     var isGenerating by remember { mutableStateOf(false) }
+    var saveStatusMessage by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 10)
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 15)
     ) { uris: List<Uri> ->
         if (uris.isNotEmpty()) {
             coroutineScope.launch {
                 uris.forEach { uri ->
                     val bmp = ImageProcessor.decodeBitmapFromUri(context, uri)
                     if (bmp != null) pickedBitmaps.add(bmp)
+                }
+            }
+        }
+    }
+
+    // Storage Access Framework: Save PDF to Device
+    val savePdfLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { destUri: Uri? ->
+        if (destUri != null && generatedPdfFile != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openOutputStream(destUri)?.use { out ->
+                        FileInputStream(generatedPdfFile!!).use { inStream ->
+                            inStream.copyTo(out)
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        saveStatusMessage = "PDF saved to device successfully (${String.format(Locale.US, "%.1f", generatedPdfFile!!.length() / 1024.0)} KB)"
+                        Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Failed to save PDF: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }
@@ -179,7 +213,7 @@ fun ImagesToPdfSection() {
             ) {
                 Column {
                     Text("Images to Single A4 PDF", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Text("Class 10/12, Graduation degrees, caste certificates", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Combine Class 10/12, Degrees, Caste certificates", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Button(
                     onClick = {
@@ -196,46 +230,84 @@ fun ImagesToPdfSection() {
             Spacer(modifier = Modifier.height(12.dp))
 
             if (pickedBitmaps.isNotEmpty()) {
-                Text("Selected Pages (${pickedBitmaps.size}):", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("Selected Pages (${pickedBitmaps.size}) — Reorder or Rotate:", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(modifier = Modifier.height(6.dp))
 
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     itemsIndexed(pickedBitmaps) { index, bmp ->
-                        Box(
-                            modifier = Modifier
-                                .size(width = 90.dp, height = 120.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                        ) {
-                            Image(
-                                bitmap = bmp.asImageBitmap(),
-                                contentDescription = "Page ${index + 1}",
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Crop
-                            )
-                            Surface(
-                                color = Color.Black.copy(alpha = 0.6f),
-                                shape = RoundedCornerShape(4.dp),
-                                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(
+                                modifier = Modifier
+                                    .size(width = 100.dp, height = 130.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
                             ) {
-                                Text("P${index + 1}", color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 4.dp))
+                                Image(
+                                    bitmap = bmp.asImageBitmap(),
+                                    contentDescription = "Page ${index + 1}",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop
+                                )
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.65f),
+                                    shape = RoundedCornerShape(4.dp),
+                                    modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+                                ) {
+                                    Text("Page ${index + 1}", color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                                }
+                                IconButton(
+                                    onClick = { pickedBitmaps.removeAt(index) },
+                                    modifier = Modifier.align(Alignment.TopEnd).size(26.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Remove", tint = Color.Red, modifier = Modifier.size(16.dp))
+                                }
                             }
-                            IconButton(
-                                onClick = { pickedBitmaps.removeAt(index) },
-                                modifier = Modifier.align(Alignment.TopEnd).size(24.dp)
-                            ) {
-                                Icon(imageVector = Icons.Default.Delete, contentDescription = "Remove", tint = Color.Red, modifier = Modifier.size(16.dp))
+
+                            // Page controls: Rotate & Move
+                            Row(modifier = Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                IconButton(
+                                    onClick = {
+                                        val rotated = PdfProcessor.rotateBitmap(bmp, 90f)
+                                        pickedBitmaps[index] = rotated
+                                    },
+                                    modifier = Modifier.size(24.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.RotateRight, contentDescription = "Rotate 90 deg", modifier = Modifier.size(14.dp))
+                                }
+                                if (index > 0) {
+                                    IconButton(
+                                        onClick = {
+                                            val item = pickedBitmaps.removeAt(index)
+                                            pickedBitmaps.add(index - 1, item)
+                                        },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Move left", modifier = Modifier.size(14.dp))
+                                    }
+                                }
+                                if (index < pickedBitmaps.size - 1) {
+                                    IconButton(
+                                        onClick = {
+                                            val item = pickedBitmaps.removeAt(index)
+                                            pickedBitmaps.add(index + 1, item)
+                                        },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.ArrowForward, contentDescription = "Move right", modifier = Modifier.size(14.dp))
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Button(
                     onClick = {
                         coroutineScope.launch {
                             isGenerating = true
+                            saveStatusMessage = null
                             val file = PdfProcessor.createPdfFromBitmaps(
                                 context = context,
                                 bitmaps = pickedBitmaps.toList(),
@@ -251,7 +323,7 @@ fun ImagesToPdfSection() {
                     modifier = Modifier.fillMaxWidth().testTag("generate_pdf_btn")
                 ) {
                     if (isGenerating) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Creating PDF...")
                     } else {
@@ -272,8 +344,8 @@ fun ImagesToPdfSection() {
                     ) {
                         Icon(imageVector = Icons.Default.PictureAsPdf, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(36.dp))
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text("No images selected yet", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                        Text("Pick one or more certificate pages to combine into a single PDF", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("No certificate images selected yet", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        Text("Pick one or more documents to combine into a single clean PDF", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
@@ -295,16 +367,37 @@ fun ImagesToPdfSection() {
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("File: ${pdfFile.name} • ${String.format(Locale.US, "%.1f", pdfFile.length() / 1024.0)} KB", fontSize = 12.sp)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Button(
-                            onClick = { sharePreparedFiles(context, listOf(pdfFile)) },
-                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Save / Share PDF")
+
+                        if (saveStatusMessage != null) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("✓ $saveStatusMessage", fontSize = 11.sp, color = EmeraldTertiary, fontWeight = FontWeight.Bold)
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    val suggestedName = "document_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
+                                    savePdfLauncher.launch(suggestedName)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f).testTag("save_pdf_device_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Save to Device", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = { sharePreparedFiles(context, listOf(pdfFile)) },
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
@@ -322,6 +415,7 @@ fun CompressPdfSection() {
     var targetMaxKb by remember { mutableIntStateOf(300) }
     var compressedPdfFile by remember { mutableStateOf<File?>(null) }
     var isCompressing by remember { mutableStateOf(false) }
+    var saveStatusMessage by remember { mutableStateOf<String?>(null) }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -336,9 +430,35 @@ fun CompressPdfSection() {
                         stream.close()
                         inputPdfFile = temp
                         compressedPdfFile = null
+                        saveStatusMessage = null
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    val saveCompressedPdfLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { destUri: Uri? ->
+        if (destUri != null && compressedPdfFile != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openOutputStream(destUri)?.use { out ->
+                        FileInputStream(compressedPdfFile!!).use { inStream ->
+                            inStream.copyTo(out)
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        saveStatusMessage = "Compressed PDF saved (${String.format(Locale.US, "%.1f", compressedPdfFile!!.length() / 1024.0)} KB)"
+                        Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }
@@ -351,7 +471,7 @@ fun CompressPdfSection() {
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text("Smart PDF Compressor", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-            Text("Compress large scanned certificates to strictly fit portal limits (e.g. 50-300 KB)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Compress large scanned certificates down to portal limits (50-300 KB)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -368,7 +488,7 @@ fun CompressPdfSection() {
                     ) {
                         Column {
                             Text(inputPdfFile!!.name, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text("Original: ${String.format(Locale.US, "%.1f", inputPdfFile!!.length() / 1024.0)} KB", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+                            Text("Original Size: ${String.format(Locale.US, "%.1f", inputPdfFile!!.length() / 1024.0)} KB", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
                         }
                         IconButton(onClick = { filePickerLauncher.launch(arrayOf("application/pdf")) }) {
                             Icon(imageVector = Icons.Default.UploadFile, contentDescription = "Change PDF")
@@ -399,6 +519,7 @@ fun CompressPdfSection() {
                     onClick = {
                         coroutineScope.launch {
                             isCompressing = true
+                            saveStatusMessage = null
                             val compressed = PdfProcessor.compressPdfToTargetKb(
                                 context = context,
                                 inputPdfFile = inputPdfFile!!,
@@ -414,7 +535,7 @@ fun CompressPdfSection() {
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     if (isCompressing) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Compressing PDF...")
                     } else {
@@ -450,17 +571,38 @@ fun CompressPdfSection() {
                             Text("Compressed Successfully!", fontWeight = FontWeight.Bold, color = EmeraldTertiary)
                         }
                         Spacer(modifier = Modifier.height(6.dp))
-                        Text("New Size: ${String.format(Locale.US, "%.1f", compFile.length() / 1024.0)} KB (Below $targetMaxKb KB target)", fontSize = 12.sp)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Button(
-                            onClick = { sharePreparedFiles(context, listOf(compFile)) },
-                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Save / Export Compressed PDF")
+                        Text("New Size: ${String.format(Locale.US, "%.1f", compFile.length() / 1024.0)} KB (Below $targetMaxKb KB limit)", fontSize = 12.sp)
+
+                        if (saveStatusMessage != null) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("✓ $saveStatusMessage", fontSize = 11.sp, color = EmeraldTertiary, fontWeight = FontWeight.Bold)
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    val suggestedName = "compressed_${targetMaxKb}kb_${compFile.name}"
+                                    saveCompressedPdfLauncher.launch(suggestedName)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Save to Device", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = { sharePreparedFiles(context, listOf(compFile)) },
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
@@ -478,8 +620,8 @@ fun FrontBackMergeSection() {
     var backBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var mergedPdfFile by remember { mutableStateOf<File?>(null) }
     var isMerging by remember { mutableStateOf(false) }
-
     var isSelectingFront by remember { mutableStateOf(true) }
+    var saveStatusMessage by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -489,6 +631,33 @@ fun FrontBackMergeSection() {
                 val bmp = ImageProcessor.decodeBitmapFromUri(context, uri)
                 if (bmp != null) {
                     if (isSelectingFront) frontBitmap = bmp else backBitmap = bmp
+                    mergedPdfFile = null
+                    saveStatusMessage = null
+                }
+            }
+        }
+    }
+
+    val saveMergedPdfLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { destUri: Uri? ->
+        if (destUri != null && mergedPdfFile != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openOutputStream(destUri)?.use { out ->
+                        FileInputStream(mergedPdfFile!!).use { inStream ->
+                            inStream.copyTo(out)
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        saveStatusMessage = "Merged PDF saved (${String.format(Locale.US, "%.1f", mergedPdfFile!!.length() / 1024.0)} KB)"
+                        Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }
@@ -558,6 +727,7 @@ fun FrontBackMergeSection() {
                     if (frontBitmap != null && backBitmap != null) {
                         coroutineScope.launch {
                             isMerging = true
+                            saveStatusMessage = null
                             val merged = PdfProcessor.createFrontAndBackCardPdf(
                                 context = context,
                                 frontBitmap = frontBitmap!!,
@@ -577,7 +747,7 @@ fun FrontBackMergeSection() {
                 modifier = Modifier.fillMaxWidth()
             ) {
                 if (isMerging) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("Merging Sides...")
                 } else {
@@ -599,16 +769,37 @@ fun FrontBackMergeSection() {
                         Text("Combined PDF Ready!", fontWeight = FontWeight.Bold, color = EmeraldTertiary)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text("Size: ${String.format(Locale.US, "%.1f", pdfFile.length() / 1024.0)} KB", fontSize = 12.sp)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Button(
-                            onClick = { sharePreparedFiles(context, listOf(pdfFile)) },
-                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Save / Export Merged PDF")
+
+                        if (saveStatusMessage != null) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("✓ $saveStatusMessage", fontSize = 11.sp, color = EmeraldTertiary, fontWeight = FontWeight.Bold)
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    val suggestedName = "id_card_merged_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
+                                    saveMergedPdfLauncher.launch(suggestedName)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Save to Device", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = { sharePreparedFiles(context, listOf(pdfFile)) },
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
