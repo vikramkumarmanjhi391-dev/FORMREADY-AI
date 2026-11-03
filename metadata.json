@@ -1,0 +1,6 @@
+{
+  "name": "FormReady AI",
+  "description": "All-in-one document preparation & online application studio for Indian government, recruitment, and entrance examinations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
