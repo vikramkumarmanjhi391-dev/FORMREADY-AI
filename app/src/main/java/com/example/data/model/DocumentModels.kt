@@ -30,6 +30,14 @@ enum class DocumentType(val displayName: String, val category: String) {
     PWD_CERTIFICATE("PwD / Disability / UDID Certificate", "Disability"),
     EXPERIENCE_CERTIFICATE("Work Experience Certificate", "Employment"),
     NOC_CERTIFICATE("No Objection Certificate (NOC)", "Employment"),
+    BANK_STATEMENT("Bank Account Statement", "Bank"),
+    BANK_PASSBOOK("Bank Passbook Copy", "Bank"),
+    BANK_CHEQUE("Cancelled Cheque", "Bank"),
+    INSURANCE_POLICY("Insurance Policy Document", "Insurance"),
+    INSURANCE_RECEIPT("Insurance Premium Receipt", "Insurance"),
+    VEHICLE_RC("Vehicle Registration (RC Book)", "Vehicle"),
+    VEHICLE_PUC("Pollution Under Control (PUC)", "Vehicle"),
+    VEHICLE_INSURANCE("Motor Insurance Policy", "Vehicle"),
     OTHER_SUPPORTING("Other Supporting Document", "General")
 }
 

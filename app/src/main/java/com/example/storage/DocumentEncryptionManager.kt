@@ -153,6 +153,7 @@ class DocumentEncryptionManager(
      * Encrypts source file atomically into target encrypted file via temporary file.
      */
     fun encryptFileAtomically(sourceFile: File, destinationEncryptedFile: File) {
+        destinationEncryptedFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
         val tempFile = File(destinationEncryptedFile.parentFile, "${destinationEncryptedFile.name}_${UUID.randomUUID()}.tmp")
         try {
             FileInputStream(sourceFile).use { inStream ->

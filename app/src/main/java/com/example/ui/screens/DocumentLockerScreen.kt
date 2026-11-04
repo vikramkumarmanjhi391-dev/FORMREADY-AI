@@ -49,7 +49,10 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material.icons.outlined.StarBorder
+import androidx.compose.ui.graphics.Color
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
@@ -124,10 +127,25 @@ class CreateCustomDocumentContract : ActivityResultContract<Pair<String, String>
 
 @Composable
 fun DocumentLockerScreen(
+    initialCategory: String? = null,
+    initialFolderId: String? = null,
+    initialShowImportant: Boolean = false,
     viewModel: DocumentLockerViewModel = viewModel(factory = DocumentLockerViewModel.Factory)
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(initialCategory, initialFolderId, initialShowImportant) {
+        if (initialCategory != null) {
+            viewModel.setSelectedCategory(initialCategory)
+        }
+        if (initialFolderId != null) {
+            viewModel.setSelectedFolderId(initialFolderId)
+        }
+        if (initialShowImportant) {
+            viewModel.setShowOnlyImportant(true)
+        }
+    }
 
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val documents by viewModel.documents.collectAsStateWithLifecycle()
@@ -479,7 +497,8 @@ fun DocumentLockerScreen(
                         exportLauncher.launch(mime to "$safeName.$ext")
                     },
                     onEdit = { editingDocument = item },
-                    onDelete = { deletingDocument = item }
+                    onDelete = { deletingDocument = item },
+                    onToggleImportant = { viewModel.toggleImportant(item.id, !item.isImportant) }
                 )
             }
         }
@@ -585,7 +604,8 @@ fun DocumentVaultCard(
     onShare: () -> Unit,
     onExport: () -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onToggleImportant: () -> Unit = {}
 ) {
     val sizeKb = item.fileSizeBytes / 1024.0
     val sizeLabel = if (sizeKb >= 1024.0) {
@@ -659,7 +679,15 @@ fun DocumentVaultCard(
                     }
                 }
 
-                Row {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onToggleImportant, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            imageVector = if (item.isImportant) Icons.Default.Star else Icons.Outlined.StarBorder,
+                            contentDescription = if (item.isImportant) "Unstar" else "Star",
+                            modifier = Modifier.size(18.dp),
+                            tint = if (item.isImportant) Color(0xFFF59E0B) else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     IconButton(onClick = onEdit, modifier = Modifier.size(32.dp)) {
                         Icon(imageVector = Icons.Default.Edit, contentDescription = "Edit Details", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }

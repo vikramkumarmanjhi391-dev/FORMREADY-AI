@@ -14,7 +14,9 @@ import androidx.room.PrimaryKey
         Index(value = ["sha256Hash"]),
         Index(value = ["category"]),
         Index(value = ["documentType"]),
-        Index(value = ["createdAt"])
+        Index(value = ["createdAt"]),
+        Index(value = ["folderId"]),
+        Index(value = ["isImportant"])
     ]
 )
 data class LockerDocumentEntity(
@@ -22,7 +24,7 @@ data class LockerDocumentEntity(
     val id: String,
     val title: String,
     val documentType: String, // DocumentType enum name
-    val category: String,     // Identity, Education, Reservation, Civil, Disability, Employment, General
+    val category: String,     // Identity, Education, Reservation, Civil, Disability, Employment, General, Bank, Insurance, Vehicle, Photo
     val originalFileName: String,
     val storedEncryptedFileName: String, // relative file name in noBackupFilesDir/document_locker
     val mimeType: String,
@@ -33,5 +35,7 @@ data class LockerDocumentEntity(
     val lastUpdatedAt: Long = System.currentTimeMillis(),
     val notes: String = "",
     val isMasked: Boolean = false,
-    val integrityStatus: String = "AVAILABLE" // AVAILABLE, MISSING_FILE, INTEGRITY_FAILED
+    val integrityStatus: String = "AVAILABLE", // AVAILABLE, MISSING_FILE, INTEGRITY_FAILED, PENDING_DELETE
+    val isImportant: Boolean = false,
+    val folderId: String? = null
 )

@@ -20,6 +20,9 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import com.example.data.database.FolderDao
+import com.example.data.database.FolderEntity
+import com.example.data.database.FolderWithCount
 import java.util.UUID
 
 enum class SortOption(val label: String) {
@@ -43,8 +46,20 @@ data class StorageReconciliationReport(
 class DocumentLockerRepository(
     private val context: Context,
     private val dao: LockerDocumentDao = FormReadyDatabase.getInstance(context).lockerDocumentDao(),
+    private val folderDao: FolderDao = FormReadyDatabase.getInstance(context).folderDao(),
     private val encryptionManager: DocumentEncryptionManager = DocumentEncryptionManager(context)
 ) {
+    constructor(
+        context: Context,
+        dao: LockerDocumentDao,
+        encryptionManager: DocumentEncryptionManager
+    ) : this(
+        context = context,
+        dao = dao,
+        folderDao = FormReadyDatabase.getInstance(context).folderDao(),
+        encryptionManager = encryptionManager
+    )
+
     companion object {
         const val STATUS_AVAILABLE = "AVAILABLE"
         const val STATUS_MISSING_FILE = "MISSING_FILE"
@@ -123,7 +138,9 @@ class DocumentLockerRepository(
         title: String,
         documentType: DocumentType,
         originalFileName: String = file.name,
-        notes: String = ""
+        notes: String = "",
+        isImportant: Boolean = false,
+        folderId: String? = null
     ): Result<LockerDocumentEntity> = withContext(Dispatchers.IO) {
         try {
             // 1. Deep validate source file
@@ -163,7 +180,9 @@ class DocumentLockerRepository(
                 lastUpdatedAt = System.currentTimeMillis(),
                 notes = notes,
                 isMasked = false,
-                integrityStatus = STATUS_AVAILABLE
+                integrityStatus = STATUS_AVAILABLE,
+                isImportant = isImportant,
+                folderId = folderId
             )
 
             try {
@@ -186,7 +205,9 @@ class DocumentLockerRepository(
         title: String,
         documentType: DocumentType,
         notes: String = "",
-        isMasked: Boolean = false
+        isMasked: Boolean = false,
+        isImportant: Boolean = false,
+        folderId: String? = null
     ): Result<LockerDocumentEntity> = withContext(Dispatchers.IO) {
         val stagingFile = File(context.cacheDir, "import_stage_${UUID.randomUUID()}.tmp")
         try {
@@ -216,7 +237,9 @@ class DocumentLockerRepository(
                 title = title,
                 documentType = documentType,
                 originalFileName = originalName,
-                notes = notes
+                notes = notes,
+                isImportant = isImportant,
+                folderId = folderId
             )
         } catch (e: Exception) {
             Result.failure(e)
@@ -504,5 +527,65 @@ class DocumentLockerRepository(
 
     suspend fun getDocumentById(id: String): LockerDocumentEntity? = withContext(Dispatchers.IO) {
         dao.getDocumentByIdSync(id)
+    }
+
+    // --- Phase 4: Folder and Organization Operations ---
+
+    val foldersWithCounts: Flow<List<FolderWithCount>> = folderDao.getAllFoldersWithCounts()
+    val allFolders: Flow<List<FolderEntity>> = folderDao.getAllFolders()
+
+    fun getDocumentsInFolder(folderId: String): Flow<List<LockerDocumentEntity>> {
+        return dao.getDocumentsByFolder(folderId)
+    }
+
+    fun getImportantDocuments(): Flow<List<LockerDocumentEntity>> {
+        return dao.getImportantDocuments()
+    }
+
+    fun getCategoryCounts(): Flow<Map<String, Int>> {
+        return dao.getCategoryCounts().map { list ->
+            list.associate { it.category to it.count }
+        }
+    }
+
+    fun getTotalDocumentCount(): Flow<Int> = dao.getTotalCount()
+
+    fun getImportantDocumentCount(): Flow<Int> = dao.getImportantCount()
+
+    fun getFolderCount(): Flow<Int> = folderDao.getFolderCount()
+
+    suspend fun createFolder(name: String, colorHex: String, iconName: String): String = withContext(Dispatchers.IO) {
+        val folderId = "folder_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
+        val folder = FolderEntity(
+            id = folderId,
+            name = name.trim(),
+            colorHex = colorHex,
+            iconName = iconName,
+            createdAt = System.currentTimeMillis(),
+            updatedAt = System.currentTimeMillis()
+        )
+        folderDao.insertFolder(folder)
+        folderId
+    }
+
+    suspend fun updateFolder(folder: FolderEntity) = withContext(Dispatchers.IO) {
+        folderDao.updateFolder(folder.copy(updatedAt = System.currentTimeMillis()))
+    }
+
+    /**
+     * Deletes a custom folder. Safe operation: unassigns all associated documents first
+     * (setting folderId = null) so no documents are deleted or orphaned.
+     */
+    suspend fun deleteFolder(folderId: String) = withContext(Dispatchers.IO) {
+        dao.unassignAllFromFolder(folderId)
+        folderDao.deleteFolderById(folderId)
+    }
+
+    suspend fun assignDocumentToFolder(documentId: String, folderId: String?) = withContext(Dispatchers.IO) {
+        dao.assignToFolder(documentId, folderId)
+    }
+
+    suspend fun toggleImportant(documentId: String, isImportant: Boolean) = withContext(Dispatchers.IO) {
+        dao.updateImportantStatus(documentId, isImportant)
     }
 }

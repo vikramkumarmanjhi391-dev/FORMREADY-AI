@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -28,6 +29,8 @@ import java.io.OutputStream
 data class LockerUiState(
     val searchQuery: String = "",
     val selectedCategory: String = "All",
+    val selectedFolderId: String? = null,
+    val showOnlyImportant: Boolean = false,
     val sortOption: SortOption = SortOption.RECENT,
     val isLoading: Boolean = false,
     val isImporting: Boolean = false,
@@ -46,21 +49,49 @@ class DocumentLockerViewModel @JvmOverloads constructor(
 
     private val _searchQuery = MutableStateFlow("")
     private val _selectedCategory = MutableStateFlow("All")
+    private val _selectedFolderId = MutableStateFlow<String?>(null)
+    private val _showOnlyImportant = MutableStateFlow(false)
     private val _sortOption = MutableStateFlow(SortOption.RECENT)
+
+    val foldersWithCounts = repository.foldersWithCounts.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
 
     @OptIn(ExperimentalCoroutinesApi::class)
     val documents: StateFlow<List<LockerDocumentEntity>> = combine(
-        _searchQuery,
-        _selectedCategory,
-        _sortOption
-    ) { query, category, sort ->
-        Triple(query, category, sort)
-    }.flatMapLatest { (query, category, sort) ->
-        repository.getFilteredAndSortedDocuments(query, category, sort)
+        combine(_searchQuery, _selectedCategory, _selectedFolderId) { q, c, f ->
+            Triple(q, c, f)
+        },
+        combine(_showOnlyImportant, _sortOption) { i, s ->
+            Pair(i, s)
+        }
+    ) { (query, category, folderId), (onlyImportant, sort) ->
+        FolderFilterParams(query, category, folderId, onlyImportant, sort)
+    }.flatMapLatest { params ->
+        repository.getFilteredAndSortedDocuments(params.query, params.category, params.sort).map { list ->
+            var result = list
+            if (params.onlyImportant) {
+                result = result.filter { it.isImportant }
+            }
+            if (params.folderId != null) {
+                result = result.filter { it.folderId == params.folderId }
+            }
+            result
+        }
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = emptyList()
+    )
+
+    private data class FolderFilterParams(
+        val query: String,
+        val category: String,
+        val folderId: String?,
+        val onlyImportant: Boolean,
+        val sort: SortOption
     )
 
     init {
@@ -75,6 +106,28 @@ class DocumentLockerViewModel @JvmOverloads constructor(
     fun setSelectedCategory(category: String) {
         _selectedCategory.value = category
         _uiState.update { it.copy(selectedCategory = category) }
+    }
+
+    fun setSelectedFolderId(folderId: String?) {
+        _selectedFolderId.value = folderId
+        _uiState.update { it.copy(selectedFolderId = folderId) }
+    }
+
+    fun setShowOnlyImportant(onlyImportant: Boolean) {
+        _showOnlyImportant.value = onlyImportant
+        _uiState.update { it.copy(showOnlyImportant = onlyImportant) }
+    }
+
+    fun toggleImportant(id: String, isImportant: Boolean) {
+        viewModelScope.launch {
+            repository.toggleImportant(id, isImportant)
+        }
+    }
+
+    fun assignToFolder(id: String, folderId: String?) {
+        viewModelScope.launch {
+            repository.assignDocumentToFolder(id, folderId)
+        }
     }
 
     fun setSortOption(sortOption: SortOption) {
