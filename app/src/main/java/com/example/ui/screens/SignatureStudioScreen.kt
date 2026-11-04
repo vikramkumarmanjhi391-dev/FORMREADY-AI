@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -136,13 +137,23 @@ fun SignatureStudioScreen(
     var selectedFormat by remember { mutableStateOf(FileFormat.JPG) }
 
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
+    var isCameraOpen by remember { mutableStateOf(false) }
+    var currentMediaInput by remember { mutableStateOf<com.example.camera.UnifiedMediaInput?>(null) }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
             coroutineScope.launch {
-                val bmp = ImageProcessor.decodeBitmapFromUri(context, uri)
+                val mediaInput = com.example.camera.UnifiedMediaInput.fromGalleryUri(
+                    uri = uri,
+                    mode = if (selectedPreset.type == DocumentType.THUMB_IMPRESSION_LEFT || selectedPreset.type == DocumentType.THUMB_IMPRESSION_RIGHT)
+                        com.example.camera.CameraCaptureMode.THUMB_IMPRESSION
+                    else
+                        com.example.camera.CameraCaptureMode.SIGNATURE
+                )
+                currentMediaInput = mediaInput
+                val bmp = mediaInput.resolveBitmap(context)
                 if (bmp != null) {
                     sourceBitmap = bmp
                     processedResult = null
@@ -152,6 +163,33 @@ fun SignatureStudioScreen(
                 }
             }
         }
+    }
+
+    if (isCameraOpen) {
+        val captureMode = if (selectedPreset.type == DocumentType.THUMB_IMPRESSION_LEFT || selectedPreset.type == DocumentType.THUMB_IMPRESSION_RIGHT) {
+            com.example.camera.CameraCaptureMode.THUMB_IMPRESSION
+        } else {
+            com.example.camera.CameraCaptureMode.SIGNATURE
+        }
+        com.example.camera.UniversalCameraScreen(
+            mode = captureMode,
+            onMediaCaptured = { input ->
+                isCameraOpen = false
+                currentMediaInput = input
+                coroutineScope.launch {
+                    val bmp = input.resolveBitmap(context)
+                    if (bmp != null) {
+                        sourceBitmap = bmp
+                        processedResult = null
+                        saveStatusMessage = null
+                    } else {
+                        Toast.makeText(context, "Failed to decode captured signature.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onDismiss = { isCameraOpen = false }
+        )
+        return
     }
 
     // Storage Access Framework: Save to Device
@@ -280,18 +318,17 @@ fun SignatureStudioScreen(
                                 fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(
-                                onClick = {
+                            Spacer(modifier = Modifier.height(14.dp))
+                            com.example.camera.MediaSourceSelectionBar(
+                                onTakePhoto = { isCameraOpen = true },
+                                onChooseGallery = {
                                     photoPickerLauncher.launch(
                                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                                     )
                                 },
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.testTag("select_signature_btn")
-                            ) {
-                                Text("Choose Signature File", fontSize = 12.sp)
-                            }
+                                takePhotoButtonText = "Capture (Camera)",
+                                galleryButtonText = "Choose (Gallery)"
+                            )
                         }
                     }
                 }
@@ -446,11 +483,11 @@ fun SignatureStudioScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Action Buttons
+            // Action Buttons: One-Click Prepare Signature & Replace
             if (sourceBitmap != null) {
-                Row(
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Button(
                         onClick = {
@@ -494,31 +531,50 @@ fun SignatureStudioScreen(
                             }
                         },
                         enabled = !isProcessing,
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.weight(1f).testTag("process_signature_btn")
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("one_click_prepare_signature_btn")
                     ) {
                         if (isProcessing) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Processing...", fontSize = 12.sp)
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Preparing Signature...", fontSize = 14.sp)
                         } else {
-                            Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Process & Clean", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("ONE-CLICK PREPARE SIGNATURE", fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         }
                     }
 
-                    OutlinedButton(
-                        onClick = {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
-                        shape = RoundedCornerShape(10.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Replace", fontSize = 12.sp)
+                        OutlinedButton(
+                            onClick = { isCameraOpen = true },
+                            modifier = Modifier.weight(1f).testTag("signature_replace_camera_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Retake (Camera)", fontSize = 11.sp)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            modifier = Modifier.weight(1f).testTag("signature_replace_gallery_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Change (Gallery)", fontSize = 11.sp)
+                        }
                     }
                 }
             }

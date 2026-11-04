@@ -167,6 +167,8 @@ fun PhotoStudioScreen(
 
     var qualityReport by remember { mutableStateOf<QualityInspector.QualityReport?>(null) }
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
+    var isCameraOpen by remember { mutableStateOf(false) }
+    var currentMediaInput by remember { mutableStateOf<com.example.camera.UnifiedMediaInput?>(null) }
 
     // Launcher for selecting an image from Android Photo Picker (zero-permission)
     val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -174,7 +176,9 @@ fun PhotoStudioScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             coroutineScope.launch {
-                val bmp = ImageProcessor.decodeBitmapFromUri(context, uri)
+                val mediaInput = com.example.camera.UnifiedMediaInput.fromGalleryUri(uri, com.example.camera.CameraCaptureMode.PASSPORT_PHOTO)
+                currentMediaInput = mediaInput
+                val bmp = mediaInput.resolveBitmap(context)
                 if (bmp != null) {
                     sourceBitmap = bmp
                     qualityReport = QualityInspector.inspectImageQuality(bmp)
@@ -185,6 +189,29 @@ fun PhotoStudioScreen(
                 }
             }
         }
+    }
+
+    if (isCameraOpen) {
+        com.example.camera.UniversalCameraScreen(
+            mode = com.example.camera.CameraCaptureMode.PASSPORT_PHOTO,
+            onMediaCaptured = { input ->
+                isCameraOpen = false
+                currentMediaInput = input
+                coroutineScope.launch {
+                    val bmp = input.resolveBitmap(context)
+                    if (bmp != null) {
+                        sourceBitmap = bmp
+                        qualityReport = QualityInspector.inspectImageQuality(bmp)
+                        processedResult = null
+                        saveStatusMessage = null
+                    } else {
+                        Toast.makeText(context, "Failed to decode captured photo.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onDismiss = { isCameraOpen = false }
+        )
+        return
     }
 
     // Storage Access Framework: Save to Device
@@ -333,17 +360,16 @@ fun PhotoStudioScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Spacer(modifier = Modifier.height(14.dp))
-                            Button(
-                                onClick = {
+                            com.example.camera.MediaSourceSelectionBar(
+                                onTakePhoto = { isCameraOpen = true },
+                                onChooseGallery = {
                                     photoPickerLauncher.launch(
                                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                                     )
                                 },
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.testTag("select_photo_btn")
-                            ) {
-                                Text("Select Photo from Device")
-                            }
+                                takePhotoButtonText = "Take Photo",
+                                galleryButtonText = "Choose Gallery"
+                            )
                         }
                     }
                 }
@@ -581,11 +607,11 @@ fun PhotoStudioScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Action Buttons: Process & Replace
+            // Action Buttons: One-Click Auto Prepare & Replace
             if (sourceBitmap != null) {
-                Row(
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Button(
                         onClick = {
@@ -629,31 +655,50 @@ fun PhotoStudioScreen(
                             }
                         },
                         enabled = !isProcessing,
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.weight(1f).testTag("process_photo_btn")
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("one_click_auto_prepare_btn")
                     ) {
                         if (isProcessing) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Processing...", fontSize = 13.sp)
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Auto Preparing Photo...", fontSize = 14.sp)
                         } else {
-                            Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Process & Prepare", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("ONE-CLICK AUTO PREPARE", fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         }
                     }
 
-                    OutlinedButton(
-                        onClick = {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
-                        shape = RoundedCornerShape(10.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Replace", fontSize = 12.sp)
+                        OutlinedButton(
+                            onClick = { isCameraOpen = true },
+                            modifier = Modifier.weight(1f).testTag("photo_replace_camera_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Retake (Camera)", fontSize = 11.sp)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            modifier = Modifier.weight(1f).testTag("photo_replace_gallery_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Change (Gallery)", fontSize = 11.sp)
+                        }
                     }
                 }
             }

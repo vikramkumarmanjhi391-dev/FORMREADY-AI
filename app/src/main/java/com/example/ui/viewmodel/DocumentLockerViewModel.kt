@@ -182,6 +182,40 @@ class DocumentLockerViewModel @JvmOverloads constructor(
         }
     }
 
+    fun importFile(
+        file: File,
+        title: String,
+        documentType: DocumentType,
+        originalFileName: String = file.name,
+        notes: String = "",
+        isMasked: Boolean = false,
+        onSuccess: () -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isImporting = true, errorMessage = null, statusMessage = null) }
+            val result = repository.importFile(file, title, documentType, originalFileName, notes, isMasked)
+            result.fold(
+                onSuccess = { doc ->
+                    _uiState.update {
+                        it.copy(
+                            isImporting = false,
+                            statusMessage = "\"${doc.title}\" encrypted and saved to Locker!"
+                        )
+                    }
+                    onSuccess()
+                },
+                onFailure = { error ->
+                    _uiState.update {
+                        it.copy(
+                            isImporting = false,
+                            errorMessage = error.localizedMessage ?: "Failed to import document"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
     fun updateMetadata(
         id: String,
         title: String,

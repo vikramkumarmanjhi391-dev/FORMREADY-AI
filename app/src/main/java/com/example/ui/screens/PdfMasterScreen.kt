@@ -77,6 +77,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.camera.CameraCaptureMode
+import com.example.camera.UnifiedMediaInput
+import com.example.camera.UniversalCameraScreen
 import com.example.processing.ImageProcessor
 import com.example.processing.PdfProcessor
 import com.example.ui.theme.EmeraldTertiary
@@ -91,6 +94,9 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.graphics.BitmapFactory
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
 
 @Composable
 fun PdfMasterScreen() {
@@ -161,6 +167,7 @@ fun ImagesToPdfSection() {
     var generatedPdfFile by remember { mutableStateOf<File?>(null) }
     var isGenerating by remember { mutableStateOf(false) }
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
+    var showCameraCapture by remember { mutableStateOf(false) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 15)
@@ -173,6 +180,29 @@ fun ImagesToPdfSection() {
                 }
             }
         }
+    }
+
+    if (showCameraCapture) {
+        UniversalCameraScreen(
+            mode = CameraCaptureMode.MULTI_PAGE_DOCUMENT,
+            onMediaCaptured = { input ->
+                val bmp = input.toBitmap(context)
+                if (bmp != null) {
+                    pickedBitmaps.add(bmp)
+                }
+                showCameraCapture = false
+            },
+            onMultiPageCaptured = { files ->
+                files.forEach { file ->
+                    val bmp = BitmapFactory.decodeFile(file.absolutePath)
+                    if (bmp != null) {
+                        pickedBitmaps.add(bmp)
+                    }
+                }
+                showCameraCapture = false
+            },
+            onDismiss = { showCameraCapture = false }
+        )
     }
 
     // Storage Access Framework: Save PDF to Device
@@ -212,19 +242,31 @@ fun ImagesToPdfSection() {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                     Text("Images to Single A4 PDF", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Text("Combine Class 10/12, Degrees, Caste certificates", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Combine Class 10/12, Degrees, Certificates", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Button(
-                    onClick = {
-                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    },
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Add Pages", fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(
+                        onClick = { showCameraCapture = true },
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.testTag("scan_pdf_camera_btn")
+                    ) {
+                        Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Scan", fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = {
+                            photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.testTag("add_pdf_gallery_btn")
+                    ) {
+                        Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Add", fontSize = 12.sp)
+                    }
                 }
             }
 
@@ -740,6 +782,28 @@ fun FrontBackMergeSection() {
         }
     }
 
+    var cameraTargetForIdCard by remember { mutableStateOf<String?>(null) } // "front" or "back" or null
+
+    if (cameraTargetForIdCard != null) {
+        UniversalCameraScreen(
+            mode = CameraCaptureMode.DOCUMENT_PAGE,
+            onMediaCaptured = { input ->
+                val bmp = input.toBitmap(context)
+                if (bmp != null) {
+                    if (cameraTargetForIdCard == "front") {
+                        frontBitmap = bmp
+                    } else {
+                        backBitmap = bmp
+                    }
+                    mergedPdfFile = null
+                    saveStatusMessage = null
+                }
+                cameraTargetForIdCard = null
+            },
+            onDismiss = { cameraTargetForIdCard = null }
+        )
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -754,10 +818,7 @@ fun FrontBackMergeSection() {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 // Front Card Box
                 Card(
-                    modifier = Modifier.weight(1f).height(120.dp).clickable {
-                        isSelectingFront = true
-                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    },
+                    modifier = Modifier.weight(1f).height(140.dp),
                     shape = RoundedCornerShape(10.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
@@ -765,10 +826,63 @@ fun FrontBackMergeSection() {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         if (frontBitmap != null) {
                             Image(bitmap = frontBitmap!!.asImageBitmap(), contentDescription = "Front side", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .background(Color.Black.copy(alpha = 0.65f))
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Text(
+                                    text = "Camera",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    modifier = Modifier.clickable { cameraTargetForIdCard = "front" }.padding(horizontal = 6.dp)
+                                )
+                                Text("•", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+                                Text(
+                                    text = "Gallery",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    modifier = Modifier.clickable {
+                                        isSelectingFront = true
+                                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                    }.padding(horizontal = 6.dp)
+                                )
+                            }
                         } else {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                                Text("Pick Front Side", fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(8.dp)
+                            ) {
+                                Text("Front Side (ID)", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    OutlinedButton(
+                                        onClick = { cameraTargetForIdCard = "front" },
+                                        modifier = Modifier.height(30.dp),
+                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(12.dp))
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text("Cam", fontSize = 10.sp)
+                                    }
+                                    Button(
+                                        onClick = {
+                                            isSelectingFront = true
+                                            photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                        },
+                                        modifier = Modifier.height(30.dp),
+                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(12.dp))
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text("Pick", fontSize = 10.sp)
+                                    }
+                                }
                             }
                         }
                     }
@@ -776,10 +890,7 @@ fun FrontBackMergeSection() {
 
                 // Back Card Box
                 Card(
-                    modifier = Modifier.weight(1f).height(120.dp).clickable {
-                        isSelectingFront = false
-                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    },
+                    modifier = Modifier.weight(1f).height(140.dp),
                     shape = RoundedCornerShape(10.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
@@ -787,10 +898,63 @@ fun FrontBackMergeSection() {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         if (backBitmap != null) {
                             Image(bitmap = backBitmap!!.asImageBitmap(), contentDescription = "Back side", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .background(Color.Black.copy(alpha = 0.65f))
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Text(
+                                    text = "Camera",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    modifier = Modifier.clickable { cameraTargetForIdCard = "back" }.padding(horizontal = 6.dp)
+                                )
+                                Text("•", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+                                Text(
+                                    text = "Gallery",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    modifier = Modifier.clickable {
+                                        isSelectingFront = false
+                                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                    }.padding(horizontal = 6.dp)
+                                )
+                            }
                         } else {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                                Text("Pick Back Side", fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(8.dp)
+                            ) {
+                                Text("Back Side (ID)", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    OutlinedButton(
+                                        onClick = { cameraTargetForIdCard = "back" },
+                                        modifier = Modifier.height(30.dp),
+                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(12.dp))
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text("Cam", fontSize = 10.sp)
+                                    }
+                                    Button(
+                                        onClick = {
+                                            isSelectingFront = false
+                                            photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                        },
+                                        modifier = Modifier.height(30.dp),
+                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(12.dp))
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text("Pick", fontSize = 10.sp)
+                                    }
+                                }
                             }
                         }
                     }

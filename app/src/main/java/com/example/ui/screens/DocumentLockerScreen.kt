@@ -101,7 +101,11 @@ import com.example.storage.DocumentValidationManager
 import com.example.ui.theme.NavyPrimary
 import com.example.ui.theme.SaffronSecondary
 import com.example.ui.theme.VerifiedGreen
+import com.example.camera.CameraCaptureMode
+import com.example.camera.UniversalCameraScreen
+import com.example.processing.PdfProcessor
 import com.example.ui.viewmodel.DocumentLockerViewModel
+import androidx.compose.material.icons.filled.PhotoCamera
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -778,16 +782,19 @@ fun AddDocumentDialog(
     var notes by remember { mutableStateOf("") }
     var selectedType by remember { mutableStateOf(DocumentType.CLASS_10_MARKSHEET) }
     var pickedUri by remember { mutableStateOf<Uri?>(null) }
+    var capturedFile by remember { mutableStateOf<File?>(null) }
     var validationResult by remember { mutableStateOf<com.example.storage.DocumentValidationResult?>(null) }
     var duplicateDoc by remember { mutableStateOf<LockerDocumentEntity?>(null) }
     var isValidating by remember { mutableStateOf(false) }
     var showTypeMenu by remember { mutableStateOf(false) }
+    var showCameraCapture by remember { mutableStateOf(false) }
 
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
             pickedUri = uri
+            capturedFile = null
             isValidating = true
             coroutineScope.launch(Dispatchers.IO) {
                 val validation = DocumentValidationManager.validateUri(context, uri)
@@ -807,6 +814,61 @@ fun AddDocumentDialog(
                 }
             }
         }
+    }
+
+    if (showCameraCapture) {
+        UniversalCameraScreen(
+            mode = CameraCaptureMode.MULTI_PAGE_DOCUMENT,
+            onMediaCaptured = { input ->
+                showCameraCapture = false
+                val file = input.file ?: input.resolveTemporaryFile(context)
+                if (file != null) {
+                    capturedFile = file
+                    pickedUri = null
+                    isValidating = true
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val validation = DocumentValidationManager.validateFile(file)
+                        validationResult = validation
+                        isValidating = false
+                        if (title.isBlank()) {
+                            title = "Scanned Document ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())}"
+                        }
+                    }
+                }
+            },
+            onMultiPageCaptured = { files ->
+                showCameraCapture = false
+                isValidating = true
+                coroutineScope.launch(Dispatchers.IO) {
+                    if (files.size == 1) {
+                        val file = files.first()
+                        capturedFile = file
+                        pickedUri = null
+                        val validation = DocumentValidationManager.validateFile(file)
+                        validationResult = validation
+                        if (title.isBlank()) {
+                            title = "Scanned Document ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())}"
+                        }
+                    } else if (files.size > 1) {
+                        val bitmaps = files.mapNotNull { BitmapFactory.decodeFile(it.absolutePath) }
+                        val outputPdf = PdfProcessor.createPdfFromBitmaps(
+                            context = context,
+                            bitmaps = bitmaps,
+                            outputFileName = "scanned_${System.currentTimeMillis()}.pdf"
+                        )
+                        capturedFile = outputPdf
+                        pickedUri = null
+                        val validation = DocumentValidationManager.validateFile(outputPdf)
+                        validationResult = validation
+                        if (title.isBlank()) {
+                            title = "Multi-Page Scan (${files.size} Pages)"
+                        }
+                    }
+                    isValidating = false
+                }
+            },
+            onDismiss = { showCameraCapture = false }
+        )
     }
 
     AlertDialog(
@@ -874,16 +936,32 @@ fun AddDocumentDialog(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                OutlinedButton(
-                    onClick = { filePicker.launch(arrayOf("application/pdf", "image/jpeg", "image/png")) },
-                    modifier = Modifier.fillMaxWidth().testTag("select_vault_file_btn"),
-                    shape = RoundedCornerShape(8.dp)
+                Text("Attach Document Source", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(imageVector = Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        if (pickedUri != null) "Change Selected File" else "Attach Genuine Document (PDF/JPG/PNG)"
-                    )
+                    OutlinedButton(
+                        onClick = { showCameraCapture = true },
+                        modifier = Modifier.weight(1f).testTag("camera_vault_scan_btn"),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Scan Doc", fontSize = 11.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = { filePicker.launch(arrayOf("application/pdf", "image/jpeg", "image/png")) },
+                        modifier = Modifier.weight(1f).testTag("select_vault_file_btn"),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(if (pickedUri != null) "Change File" else "Attach File", fontSize = 11.sp)
+                    }
                 }
 
                 if (isValidating) {
@@ -948,9 +1026,19 @@ fun AddDocumentDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    pickedUri?.let { uri ->
+                    if (capturedFile != null) {
+                        viewModel.importFile(
+                            file = capturedFile!!,
+                            title = title.ifBlank { "Scanned Document" },
+                            documentType = selectedType,
+                            originalFileName = capturedFile!!.name,
+                            notes = notes,
+                            isMasked = false,
+                            onSuccess = onDismiss
+                        )
+                    } else if (pickedUri != null) {
                         viewModel.importDocument(
-                            uri = uri,
+                            uri = pickedUri!!,
                             title = title.ifBlank { "Saved Document" },
                             documentType = selectedType,
                             notes = notes,
@@ -959,7 +1047,7 @@ fun AddDocumentDialog(
                         )
                     }
                 },
-                enabled = pickedUri != null && validationResult?.isValid == true && title.isNotBlank(),
+                enabled = (pickedUri != null || capturedFile != null) && validationResult?.isValid == true && title.isNotBlank(),
                 shape = RoundedCornerShape(8.dp),
                 modifier = Modifier.testTag("confirm_vault_save_btn")
             ) {
