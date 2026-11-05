@@ -30,6 +30,8 @@ object PdfProcessor {
 
     /**
      * Converts a list of Bitmaps into a single standard A4 PDF document.
+     * Ensures that [PdfDocument] is always closed in a `finally` block and that empty or unreadable
+     * page lists fail safely.
      */
     suspend fun createPdfFromBitmaps(
         context: Context,
@@ -37,41 +39,57 @@ object PdfProcessor {
         outputFileName: String = "document_${System.currentTimeMillis()}.pdf",
         marginPoints: Int = 24
     ): File = withContext(Dispatchers.IO) {
+        val validBitmaps = bitmaps.filter { !it.isRecycled && it.width > 0 && it.height > 0 }
+        require(validBitmaps.isNotEmpty()) { "Cannot generate PDF from an empty or invalid page list" }
+
         val pdfDocument = PdfDocument()
-
-        bitmaps.forEachIndexed { index, bitmap ->
-            val pageInfo = PdfDocument.PageInfo.Builder(A4_WIDTH_POINTS, A4_HEIGHT_POINTS, index + 1).create()
-            val page = pdfDocument.startPage(pageInfo)
-            val canvas: Canvas = page.canvas
-
-            // Fill white background
-            val bgPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.FILL }
-            canvas.drawRect(0f, 0f, A4_WIDTH_POINTS.toFloat(), A4_HEIGHT_POINTS.toFloat(), bgPaint)
-
-            // Calculate scaled rect inside margins preserving aspect ratio
-            val availW = A4_WIDTH_POINTS - (marginPoints * 2)
-            val availH = A4_HEIGHT_POINTS - (marginPoints * 2)
-
-            val bmpW = bitmap.width.toFloat()
-            val bmpH = bitmap.height.toFloat()
-            val scale = (availW / bmpW).coerceAtMost(availH / bmpH)
-
-            val drawW = bmpW * scale
-            val drawH = bmpH * scale
-            val left = marginPoints + (availW - drawW) / 2f
-            val top = marginPoints + (availH - drawH) / 2f
-
-            val destRect = Rect(left.toInt(), top.toInt(), (left + drawW).toInt(), (top + drawH).toInt())
-            canvas.drawBitmap(bitmap, null, destRect, Paint(Paint.FILTER_BITMAP_FLAG))
-
-            pdfDocument.finishPage(page)
-        }
-
         val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
         val outFile = File(outDir, outputFileName)
-        FileOutputStream(outFile).use { pdfDocument.writeTo(it) }
-        pdfDocument.close()
-        outFile
+
+        try {
+            validBitmaps.forEachIndexed { index, bitmap ->
+                val pageInfo = PdfDocument.PageInfo.Builder(A4_WIDTH_POINTS, A4_HEIGHT_POINTS, index + 1).create()
+                val page = pdfDocument.startPage(pageInfo)
+                try {
+                    val canvas: Canvas = page.canvas
+
+                    // Fill white background
+                    val bgPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.FILL }
+                    canvas.drawRect(0f, 0f, A4_WIDTH_POINTS.toFloat(), A4_HEIGHT_POINTS.toFloat(), bgPaint)
+
+                    // Calculate scaled rect inside margins preserving aspect ratio
+                    val availW = A4_WIDTH_POINTS - (marginPoints * 2)
+                    val availH = A4_HEIGHT_POINTS - (marginPoints * 2)
+
+                    val bmpW = bitmap.width.toFloat()
+                    val bmpH = bitmap.height.toFloat()
+                    val scale = (availW / bmpW).coerceAtMost(availH / bmpH)
+
+                    val drawW = bmpW * scale
+                    val drawH = bmpH * scale
+                    val left = marginPoints + (availW - drawW) / 2f
+                    val top = marginPoints + (availH - drawH) / 2f
+
+                    val destRect = Rect(left.toInt(), top.toInt(), (left + drawW).toInt(), (top + drawH).toInt())
+                    canvas.drawBitmap(bitmap, null, destRect, Paint(Paint.FILTER_BITMAP_FLAG))
+                } finally {
+                    pdfDocument.finishPage(page)
+                }
+            }
+
+            FileOutputStream(outFile).use { pdfDocument.writeTo(it) }
+            outFile
+        } catch (t: Throwable) {
+            if (outFile.exists()) {
+                outFile.delete()
+            }
+            throw t
+        } finally {
+            try {
+                pdfDocument.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     /**

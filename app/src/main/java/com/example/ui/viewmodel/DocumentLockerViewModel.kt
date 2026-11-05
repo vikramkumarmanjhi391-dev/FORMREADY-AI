@@ -149,6 +149,13 @@ class DocumentLockerViewModel @JvmOverloads constructor(
         }
     }
 
+    fun checkDuplicateFile(file: File, onResult: (LockerDocumentEntity?) -> Unit) {
+        viewModelScope.launch {
+            val existing = repository.checkDuplicateFile(file)
+            onResult(existing)
+        }
+    }
+
     fun importDocument(
         uri: Uri,
         title: String,
@@ -189,6 +196,7 @@ class DocumentLockerViewModel @JvmOverloads constructor(
         originalFileName: String = file.name,
         notes: String = "",
         isMasked: Boolean = false,
+        cleanupSourceAfterSuccess: Boolean = false,
         onSuccess: () -> Unit = {}
     ) {
         viewModelScope.launch {
@@ -196,6 +204,14 @@ class DocumentLockerViewModel @JvmOverloads constructor(
             val result = repository.importFile(file, title, documentType, originalFileName, notes, isMasked)
             result.fold(
                 onSuccess = { doc ->
+                    if (cleanupSourceAfterSuccess && file.exists() &&
+                        (file.absolutePath.contains("camera_captures") || file.absolutePath.contains("prepared_pdfs") || file.absolutePath.contains("unified_"))
+                    ) {
+                        try {
+                            file.delete()
+                        } catch (_: Exception) {
+                        }
+                    }
                     _uiState.update {
                         it.copy(
                             isImporting = false,

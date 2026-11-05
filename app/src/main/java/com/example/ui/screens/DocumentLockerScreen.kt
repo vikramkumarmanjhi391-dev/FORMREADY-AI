@@ -789,12 +789,25 @@ fun AddDocumentDialog(
     var showTypeMenu by remember { mutableStateOf(false) }
     var showCameraCapture by remember { mutableStateOf(false) }
 
+    val cleanupCurrentCapturedFile: () -> Unit = {
+        val current = capturedFile
+        if (current != null && current.exists() &&
+            (current.absolutePath.contains("camera_captures") || current.absolutePath.contains("prepared_pdfs") || current.absolutePath.contains("unified_"))
+        ) {
+            try {
+                current.delete()
+            } catch (_: Exception) {
+            }
+        }
+        capturedFile = null
+    }
+
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
+            cleanupCurrentCapturedFile()
             pickedUri = uri
-            capturedFile = null
             isValidating = true
             coroutineScope.launch(Dispatchers.IO) {
                 val validation = DocumentValidationManager.validateUri(context, uri)
@@ -821,6 +834,7 @@ fun AddDocumentDialog(
             mode = CameraCaptureMode.MULTI_PAGE_DOCUMENT,
             onMediaCaptured = { input ->
                 showCameraCapture = false
+                cleanupCurrentCapturedFile()
                 val file = input.file ?: input.resolveTemporaryFile(context)
                 if (file != null) {
                     capturedFile = file
@@ -833,38 +847,76 @@ fun AddDocumentDialog(
                         if (title.isBlank()) {
                             title = "Scanned Document ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())}"
                         }
+                        viewModel.checkDuplicateFile(file) { existing ->
+                            duplicateDoc = existing
+                        }
                     }
                 }
             },
             onMultiPageCaptured = { files ->
                 showCameraCapture = false
+                cleanupCurrentCapturedFile()
                 isValidating = true
                 coroutineScope.launch(Dispatchers.IO) {
-                    if (files.size == 1) {
-                        val file = files.first()
-                        capturedFile = file
-                        pickedUri = null
-                        val validation = DocumentValidationManager.validateFile(file)
-                        validationResult = validation
-                        if (title.isBlank()) {
-                            title = "Scanned Document ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())}"
+                    try {
+                        if (files.size == 1) {
+                            val file = files.first()
+                            capturedFile = file
+                            pickedUri = null
+                            val validation = DocumentValidationManager.validateFile(file)
+                            validationResult = validation
+                            if (title.isBlank()) {
+                                title = "Scanned Document ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())}"
+                            }
+                            viewModel.checkDuplicateFile(file) { existing ->
+                                duplicateDoc = existing
+                            }
+                        } else if (files.size > 1) {
+                            val bitmaps = files.mapNotNull {
+                                com.example.camera.UnifiedMediaInput.decodeBitmapWithExif(it, maxDimension = 2048)
+                            }
+                            com.example.camera.UniversalCameraController.cleanupTemporaryFiles(files)
+
+                            if (bitmaps.isNotEmpty()) {
+                                val outputPdf = PdfProcessor.createPdfFromBitmaps(
+                                    context = context,
+                                    bitmaps = bitmaps,
+                                    outputFileName = "scanned_${System.currentTimeMillis()}.pdf"
+                                )
+                                capturedFile = outputPdf
+                                pickedUri = null
+                                val validation = DocumentValidationManager.validateFile(outputPdf)
+                                validationResult = validation
+                                if (title.isBlank()) {
+                                    title = "Multi-Page Scan (${bitmaps.size} Pages)"
+                                }
+                                viewModel.checkDuplicateFile(outputPdf) { existing ->
+                                    duplicateDoc = existing
+                                }
+                            } else {
+                                validationResult = com.example.storage.DocumentValidationResult(
+                                    isValid = false,
+                                    detectedFormat = null,
+                                    mimeType = "application/octet-stream",
+                                    fileSizeBytes = 0L,
+                                    sha256Hex = "",
+                                    errorMessage = "Could not decode captured document pages."
+                                )
+                            }
                         }
-                    } else if (files.size > 1) {
-                        val bitmaps = files.mapNotNull { BitmapFactory.decodeFile(it.absolutePath) }
-                        val outputPdf = PdfProcessor.createPdfFromBitmaps(
-                            context = context,
-                            bitmaps = bitmaps,
-                            outputFileName = "scanned_${System.currentTimeMillis()}.pdf"
+                    } catch (e: Exception) {
+                        com.example.camera.UniversalCameraController.cleanupTemporaryFiles(files)
+                        validationResult = com.example.storage.DocumentValidationResult(
+                            isValid = false,
+                            detectedFormat = null,
+                            mimeType = "application/octet-stream",
+                            fileSizeBytes = 0L,
+                            sha256Hex = "",
+                            errorMessage = "Failed to prepare multi-page scan: ${e.localizedMessage}"
                         )
-                        capturedFile = outputPdf
-                        pickedUri = null
-                        val validation = DocumentValidationManager.validateFile(outputPdf)
-                        validationResult = validation
-                        if (title.isBlank()) {
-                            title = "Multi-Page Scan (${files.size} Pages)"
-                        }
+                    } finally {
+                        isValidating = false
                     }
-                    isValidating = false
                 }
             },
             onDismiss = { showCameraCapture = false }
@@ -872,7 +924,10 @@ fun AddDocumentDialog(
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            cleanupCurrentCapturedFile()
+            onDismiss()
+        },
         title = { Text("Store Document in Encrypted Vault", fontWeight = FontWeight.Bold, fontSize = 16.sp) },
         text = {
             Column(
@@ -1027,14 +1082,19 @@ fun AddDocumentDialog(
             Button(
                 onClick = {
                     if (capturedFile != null) {
+                        val fileToImport = capturedFile!!
                         viewModel.importFile(
-                            file = capturedFile!!,
+                            file = fileToImport,
                             title = title.ifBlank { "Scanned Document" },
                             documentType = selectedType,
-                            originalFileName = capturedFile!!.name,
+                            originalFileName = fileToImport.name,
                             notes = notes,
                             isMasked = false,
-                            onSuccess = onDismiss
+                            cleanupSourceAfterSuccess = true,
+                            onSuccess = {
+                                capturedFile = null
+                                onDismiss()
+                            }
                         )
                     } else if (pickedUri != null) {
                         viewModel.importDocument(
@@ -1055,7 +1115,13 @@ fun AddDocumentDialog(
             }
         },
         dismissButton = {
-            OutlinedButton(onClick = onDismiss, shape = RoundedCornerShape(8.dp)) {
+            OutlinedButton(
+                onClick = {
+                    cleanupCurrentCapturedFile()
+                    onDismiss()
+                },
+                shape = RoundedCornerShape(8.dp)
+            ) {
                 Text("Cancel")
             }
         }

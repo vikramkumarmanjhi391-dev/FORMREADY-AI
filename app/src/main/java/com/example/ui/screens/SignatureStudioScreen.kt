@@ -1,15 +1,14 @@
 package com.example.ui.screens
 
-import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,12 +30,11 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Draw
-import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.FolderShared
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -53,6 +51,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -62,7 +61,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -71,13 +69,19 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.data.model.ColorMode
+import com.example.camera.CameraCaptureMode
+import com.example.camera.MediaSourceSelectionBar
+import com.example.camera.UnifiedMediaInput
+import com.example.camera.UniversalCameraScreen
 import com.example.data.model.DocumentRule
 import com.example.data.model.DocumentType
 import com.example.data.model.FileFormat
 import com.example.data.model.PreparationStatus
 import com.example.data.model.ProcessedFileResult
+import com.example.data.repository.DocumentLockerRepository
 import com.example.processing.ImageProcessor
+import com.example.processing.OneClickPreparationCoordinator
+import com.example.ui.components.PortalPresetSelectorBar
 import com.example.ui.theme.EmeraldTertiary
 import com.example.ui.theme.NavyPrimary
 import com.example.ui.theme.SaffronSecondary
@@ -98,18 +102,23 @@ data class SignaturePreset(
     val heightPx: Int,
     val minKb: Int,
     val maxKb: Int,
-    val description: String
+    val description: String,
+    val dpi: Int = 300,
+    val defaultBlackInkOnly: Boolean = false,
+    val portalId: String = "universal_passport"
 )
 
 val SIGNATURE_PRESETS = listOf(
-    SignaturePreset("SSC / IBPS (140x60)", DocumentType.SIGNATURE_ENGLISH, 140, 60, 10, 20, "Exact 140x60 px, 10-20 KB"),
-    SignaturePreset("UPSC CSE (Square)", DocumentType.SIGNATURE_ENGLISH, 400, 400, 20, 300, "1:1 ratio, 20-300 KB"),
-    SignaturePreset("BPSC English Sign", DocumentType.SIGNATURE_ENGLISH, 220, 100, 5, 15, "Strictly under 15 KB"),
-    SignaturePreset("BPSC Hindi Sign (हस्ताक्षर)", DocumentType.SIGNATURE_HINDI, 220, 100, 5, 15, "Hindi signature under 15 KB"),
-    SignaturePreset("Left Thumb (LTI)", DocumentType.THUMB_IMPRESSION_LEFT, 240, 240, 20, 50, "Left thumb impression 20-50 KB"),
-    SignaturePreset("Right Thumb (RTI)", DocumentType.THUMB_IMPRESSION_RIGHT, 240, 240, 20, 50, "Right thumb impression 20-50 KB"),
-    SignaturePreset("CTET Sign (35x15 mm)", DocumentType.SIGNATURE_ENGLISH, 350, 150, 3, 30, "3.5 x 1.5 cm format"),
-    SignaturePreset("Custom Dimensions", DocumentType.SIGNATURE_ENGLISH, 200, 100, 10, 30, "Custom width, height, and KB")
+    SignaturePreset("SSC / IBPS (140x60)", DocumentType.SIGNATURE_ENGLISH, 140, 60, 10, 20, "Exact 140x60 px, 10-20 KB", dpi = 300, portalId = "ssc_cgl"),
+    SignaturePreset("NSDL PAN Sign (<20KB)", DocumentType.SIGNATURE_ENGLISH, 140, 60, 5, 20, "Protean/NSDL 300 DPI B&W <20 KB", dpi = 300, defaultBlackInkOnly = true, portalId = "nsdl_pan"),
+    SignaturePreset("UTI PAN Sign (600 DPI)", DocumentType.SIGNATURE_ENGLISH, 140, 60, 5, 20, "UTIITSL 600 DPI B&W <20 KB", dpi = 600, defaultBlackInkOnly = true, portalId = "uti_pan"),
+    SignaturePreset("BPSC English Sign", DocumentType.SIGNATURE_ENGLISH, 220, 100, 5, 15, "Strictly under 15 KB", dpi = 300, portalId = "bpsc_cce"),
+    SignaturePreset("BPSC Hindi Sign (हस्ताक्षर)", DocumentType.SIGNATURE_HINDI, 220, 100, 5, 15, "Hindi signature under 15 KB", dpi = 300, portalId = "bpsc_cce"),
+    SignaturePreset("UPSC CSE (Square)", DocumentType.SIGNATURE_ENGLISH, 400, 400, 20, 300, "1:1 ratio, 20-300 KB", dpi = 300, portalId = "upsc_cse"),
+    SignaturePreset("Left Thumb (LTI)", DocumentType.THUMB_IMPRESSION_LEFT, 240, 240, 20, 50, "Left thumb impression 20-50 KB", dpi = 300, portalId = "ibps_bank"),
+    SignaturePreset("Right Thumb (RTI)", DocumentType.THUMB_IMPRESSION_RIGHT, 240, 240, 20, 50, "Right thumb impression 20-50 KB", dpi = 300, portalId = "ibps_bank"),
+    SignaturePreset("CTET Sign (35x15 mm)", DocumentType.SIGNATURE_ENGLISH, 350, 150, 3, 30, "3.5 x 1.5 cm format", dpi = 300, portalId = "ctet_exam"),
+    SignaturePreset("Custom Dimensions", DocumentType.SIGNATURE_ENGLISH, 200, 100, 10, 30, "Custom width, height, and KB", dpi = 300, portalId = "custom")
 )
 
 @Composable
@@ -122,42 +131,103 @@ fun SignatureStudioScreen(
     var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processedResult by remember { mutableStateOf<ProcessedFileResult?>(null) }
     var isProcessing by remember { mutableStateOf(false) }
+    var showOriginalBefore by remember { mutableStateOf(false) }
 
+    var selectedPortalId by remember { mutableStateOf("ssc_cgl") }
     var selectedPreset by remember { mutableStateOf(SIGNATURE_PRESETS[0]) }
 
     var autoCropBlankMargins by remember { mutableStateOf(true) }
     var preserveInkColor by remember { mutableStateOf(true) }
-    var contrastFactor by remember { mutableFloatStateOf(1.2f) }
-    var inkThreshold by remember { mutableIntStateOf(180) }
+    var contrastFactor by remember { mutableFloatStateOf(1.25f) }
+    var inkThreshold by remember { mutableIntStateOf(185) }
 
-    var customWidthPx by remember { mutableStateOf("140") }
-    var customHeightPx by remember { mutableStateOf("60") }
-    var targetMinKb by remember { mutableIntStateOf(10) }
-    var targetMaxKb by remember { mutableIntStateOf(20) }
+    var customWidthPx by remember { mutableStateOf((initialRule?.exactWidthPx ?: 140).toString()) }
+    var customHeightPx by remember { mutableStateOf((initialRule?.exactHeightPx ?: 60).toString()) }
+    var customDpi by remember { mutableIntStateOf(initialRule?.dpi ?: 300) }
+    var targetMinKb by remember { mutableIntStateOf(initialRule?.minKb ?: 10) }
+    var targetMaxKb by remember { mutableIntStateOf(initialRule?.maxKb ?: 20) }
     var selectedFormat by remember { mutableStateOf(FileFormat.JPG) }
 
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
     var isCameraOpen by remember { mutableStateOf(false) }
-    var currentMediaInput by remember { mutableStateOf<com.example.camera.UnifiedMediaInput?>(null) }
+    var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
+
+    LaunchedEffect(initialRule) {
+        if (initialRule != null) {
+            customWidthPx = (initialRule.exactWidthPx ?: initialRule.minWidthPx ?: 140).toString()
+            customHeightPx = (initialRule.exactHeightPx ?: initialRule.minHeightPx ?: 60).toString()
+            targetMinKb = initialRule.minKb
+            targetMaxKb = initialRule.maxKb
+            customDpi = initialRule.dpi ?: 300
+        }
+    }
+
+    // Shared 1-Click Signature Auto-Processing Pipeline
+    val triggerOneClickSignaturePrepare: (Bitmap, UnifiedMediaInput?) -> Unit = { bmp, mediaInput ->
+        val w = customWidthPx.toIntOrNull()?.coerceAtLeast(30) ?: 140
+        val h = customHeightPx.toIntOrNull()?.coerceAtLeast(20) ?: 60
+        coroutineScope.launch {
+            isProcessing = true
+            saveStatusMessage = null
+            showOriginalBefore = false
+
+            val rule = DocumentRule(
+                id = "sign_rule_${System.currentTimeMillis()}",
+                documentType = selectedPreset.type,
+                allowedFormats = listOf(selectedFormat),
+                minKb = targetMinKb,
+                maxKb = targetMaxKb,
+                exactWidthPx = w,
+                exactHeightPx = h,
+                dpi = customDpi,
+                targetAspectRatio = w.toFloat() / h.toFloat(),
+                requiresWhiteBackground = true
+            )
+
+            // When captured from the in-app camera's horizontal cutout window, auto-crop strictly to the cutout box first
+            val guideCrop = if (mediaInput?.isFromCamera == true) {
+                mediaInput.mode.guideCropRectNorm
+            } else null
+
+            processedResult = OneClickPreparationCoordinator.autoPrepareSignature(
+                context = context,
+                input = mediaInput,
+                rule = rule,
+                preDecodedBitmap = bmp,
+                customTargetKb = targetMaxKb,
+                customWidthPx = w,
+                customHeightPx = h,
+                trimBlankMargins = autoCropBlankMargins,
+                contrastMultiplier = contrastFactor,
+                inkThreshold = inkThreshold,
+                preserveInkColor = preserveInkColor,
+                enforceProportional = true,
+                cropRectNorm = guideCrop,
+                customDpi = customDpi
+            )
+            isProcessing = false
+        }
+    }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
             coroutineScope.launch {
-                val mediaInput = com.example.camera.UnifiedMediaInput.fromGalleryUri(
+                val previousInput = currentMediaInput
+                val mediaInput = UnifiedMediaInput.fromGalleryUri(
                     uri = uri,
                     mode = if (selectedPreset.type == DocumentType.THUMB_IMPRESSION_LEFT || selectedPreset.type == DocumentType.THUMB_IMPRESSION_RIGHT)
-                        com.example.camera.CameraCaptureMode.THUMB_IMPRESSION
+                        CameraCaptureMode.THUMB_IMPRESSION
                     else
-                        com.example.camera.CameraCaptureMode.SIGNATURE
+                        CameraCaptureMode.SIGNATURE
                 )
-                currentMediaInput = mediaInput
                 val bmp = mediaInput.resolveBitmap(context)
                 if (bmp != null) {
+                    previousInput?.cleanupPrivateCameraFileIfTemporary()
+                    currentMediaInput = mediaInput
                     sourceBitmap = bmp
-                    processedResult = null
-                    saveStatusMessage = null
+                    triggerOneClickSignaturePrepare(bmp, mediaInput)
                 } else {
                     Toast.makeText(context, "Could not open selected signature image.", Toast.LENGTH_SHORT).show()
                 }
@@ -167,22 +237,24 @@ fun SignatureStudioScreen(
 
     if (isCameraOpen) {
         val captureMode = if (selectedPreset.type == DocumentType.THUMB_IMPRESSION_LEFT || selectedPreset.type == DocumentType.THUMB_IMPRESSION_RIGHT) {
-            com.example.camera.CameraCaptureMode.THUMB_IMPRESSION
+            CameraCaptureMode.THUMB_IMPRESSION
         } else {
-            com.example.camera.CameraCaptureMode.SIGNATURE
+            CameraCaptureMode.SIGNATURE
         }
-        com.example.camera.UniversalCameraScreen(
+        UniversalCameraScreen(
             mode = captureMode,
             onMediaCaptured = { input ->
                 isCameraOpen = false
+                val previousInput = currentMediaInput
                 currentMediaInput = input
                 coroutineScope.launch {
                     val bmp = input.resolveBitmap(context)
                     if (bmp != null) {
+                        previousInput?.cleanupPrivateCameraFileIfTemporary()
                         sourceBitmap = bmp
-                        processedResult = null
-                        saveStatusMessage = null
+                        triggerOneClickSignaturePrepare(bmp, input)
                     } else {
+                        input.cleanupPrivateCameraFileIfTemporary()
                         Toast.makeText(context, "Failed to decode captured signature.", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -232,45 +304,119 @@ fun SignatureStudioScreen(
             .testTag("signature_studio_screen")
     ) {
         item {
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             Text(
-                text = "Signature & Thumb Studio",
+                text = "1-Click Signature & Thumb Studio",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                text = "Auto-crop blank white margins, clean paper shadows, darken ink without losing fine strokes, and compress strictly to portal limits.",
+                text = "Camera cutout auto-crop, adaptive shadow whitening (#FFFFFF), Black/Blue ink toggle, and Exact Min-Max KB padding.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            // Signature Display Box
+            // 1. Unified Top Portal Preset Selector Bar
+            PortalPresetSelectorBar(
+                selectedPortalId = selectedPortalId,
+                activeSectionSummary = "Active Sign Target: ${customWidthPx}×${customHeightPx} px • $customDpi DPI • $targetMinKb–$targetMaxKb KB • " +
+                    if (preserveInkColor) "Blue/Original Ink" else "Pure Black Ink",
+                onPortalSelected = { portalSpec ->
+                    selectedPortalId = portalSpec.id
+                    val signRule = portalSpec.documents.find {
+                        it.documentType == DocumentType.SIGNATURE_ENGLISH ||
+                        it.documentType == DocumentType.SIGNATURE_HINDI ||
+                        it.documentType == DocumentType.THUMB_IMPRESSION_LEFT
+                    }
+                    if (signRule != null) {
+                        val w = signRule.exactWidthPx ?: signRule.minWidthPx ?: 140
+                        val h = signRule.exactHeightPx ?: signRule.minHeightPx ?: 60
+                        customWidthPx = w.toString()
+                        customHeightPx = h.toString()
+                        targetMinKb = signRule.minKb
+                        targetMaxKb = signRule.maxKb
+                        customDpi = signRule.dpi ?: 300
+                        preserveInkColor = signRule.colorMode != com.example.data.model.ColorMode.BLACK_AND_WHITE
+                        SIGNATURE_PRESETS.find { it.portalId == portalSpec.id }?.let { selectedPreset = it }
+                        if (sourceBitmap != null) {
+                            triggerOneClickSignaturePrepare(sourceBitmap!!, currentMediaInput)
+                        }
+                    }
+                }
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 2. Signature Display Box with Before/After Toggle & Exact Px/KB/DPI Badges
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(200.dp),
+                    .height(210.dp),
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                border = androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+                border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
             ) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     if (sourceBitmap != null) {
-                        val displayBmp = processedResult?.processedFilePath?.let { File(it) }?.takeIf { it.exists() }?.let {
-                            android.graphics.BitmapFactory.decodeFile(it.absolutePath)
-                        } ?: sourceBitmap
+                        val processedBmp = remember(processedResult?.processedFilePath) {
+                            processedResult?.processedFilePath?.let { File(it) }?.takeIf { it.exists() }?.let {
+                                BitmapFactory.decodeFile(it.absolutePath)
+                            }
+                        }
+                        val displayBmp = if (showOriginalBefore || processedBmp == null) sourceBitmap else processedBmp
 
                         Image(
                             bitmap = displayBmp!!.asImageBitmap(),
                             contentDescription = "Signature Preview",
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(12.dp),
+                                .padding(16.dp),
                             contentScale = ContentScale.Fit
                         )
+
+                        // Before / After Toggle Pill (top-start)
+                        if (processedResult != null) {
+                            Surface(
+                                onClick = { showOriginalBefore = !showOriginalBefore },
+                                color = Color.Black.copy(alpha = 0.72f),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(10.dp)
+                                    .testTag("sign_before_after_toggle")
+                            ) {
+                                Text(
+                                    text = if (showOriginalBefore) "👁 Viewing: BEFORE (Tap for After)" else "✨ Viewing: AFTER 1-Click (Tap for Before)",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+
+                        // Exact Dimensions + DPI + KB Badge (bottom)
+                        processedResult?.let { res ->
+                            Surface(
+                                color = if (res.isCompliant) EmeraldTertiary else SaffronSecondary,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(10.dp)
+                            ) {
+                                Text(
+                                    text = "✓ ${res.widthPx}×${res.heightPx} px • ${res.dpi} DPI • ${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
 
                         Surface(
                             color = if (processedResult != null) EmeraldTertiary else NavyPrimary,
@@ -280,7 +426,7 @@ fun SignatureStudioScreen(
                                 .padding(10.dp)
                         ) {
                             Text(
-                                text = if (processedResult != null) "Cleaned & Verified" else "Original Sample",
+                                text = if (processedResult != null) "1-Click Ready" else "Original Sample",
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -309,24 +455,24 @@ fun SignatureStudioScreen(
                             }
                             Spacer(modifier = Modifier.height(10.dp))
                             Text(
-                                text = "Select Scanned Signature or Thumb Impression",
+                                text = "Capture or Select Signature / Thumb",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Blue/black pen ink on clean white paper. Original file is never modified.",
+                                text = "1-Click Cutout Auto-Crop + Shadow Removal + Exact Min–Max KB.",
                                 fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Spacer(modifier = Modifier.height(14.dp))
-                            com.example.camera.MediaSourceSelectionBar(
+                            MediaSourceSelectionBar(
                                 onTakePhoto = { isCameraOpen = true },
                                 onChooseGallery = {
                                     photoPickerLauncher.launch(
                                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                                     )
                                 },
-                                takePhotoButtonText = "Capture (Camera)",
+                                takePhotoButtonText = "Capture (1-Click Box)",
                                 galleryButtonText = "Choose (Gallery)"
                             )
                         }
@@ -334,7 +480,172 @@ fun SignatureStudioScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 3. Immediate Results & 1-Click Download to Gallery Card
+            processedResult?.let { res ->
+                val isSuccess = res.status == PreparationStatus.SUCCESS_PREPARED
+                val cardBg = if (isSuccess) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
+                val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
+
+                Card(
+                    modifier = Modifier.fillMaxWidth().testTag("sign_result_card"),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = cardBg),
+                    border = BorderStroke(1.2.dp, statusColor)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = statusColor
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "${res.status.label} (${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB)",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = statusColor
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            text = "Exact Output: ${res.widthPx} × ${res.heightPx} px • ${res.dpi} DPI • ${res.fileFormat.extension.uppercase()} (Allowed: $targetMinKb–$targetMaxKb KB)",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        res.validationMessages.forEach { msg ->
+                            Text(
+                                text = "• $msg",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+
+                        if (saveStatusMessage != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "✓ $saveStatusMessage",
+                                fontSize = 12.sp,
+                                color = VerifiedGreen,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // 1-Click Direct Download to Gallery Button
+                        Button(
+                            onClick = {
+                                coroutineScope.launch {
+                                    val srcFile = File(res.processedFilePath)
+                                    val fileName = "FormReady_Sign_${selectedPortalId}_${res.widthPx}x${res.heightPx}_${System.currentTimeMillis()}.${res.fileFormat.extension}"
+                                    val saveRes = ImageProcessor.saveFileToGalleryMediaStore(
+                                        context = context,
+                                        sourceFile = srcFile,
+                                        displayName = fileName,
+                                        mimeType = res.fileFormat.mimeType
+                                    )
+                                    if (saveRes.isSuccess) {
+                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB)"
+                                        Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
+                                    } else {
+                                        Toast.makeText(context, "Save failed: ${saveRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                            modifier = Modifier.fillMaxWidth().height(46.dp).testTag("instant_gallery_download_sign_btn")
+                        ) {
+                            Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("1-CLICK DOWNLOAD READY SIGNATURE", fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Save to Device & Share row
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    val suggestedName = "signature_${res.widthPx}x${res.heightPx}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.${res.fileFormat.extension}"
+                                    saveDocumentLauncher.launch(suggestedName)
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.weight(1f).testTag("save_signature_device_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.SaveAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Save As...", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    sharePreparedFiles(context, listOf(File(res.processedFilePath)))
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.weight(1f).testTag("share_signature_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share", fontSize = 12.sp)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    try {
+                                        val repo = DocumentLockerRepository(context)
+                                        val file = File(res.processedFilePath)
+                                        if (file.exists()) {
+                                            val importRes = repo.importFile(
+                                                file = file,
+                                                title = "${selectedPreset.title} (${res.widthPx}x${res.heightPx})",
+                                                documentType = selectedPreset.type,
+                                                originalFileName = file.name,
+                                                notes = "Generated in Signature Studio"
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                if (importRes.isSuccess) {
+                                                    Toast.makeText(context, "Saved to Personal Document Locker!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "Locker save failed: ${importRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "Locker error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("add_signature_to_locker_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save to Document Locker Vault", fontSize = 12.sp)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+            }
 
             // Preset Selection
             Text(
@@ -350,10 +661,16 @@ fun SignatureStudioScreen(
                         selected = selectedPreset.title == preset.title,
                         onClick = {
                             selectedPreset = preset
+                            selectedPortalId = preset.portalId
                             customWidthPx = preset.widthPx.toString()
                             customHeightPx = preset.heightPx.toString()
                             targetMinKb = preset.minKb
                             targetMaxKb = preset.maxKb
+                            customDpi = preset.dpi
+                            preserveInkColor = !preset.defaultBlackInkOnly
+                            if (sourceBitmap != null) {
+                                triggerOneClickSignaturePrepare(sourceBitmap!!, currentMediaInput)
+                            }
                         },
                         label = { Text(preset.title, fontSize = 12.sp) },
                         shape = RoundedCornerShape(18.dp)
@@ -371,10 +688,41 @@ fun SignatureStudioScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "Signature Cleanup & Controls",
+                        text = "Adaptive Scanner & Ink Controls",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold
                     )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // 1-Click Ink Mode Toggle: Black Ink vs Blue/Original Ink
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Scanner Ink Mode", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            FilterChip(
+                                selected = !preserveInkColor,
+                                onClick = {
+                                    preserveInkColor = false
+                                    if (sourceBitmap != null) triggerOneClickSignaturePrepare(sourceBitmap!!, currentMediaInput)
+                                },
+                                label = { Text("Crisp Black Ink", fontSize = 11.sp) },
+                                modifier = Modifier.testTag("sign_black_ink_chip")
+                            )
+                            FilterChip(
+                                selected = preserveInkColor,
+                                onClick = {
+                                    preserveInkColor = true
+                                    if (sourceBitmap != null) triggerOneClickSignaturePrepare(sourceBitmap!!, currentMediaInput)
+                                },
+                                label = { Text("Blue / Original Ink", fontSize = 11.sp) },
+                                modifier = Modifier.testTag("sign_blue_ink_chip")
+                            )
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -389,24 +737,10 @@ fun SignatureStudioScreen(
                         }
                         Switch(
                             checked = autoCropBlankMargins,
-                            onCheckedChange = { autoCropBlankMargins = it }
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Preserve Pen Ink Color", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Whitens paper background while keeping blue/black ink tones", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Switch(
-                            checked = preserveInkColor,
-                            onCheckedChange = { preserveInkColor = it }
+                            onCheckedChange = {
+                                autoCropBlankMargins = it
+                                if (sourceBitmap != null) triggerOneClickSignaturePrepare(sourceBitmap!!, currentMediaInput)
+                            }
                         )
                     }
 
@@ -428,7 +762,7 @@ fun SignatureStudioScreen(
                     Spacer(modifier = Modifier.height(6.dp))
 
                     Text(
-                        text = "Paper Whitening Threshold: $inkThreshold",
+                        text = "Shadow & Paper Whitening Threshold: $inkThreshold",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium
                     )
@@ -465,7 +799,7 @@ fun SignatureStudioScreen(
                     Spacer(modifier = Modifier.height(8.dp))
 
                     Text(
-                        text = "Target KB Range: $targetMinKb - $targetMaxKb KB",
+                        text = "Exact KB Guarantee Window: $targetMinKb – $targetMaxKb KB • $customDpi DPI",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
@@ -498,37 +832,7 @@ fun SignatureStudioScreen(
                                 Toast.makeText(context, "Please enter valid positive dimensions.", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-
-                            coroutineScope.launch {
-                                isProcessing = true
-                                saveStatusMessage = null
-
-                                val rule = DocumentRule(
-                                    id = "sign_rule_${System.currentTimeMillis()}",
-                                    documentType = selectedPreset.type,
-                                    allowedFormats = listOf(selectedFormat),
-                                    minKb = targetMinKb,
-                                    maxKb = targetMaxKb,
-                                    exactWidthPx = w,
-                                    exactHeightPx = h,
-                                    targetAspectRatio = w.toFloat() / h.toFloat(),
-                                    requiresWhiteBackground = true
-                                )
-
-                                processedResult = ImageProcessor.processImageForRule(
-                                    context = context,
-                                    originalBitmap = sourceBitmap!!,
-                                    rule = rule,
-                                    customTargetKb = targetMaxKb,
-                                    customWidthPx = w,
-                                    customHeightPx = h,
-                                    autoCropMargins = autoCropBlankMargins,
-                                    contrastFactor = contrastFactor,
-                                    inkThreshold = inkThreshold,
-                                    preserveInkColor = preserveInkColor
-                                )
-                                isProcessing = false
-                            }
+                            triggerOneClickSignaturePrepare(sourceBitmap!!, currentMediaInput)
                         },
                         enabled = !isProcessing,
                         shape = RoundedCornerShape(12.dp),
@@ -574,146 +878,6 @@ fun SignatureStudioScreen(
                             Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Change (Gallery)", fontSize = 11.sp)
-                        }
-                    }
-                }
-            }
-
-            // Results, Validation, Save to Device & Share Card
-            processedResult?.let { res ->
-                Spacer(modifier = Modifier.height(16.dp))
-
-                val isSuccess = res.status == PreparationStatus.SUCCESS_PREPARED
-                val cardBg = if (isSuccess) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
-                val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
-
-                Card(
-                    modifier = Modifier.fillMaxWidth().testTag("sign_result_card"),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = cardBg),
-                    border = androidx.compose.foundation.BorderStroke(1.2.dp, statusColor)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
-                                contentDescription = null,
-                                tint = statusColor
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = res.status.label,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = statusColor
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Text(
-                            text = "Measured Size: ${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB (Allowed: $targetMinKb - $targetMaxKb KB)",
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 13.sp
-                        )
-                        Text(
-                            text = "Actual Resolution: ${res.widthPx} x ${res.heightPx} px • Format: ${res.fileFormat.extension.uppercase()}",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        res.validationMessages.forEach { msg ->
-                            Text(
-                                text = "• $msg",
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-
-                        if (saveStatusMessage != null) {
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = "✓ $saveStatusMessage",
-                                fontSize = 12.sp,
-                                color = VerifiedGreen,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(14.dp))
-
-                        // Save to Device & Share row
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = {
-                                    val suggestedName = "signature_${res.widthPx}x${res.heightPx}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.${res.fileFormat.extension}"
-                                    saveDocumentLauncher.launch(suggestedName)
-                                },
-                                shape = RoundedCornerShape(10.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
-                                modifier = Modifier.weight(1f).testTag("save_signature_device_btn")
-                            ) {
-                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Save to Device", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
-
-                            OutlinedButton(
-                                onClick = {
-                                    sharePreparedFiles(context, listOf(File(res.processedFilePath)))
-                                },
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.testTag("share_signature_btn")
-                            ) {
-                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Share", fontSize = 12.sp)
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        OutlinedButton(
-                            onClick = {
-                                coroutineScope.launch(Dispatchers.IO) {
-                                    try {
-                                        val repo = com.example.data.repository.DocumentLockerRepository(context)
-                                        val file = File(res.processedFilePath)
-                                        if (file.exists()) {
-                                            val importRes = repo.importFile(
-                                                file = file,
-                                                title = "${selectedPreset.title} (${res.widthPx}x${res.heightPx})",
-                                                documentType = selectedPreset.type,
-                                                originalFileName = file.name,
-                                                notes = "Generated in Signature Studio"
-                                            )
-                                            withContext(Dispatchers.Main) {
-                                                if (importRes.isSuccess) {
-                                                    Toast.makeText(context, "Saved to Personal Document Locker!", Toast.LENGTH_SHORT).show()
-                                                } else {
-                                                    Toast.makeText(context, "Locker save failed: ${importRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
-                                                }
-                                            }
-                                        }
-                                    } catch (e: Exception) {
-                                        withContext(Dispatchers.Main) {
-                                            Toast.makeText(context, "Locker error: ${e.message}", Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth().testTag("add_signature_to_locker_btn"),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(imageVector = Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Save to Document Locker Vault", fontSize = 12.sp)
                         }
                     }
                 }

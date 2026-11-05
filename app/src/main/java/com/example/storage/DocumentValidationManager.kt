@@ -205,6 +205,7 @@ object DocumentValidationManager {
 
     /**
      * Fallback parser for JVM unit tests where PdfRenderer native code is not loaded.
+     * Parses actual page count from PDF structure (`/Type /Page` entries or `/Count N`).
      */
     private fun validatePdfStructureFallback(file: File, fileSizeBytes: Long, sha256Hex: String): DocumentValidationResult {
         return try {
@@ -230,13 +231,14 @@ object DocumentValidationManager {
                     errorMessage = "Truncated or incomplete PDF: missing EOF marker"
                 )
             } else {
+                val estimatedPageCount = extractPdfPageCountFromBytes(file).coerceAtLeast(1)
                 DocumentValidationResult(
                     isValid = true,
                     detectedFormat = FileFormat.PDF,
                     mimeType = FileFormat.PDF.mimeType,
                     fileSizeBytes = fileSizeBytes,
                     sha256Hex = sha256Hex,
-                    pageCount = 1,
+                    pageCount = estimatedPageCount,
                     errorMessage = null
                 )
             }
@@ -249,6 +251,34 @@ object DocumentValidationManager {
                 sha256Hex = sha256Hex,
                 errorMessage = "Invalid PDF document: ${e.localizedMessage}"
             )
+        }
+    }
+
+    private fun extractPdfPageCountFromBytes(file: File): Int {
+        return try {
+            val maxScanBytes = minOf(file.length(), 4L * 1024L * 1024L).toInt()
+            val bytes = ByteArray(maxScanBytes)
+            FileInputStream(file).use { input ->
+                var total = 0
+                while (total < maxScanBytes) {
+                    val r = input.read(bytes, total, maxScanBytes - total)
+                    if (r == -1) break
+                    total += r
+                }
+            }
+            val content = String(bytes, Charsets.ISO_8859_1)
+            val pageNodeRegex = Regex("""/Type\s*/Page\b(?!s)""")
+            val pageMatches = pageNodeRegex.findAll(content).count()
+            if (pageMatches > 0) {
+                return pageMatches
+            }
+            val countRegex = Regex("""/Count\s+(\d+)""")
+            val maxCount = countRegex.findAll(content)
+                .mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }
+                .maxOrNull()
+            maxCount ?: 1
+        } catch (_: Exception) {
+            1
         }
     }
 

@@ -130,7 +130,10 @@ data class ProcessedFileResult(
     val status: PreparationStatus = if (isCompliant) PreparationStatus.SUCCESS_PREPARED else PreparationStatus.SIZE_EXCEEDED,
     val aspectRatio: Float = if (heightPx > 0) widthPx.toFloat() / heightPx.toFloat() else 1.0f,
     val hasConflict: Boolean = false,
-    val conflictReason: String? = null
+    val conflictReason: String? = null,
+    val dpi: Int = 300,
+    val wasPaddedToMinKb: Boolean = false,
+    val hasWhiteBackground: Boolean = false
 )
 
 data class ValidationIssue(

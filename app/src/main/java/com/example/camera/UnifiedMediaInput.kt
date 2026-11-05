@@ -4,11 +4,14 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.RectF
 import android.media.ExifInterface
 import android.net.Uri
+import android.webkit.MimeTypeMap
 import com.example.processing.ImageProcessor
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 import java.util.UUID
 
 enum class CameraCaptureMode(
@@ -16,42 +19,48 @@ enum class CameraCaptureMode(
     val subtitle: String,
     val instruction: String,
     val isMultiPageAllowed: Boolean = false,
-    val defaultToFrontCamera: Boolean = false
+    val defaultToFrontCamera: Boolean = false,
+    val guideCropRectNorm: RectF = RectF(0f, 0f, 1f, 1f)
 ) {
     PASSPORT_PHOTO(
         title = "Passport & Photo Capture",
-        subtitle = "Align face within the framing guide",
-        instruction = "Look straight at the camera. Keep head upright with plain background.",
+        subtitle = "Align face & shoulders within the guide",
+        instruction = "Look straight at the camera. Keep face in oval & shoulders on line.",
         isMultiPageAllowed = false,
-        defaultToFrontCamera = true
+        defaultToFrontCamera = true,
+        guideCropRectNorm = RectF(0.14f, 0.14f, 0.86f, 0.84f)
     ),
     SIGNATURE(
-        title = "Signature Capture",
-        subtitle = "Align handwriting within rectangular frame",
-        instruction = "Keep paper flat with good lighting. Avoid shadows across ink strokes.",
+        title = "Signature Cutout Capture",
+        subtitle = "Align signature inside horizontal cutout box",
+        instruction = "Place signature inside the clear horizontal box. Auto-crops in 1-Click.",
         isMultiPageAllowed = false,
-        defaultToFrontCamera = false
+        defaultToFrontCamera = false,
+        guideCropRectNorm = RectF(0.08f, 0.36f, 0.92f, 0.64f)
     ),
     THUMB_IMPRESSION(
         title = "Thumb Impression Capture",
         subtitle = "Align ink impression inside focus box",
         instruction = "Ensure ridge patterns are clearly visible and paper is well illuminated.",
         isMultiPageAllowed = false,
-        defaultToFrontCamera = false
+        defaultToFrontCamera = false,
+        guideCropRectNorm = RectF(0.24f, 0.30f, 0.76f, 0.70f)
     ),
     DOCUMENT_PAGE(
-        title = "Document & Certificate Page",
-        subtitle = "Fit whole document inside the frame",
-        instruction = "Hold device steady directly above document. Ensure all four borders and text are visible.",
+        title = "Document & ID Scanner",
+        subtitle = "Fit ID Card or A4 document inside frame",
+        instruction = "Align all 4 corners inside the frame for 1-Click Clear Scan.",
         isMultiPageAllowed = false,
-        defaultToFrontCamera = false
+        defaultToFrontCamera = false,
+        guideCropRectNorm = RectF(0.07f, 0.12f, 0.93f, 0.88f)
     ),
     MULTI_PAGE_DOCUMENT(
         title = "Multi-Page Document Scanner",
         subtitle = "Capture pages sequentially",
         instruction = "Capture each page clearly. You can review, reorder, or add more pages.",
         isMultiPageAllowed = true,
-        defaultToFrontCamera = false
+        defaultToFrontCamera = false,
+        guideCropRectNorm = RectF(0.07f, 0.12f, 0.93f, 0.88f)
     )
 }
 
@@ -80,21 +89,18 @@ data class UnifiedMediaInput(
 ) {
     val file: File? get() = privateFile
     val fileSizeBytes: Long get() = privateFile?.length() ?: 0L
+    val isFromCamera: Boolean
+        get() = origin == MediaInputOrigin.CAMERA || origin == MediaInputOrigin.IN_APP_CAMERA
 
     /**
-     * Resolves a working Bitmap safely with orientation correction synchronously.
+     * Resolves a working Bitmap safely with EXIF orientation correction and memory bounds protection.
      */
-    fun toBitmap(context: Context): Bitmap? {
+    fun toBitmap(context: Context, maxDimension: Int = 2048): Bitmap? {
         return try {
-            if (privateFile != null && privateFile.exists()) {
-                decodeBitmapWithExif(privateFile)
+            if (privateFile != null && privateFile.exists() && privateFile.length() > 0L) {
+                decodeBitmapWithExif(privateFile, maxDimension)
             } else if (uri != null) {
-                val currentUri = uri
-                runCatching {
-                    context.contentResolver.openInputStream(currentUri)?.use { stream ->
-                        BitmapFactory.decodeStream(stream)
-                    }
-                }.getOrNull()
+                ImageProcessor.decodeBitmapFromUriSync(context, uri, maxDimension)
             } else null
         } catch (e: Exception) {
             e.printStackTrace()
@@ -103,14 +109,15 @@ data class UnifiedMediaInput(
     }
 
     /**
-     * Resolves a working Bitmap safely with orientation correction.
+     * Suspending resolution of a working Bitmap with orientation correction.
+     * Both Camera and Gallery inputs apply identical EXIF orientation and sample-size logic.
      */
-    suspend fun resolveBitmap(context: Context): Bitmap? {
+    suspend fun resolveBitmap(context: Context, maxDimension: Int = 2048): Bitmap? {
         return try {
-            if (privateFile != null && privateFile.exists()) {
-                decodeBitmapWithExif(privateFile)
+            if (privateFile != null && privateFile.exists() && privateFile.length() > 0L) {
+                decodeBitmapWithExif(privateFile, maxDimension)
             } else if (uri != null) {
-                ImageProcessor.decodeBitmapFromUri(context, uri)
+                ImageProcessor.decodeBitmapFromUri(context, uri, maxDimension)
             } else null
         } catch (e: Exception) {
             e.printStackTrace()
@@ -124,18 +131,23 @@ data class UnifiedMediaInput(
      */
     fun resolveTemporaryFile(context: Context): File? {
         return try {
-            if (privateFile != null && privateFile.exists()) {
-                val copy = File(context.cacheDir, "unified_${UUID.randomUUID()}.jpg")
+            val ext = resolveExtension(context)
+            if (privateFile != null && privateFile.exists() && privateFile.length() > 0L) {
+                val copy = File(context.cacheDir, "unified_${UUID.randomUUID()}.$ext")
                 privateFile.copyTo(copy, overwrite = true)
                 copy
             } else if (uri != null) {
-                val staging = File(context.cacheDir, "unified_${UUID.randomUUID()}.jpg")
-                context.contentResolver.openInputStream(uri)?.use { inStream ->
+                val staging = File(context.cacheDir, "unified_${UUID.randomUUID()}.$ext")
+                val copied = context.contentResolver.openInputStream(uri)?.use { inStream ->
                     FileOutputStream(staging).use { outStream ->
                         inStream.copyTo(outStream)
                     }
+                    true
+                } ?: false
+                if (copied && staging.exists() && staging.length() > 0L) staging else {
+                    staging.delete()
+                    null
                 }
-                staging
             } else null
         } catch (e: Exception) {
             e.printStackTrace()
@@ -143,86 +155,195 @@ data class UnifiedMediaInput(
         }
     }
 
+    /**
+     * Cleans up the underlying private camera file if this input originated from temporary camera capture.
+     * Never deletes original Gallery documents.
+     */
+    fun cleanupPrivateCameraFileIfTemporary() {
+        try {
+            val f = privateFile ?: return
+            if (isFromCamera && f.exists() && f.absolutePath.contains("camera_captures")) {
+                f.delete()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun resolveExtension(context: Context): String {
+        privateFile?.extension?.takeIf { it.isNotBlank() }?.let {
+            return it.lowercase(Locale.US)
+        }
+        val resolvedMime = uri?.let { context.contentResolver.getType(it) } ?: mimeType
+        return when (resolvedMime.lowercase(Locale.US)) {
+            "image/png" -> "png"
+            "application/pdf" -> "pdf"
+            "image/jpeg", "image/jpg" -> "jpg"
+            else -> MimeTypeMap.getSingleton().getExtensionFromMimeType(resolvedMime) ?: "jpg"
+        }
+    }
+
     companion object {
-        fun fromGalleryUri(uri: Uri, mode: CameraCaptureMode, displayName: String = "gallery_image"): UnifiedMediaInput {
+        fun fromGalleryUri(
+            uri: Uri,
+            mode: CameraCaptureMode,
+            displayName: String = "gallery_image",
+            mimeType: String = "image/jpeg"
+        ): UnifiedMediaInput {
             return UnifiedMediaInput(
                 uri = uri,
                 privateFile = null,
                 origin = MediaInputOrigin.GALLERY,
                 mode = mode,
+                mimeType = mimeType,
                 displayName = displayName
             )
         }
 
-        fun fromUri(uri: Uri, mode: CameraCaptureMode, origin: MediaInputOrigin = MediaInputOrigin.GALLERY): UnifiedMediaInput {
+        fun fromUri(
+            uri: Uri,
+            mode: CameraCaptureMode,
+            origin: MediaInputOrigin = MediaInputOrigin.GALLERY,
+            mimeType: String = "image/jpeg"
+        ): UnifiedMediaInput {
             return UnifiedMediaInput(
                 uri = uri,
                 privateFile = null,
                 origin = origin,
                 mode = mode,
+                mimeType = mimeType,
                 displayName = uri.lastPathSegment ?: "image"
             )
         }
 
         fun fromCameraFile(file: File, mode: CameraCaptureMode, rotationDegrees: Int = 0): UnifiedMediaInput {
+            val ext = file.extension.lowercase(Locale.US)
+            val detectedMime = when (ext) {
+                "png" -> "image/png"
+                "pdf" -> "application/pdf"
+                else -> "image/jpeg"
+            }
             return UnifiedMediaInput(
                 uri = null,
                 privateFile = file,
                 origin = MediaInputOrigin.CAMERA,
                 mode = mode,
+                mimeType = detectedMime,
                 rotationDegrees = rotationDegrees,
                 displayName = file.name
             )
         }
 
-        fun fromFile(file: File, mode: CameraCaptureMode, origin: MediaInputOrigin = MediaInputOrigin.CAMERA): UnifiedMediaInput {
+        fun fromFile(
+            file: File,
+            mode: CameraCaptureMode,
+            origin: MediaInputOrigin = MediaInputOrigin.CAMERA
+        ): UnifiedMediaInput {
+            val ext = file.extension.lowercase(Locale.US)
+            val detectedMime = when (ext) {
+                "png" -> "image/png"
+                "pdf" -> "application/pdf"
+                else -> "image/jpeg"
+            }
             return UnifiedMediaInput(
                 uri = null,
                 privateFile = file,
                 origin = origin,
                 mode = mode,
+                mimeType = detectedMime,
                 displayName = file.name
             )
         }
 
-        fun decodeBitmapWithExif(file: File): Bitmap? {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(file.absolutePath, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-
-            val maxDimension = 3000
-            var sampleSize = 1
-            while (bounds.outWidth / sampleSize > maxDimension || bounds.outHeight / sampleSize > maxDimension) {
-                sampleSize *= 2
+        fun hasValidImageHeader(header: ByteArray, readBytes: Int): Boolean {
+            if (readBytes < 4) return false
+            // JPEG: FF D8 FF
+            if (header[0] == 0xFF.toByte() && header[1] == 0xD8.toByte() && header[2] == 0xFF.toByte()) {
+                return true
             }
-
-            val decodeOpts = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
+            // PNG: 89 50 4E 47
+            if (header[0] == 0x89.toByte() && header[1] == 0x50.toByte() &&
+                header[2] == 0x4E.toByte() && header[3] == 0x47.toByte()
+            ) {
+                return true
             }
+            // WEBP: RIFF....WEBP
+            if (readBytes >= 12 &&
+                header[0] == 'R'.code.toByte() && header[1] == 'I'.code.toByte() &&
+                header[2] == 'F'.code.toByte() && header[3] == 'F'.code.toByte() &&
+                header[8] == 'W'.code.toByte() && header[9] == 'E'.code.toByte() &&
+                header[10] == 'B'.code.toByte() && header[11] == 'P'.code.toByte()
+            ) {
+                return true
+            }
+            // GIF: GIF8
+            if (header[0] == 'G'.code.toByte() && header[1] == 'I'.code.toByte() &&
+                header[2] == 'F'.code.toByte() && header[3] == '8'.code.toByte()
+            ) {
+                return true
+            }
+            // BMP: BM
+            if (header[0] == 'B'.code.toByte() && header[1] == 'M'.code.toByte()) {
+                return true
+            }
+            return false
+        }
 
-            val decoded = BitmapFactory.decodeFile(file.absolutePath, decodeOpts) ?: return null
-
+        fun decodeBitmapWithExif(file: File, maxDimension: Int = 2048): Bitmap? {
+            if (!file.exists() || file.length() < 4L) return null
             return try {
-                val exif = ExifInterface(file.absolutePath)
-                val orientation = exif.getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION,
+                val header = ByteArray(12)
+                val readBytes = file.inputStream().use { it.read(header) }
+                if (!hasValidImageHeader(header, readBytes)) return null
+
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+                var sampleSize = 1
+                while (bounds.outWidth / sampleSize > maxDimension || bounds.outHeight / sampleSize > maxDimension) {
+                    sampleSize *= 2
+                }
+
+                val decodeOpts = BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+
+                val decoded = BitmapFactory.decodeFile(file.absolutePath, decodeOpts) ?: return null
+
+                val orientation = try {
+                    val exif = ExifInterface(file.absolutePath)
+                    exif.getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION,
+                        ExifInterface.ORIENTATION_NORMAL
+                    )
+                } catch (_: Exception) {
                     ExifInterface.ORIENTATION_NORMAL
-                )
+                }
+
                 val matrix = Matrix()
                 when (orientation) {
                     ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
                     ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
                     ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-                    ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1.0f, 1.0f)
-                    ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1.0f, -1.0f)
+                    ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1.0f, 1.0f)
+                    ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1.0f, -1.0f)
+                    ExifInterface.ORIENTATION_TRANSPOSE -> {
+                        matrix.postRotate(90f)
+                        matrix.postScale(-1.0f, 1.0f)
+                    }
+                    ExifInterface.ORIENTATION_TRANSVERSE -> {
+                        matrix.postRotate(270f)
+                        matrix.postScale(-1.0f, 1.0f)
+                    }
                     else -> return decoded
                 }
                 val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
                 if (rotated != decoded) decoded.recycle()
                 rotated
             } catch (e: Exception) {
-                decoded
+                e.printStackTrace()
+                null
             }
         }
     }

@@ -5,13 +5,15 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <exclude domain="no_backup" path="document_locker" />
+        <exclude domain="root" path="no_backup" />
+        <exclude domain="file" path="document_locker" />
         <exclude domain="database" path="formready_locker.db" />
         <exclude domain="database" path="formready_locker.db-wal" />
         <exclude domain="database" path="formready_locker.db-shm" />
     </cloud-backup>
     <device-transfer>
-        <exclude domain="no_backup" path="document_locker" />
+        <exclude domain="root" path="no_backup" />
+        <exclude domain="file" path="document_locker" />
         <exclude domain="database" path="formready_locker.db" />
         <exclude domain="database" path="formready_locker.db-wal" />
         <exclude domain="database" path="formready_locker.db-shm" />

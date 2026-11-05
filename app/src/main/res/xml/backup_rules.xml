@@ -6,7 +6,8 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <exclude domain="no_backup" path="document_locker" />
+    <exclude domain="root" path="no_backup" />
+    <exclude domain="file" path="document_locker" />
     <exclude domain="database" path="formready_locker.db" />
     <exclude domain="database" path="formready_locker.db-wal" />
     <exclude domain="database" path="formready_locker.db-shm" />

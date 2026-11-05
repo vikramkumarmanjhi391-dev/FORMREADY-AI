@@ -24,21 +24,19 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowForward
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Compare
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderShared
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Share
@@ -48,7 +46,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -80,11 +77,15 @@ import androidx.compose.ui.unit.sp
 import com.example.camera.CameraCaptureMode
 import com.example.camera.UnifiedMediaInput
 import com.example.camera.UniversalCameraScreen
+import com.example.data.model.DocumentType
+import com.example.data.model.PortalSpec
+import com.example.data.portal.PortalDatabase
 import com.example.processing.ImageProcessor
+import com.example.processing.OneClickPreparationCoordinator
 import com.example.processing.PdfProcessor
+import com.example.ui.components.PortalPresetSelectorBar
 import com.example.ui.theme.EmeraldTertiary
 import com.example.ui.theme.NavyPrimary
-import com.example.ui.theme.SaffronSecondary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -94,17 +95,31 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import android.graphics.BitmapFactory
-import androidx.compose.material.icons.filled.PhotoCamera
-import androidx.compose.material.icons.filled.PhotoLibrary
 
 @Composable
 fun PdfMasterScreen() {
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-
     var selectedTabIndex by remember { mutableIntStateOf(0) }
-    val tabTitles = listOf("Images to PDF", "Compress PDF", "Front & Back Merge")
+    val tabTitles = listOf("1-Click Doc & PDF", "Compress PDF", "Front & Back ID")
+
+    var selectedPortal by remember {
+        mutableStateOf(
+            PortalDatabase.findPortalById("nsdl_pan") ?: PortalDatabase.getAllPortals().first()
+        )
+    }
+
+    val docRule = remember(selectedPortal) {
+        selectedPortal.documents.firstOrNull {
+            it.documentType != DocumentType.PASSPORT_PHOTO &&
+                it.documentType != DocumentType.POSTCARD_PHOTO &&
+                it.documentType != DocumentType.SIGNATURE_ENGLISH &&
+                it.documentType != DocumentType.SIGNATURE_HINDI &&
+                it.documentType != DocumentType.THUMB_IMPRESSION_LEFT &&
+                it.documentType != DocumentType.THUMB_IMPRESSION_RIGHT
+        }
+    }
+    val portalMaxDocKb = docRule?.maxKb ?: 200
+    val portalMinDocKb = docRule?.minKb ?: 20
+    val portalDocDpi = docRule?.dpi ?: 200
 
     LazyColumn(
         modifier = Modifier
@@ -116,15 +131,23 @@ fun PdfMasterScreen() {
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
-                text = "PDF Master Studio",
+                text = "1-Click Document & PDF Studio",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                text = "Convert certificates to PDF, compress down to 100-300 KB, merge pages, and combine front & back ID cards with real Save to Device.",
+                text = "1-Click Clear Scan with dual JPG + PDF output (<200KB / <300KB), multi-page A4 certificates, and Front & Back ID card merger.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            PortalPresetSelectorBar(
+                selectedPortalId = selectedPortal.id,
+                activeSectionSummary = "${selectedPortal.portalName} • Document: $portalMinDocKb–$portalMaxDocKb KB (JPG + PDF @ $portalDocDpi DPI) • Clear Scan ON",
+                onPortalSelected = { portal -> selectedPortal = portal }
             )
 
             Spacer(modifier = Modifier.height(14.dp))
@@ -138,7 +161,13 @@ fun PdfMasterScreen() {
                     Tab(
                         selected = selectedTabIndex == index,
                         onClick = { selectedTabIndex = index },
-                        text = { Text(title, fontSize = 12.sp, fontWeight = if (selectedTabIndex == index) FontWeight.Bold else FontWeight.Normal) }
+                        text = {
+                            Text(
+                                title,
+                                fontSize = 12.sp,
+                                fontWeight = if (selectedTabIndex == index) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
                     )
                 }
             }
@@ -147,8 +176,15 @@ fun PdfMasterScreen() {
         }
 
         when (selectedTabIndex) {
-            0 -> item { ImagesToPdfSection() }
-            1 -> item { CompressPdfSection() }
+            0 -> item {
+                ImagesToPdfSection(
+                    selectedPortal = selectedPortal,
+                    targetMinKb = portalMinDocKb,
+                    targetMaxKb = portalMaxDocKb,
+                    targetDpi = portalDocDpi
+                )
+            }
+            1 -> item { CompressPdfSection(defaultTargetMaxKb = portalMaxDocKb) }
             2 -> item { FrontBackMergeSection() }
         }
 
@@ -159,24 +195,151 @@ fun PdfMasterScreen() {
 }
 
 @Composable
-fun ImagesToPdfSection() {
+fun ImagesToPdfSection(
+    selectedPortal: PortalSpec = PortalDatabase.getAllPortals().first(),
+    targetMinKb: Int = 20,
+    targetMaxKb: Int = 200,
+    targetDpi: Int = 200
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
+    // 1-Click Single Document Dual JPG + PDF state
+    var oneClickOriginalBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var oneClickBundle by remember { mutableStateOf<OneClickPreparationCoordinator.OneClickDocumentBundle?>(null) }
+    var isOneClickProcessing by remember { mutableStateOf(false) }
+    var showOneClickOriginalPreview by remember { mutableStateOf(false) }
+    var showSingleDocCamera by remember { mutableStateOf(false) }
+    var oneClickSaveMessage by remember { mutableStateOf<String?>(null) }
+
+    // Multi-page PDF state
     val pickedBitmaps = remember { mutableStateListOf<Bitmap>() }
     var generatedPdfFile by remember { mutableStateOf<File?>(null) }
     var isGenerating by remember { mutableStateOf(false) }
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
     var showCameraCapture by remember { mutableStateOf(false) }
+    var generatedPageCount by remember { mutableIntStateOf(0) }
+
+    fun triggerOneClickDocumentPrepare(sourceBmp: Bitmap, useGuideCrop: Boolean) {
+        coroutineScope.launch {
+            isOneClickProcessing = true
+            oneClickSaveMessage = null
+            showOneClickOriginalPreview = false
+            try {
+                val cropRect = if (useGuideCrop) CameraCaptureMode.DOCUMENT_PAGE.guideCropRectNorm else null
+                val bundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+                    context = context,
+                    input = null,
+                    preDecodedBitmap = sourceBmp,
+                    minKb = targetMinKb,
+                    maxKb = targetMaxKb,
+                    dpi = targetDpi,
+                    applyClearScanFilter = true,
+                    cropRectNorm = cropRect
+                )
+                oneClickBundle = bundle
+                if (bundle != null) {
+                    Toast.makeText(
+                        context,
+                        "1-Click Document Ready! JPG: ${String.format(Locale.US, "%.1f", bundle.jpgResult.fileSizeKb)} KB • PDF: ${String.format(Locale.US, "%.1f", bundle.pdfSizeKb)} KB",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    Toast.makeText(context, "1-Click document scan failed", Toast.LENGTH_SHORT).show()
+                }
+            } finally {
+                isOneClickProcessing = false
+            }
+        }
+    }
+
+    val singleDocGalleryPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            coroutineScope.launch {
+                val input = UnifiedMediaInput.fromGalleryUri(uri, CameraCaptureMode.DOCUMENT_PAGE)
+                val bmp = input.resolveBitmap(context)
+                if (bmp != null) {
+                    oneClickOriginalBitmap = bmp
+                    if (pickedBitmaps.isEmpty()) {
+                        pickedBitmaps.add(bmp)
+                    }
+                    triggerOneClickDocumentPrepare(bmp, useGuideCrop = false)
+                } else {
+                    Toast.makeText(context, "Unable to decode selected document.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    if (showSingleDocCamera) {
+        UniversalCameraScreen(
+            mode = CameraCaptureMode.DOCUMENT_PAGE,
+            instantOneClickByDefault = true,
+            onMediaCaptured = { input ->
+                val bmp = input.toBitmap(context)
+                input.cleanupPrivateCameraFileIfTemporary()
+                if (bmp != null) {
+                    oneClickOriginalBitmap = bmp
+                    if (pickedBitmaps.isEmpty()) {
+                        pickedBitmaps.add(bmp)
+                    }
+                    triggerOneClickDocumentPrepare(bmp, useGuideCrop = true)
+                } else {
+                    Toast.makeText(context, "Failed to decode captured document.", Toast.LENGTH_SHORT).show()
+                }
+                showSingleDocCamera = false
+            },
+            onDismiss = { showSingleDocCamera = false }
+        )
+    }
+
+    val saveOneClickPdfLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { destUri: Uri? ->
+        val pdfFile = oneClickBundle?.pdfFile
+        if (destUri != null && pdfFile != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openOutputStream(destUri)?.use { out ->
+                        FileInputStream(pdfFile).use { inStream ->
+                            inStream.copyTo(out)
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        oneClickSaveMessage = "PDF saved (${String.format(Locale.US, "%.1f", pdfFile.length() / 1024.0)} KB)"
+                        Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Failed to save PDF: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 15)
     ) { uris: List<Uri> ->
         if (uris.isNotEmpty()) {
             coroutineScope.launch {
+                var addedCount = 0
                 uris.forEach { uri ->
-                    val bmp = ImageProcessor.decodeBitmapFromUri(context, uri)
-                    if (bmp != null) pickedBitmaps.add(bmp)
+                    val input = UnifiedMediaInput.fromGalleryUri(uri, CameraCaptureMode.MULTI_PAGE_DOCUMENT)
+                    val bmp = input.resolveBitmap(context)
+                    if (bmp != null) {
+                        pickedBitmaps.add(bmp)
+                        if (oneClickOriginalBitmap == null) {
+                            oneClickOriginalBitmap = bmp
+                            triggerOneClickDocumentPrepare(bmp, useGuideCrop = false)
+                        }
+                        addedCount++
+                    }
+                }
+                if (addedCount < uris.size) {
+                    Toast.makeText(context, "Skipped ${uris.size - addedCount} unreadable image(s).", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -187,17 +350,34 @@ fun ImagesToPdfSection() {
             mode = CameraCaptureMode.MULTI_PAGE_DOCUMENT,
             onMediaCaptured = { input ->
                 val bmp = input.toBitmap(context)
+                input.cleanupPrivateCameraFileIfTemporary()
                 if (bmp != null) {
                     pickedBitmaps.add(bmp)
+                    if (oneClickOriginalBitmap == null) {
+                        oneClickOriginalBitmap = bmp
+                        triggerOneClickDocumentPrepare(bmp, useGuideCrop = true)
+                    }
+                } else {
+                    Toast.makeText(context, "Failed to decode captured page.", Toast.LENGTH_SHORT).show()
                 }
                 showCameraCapture = false
             },
             onMultiPageCaptured = { files ->
+                var added = 0
                 files.forEach { file ->
-                    val bmp = BitmapFactory.decodeFile(file.absolutePath)
+                    val bmp = UnifiedMediaInput.decodeBitmapWithExif(file, maxDimension = 2048)
                     if (bmp != null) {
                         pickedBitmaps.add(bmp)
+                        if (oneClickOriginalBitmap == null) {
+                            oneClickOriginalBitmap = bmp
+                            triggerOneClickDocumentPrepare(bmp, useGuideCrop = true)
+                        }
+                        added++
                     }
+                }
+                com.example.camera.UniversalCameraController.cleanupTemporaryFiles(files)
+                if (added == 0 && files.isNotEmpty()) {
+                    Toast.makeText(context, "Could not decode captured pages.", Toast.LENGTH_SHORT).show()
                 }
                 showCameraCapture = false
             },
@@ -231,6 +411,7 @@ fun ImagesToPdfSection() {
         }
     }
 
+    // 1. 1-Click Clear Scan Document Card (Dual JPG + PDF output under Portal Max KB)
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -243,8 +424,235 @@ fun ImagesToPdfSection() {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                    Text("Images to Single A4 PDF", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Text("Combine Class 10/12, Degrees, Certificates", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        text = "⚡ 1-Click Clear Scan (JPG + PDF)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = "Auto-crop + Clear Scan contrast filter + Both JPG & PDF (<$targetMaxKb KB for ${selectedPortal.portalName})",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { showSingleDocCamera = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.weight(1f).testTag("one_click_doc_camera_btn")
+                ) {
+                    Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("1-Click Cam Scan", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        singleDocGalleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.weight(1f).testTag("one_click_doc_gallery_btn")
+                ) {
+                    Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Pick Document", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+
+            if (isOneClickProcessing) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Applying Clear Scan & preparing JPG + PDF (<$targetMaxKb KB)...", fontSize = 12.sp)
+                }
+            }
+
+            oneClickBundle?.let { bundle ->
+                Spacer(modifier = Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
+                    border = androidx.compose.foundation.BorderStroke(1.5.dp, EmeraldTertiary)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldTertiary)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "1-Click Clear Scan Ready!",
+                                    fontWeight = FontWeight.Bold,
+                                    color = EmeraldTertiary,
+                                    fontSize = 13.sp
+                                )
+                            }
+                            if (oneClickOriginalBitmap != null) {
+                                Surface(
+                                    color = NavyPrimary.copy(alpha = 0.1f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.clickable { showOneClickOriginalPreview = !showOneClickOriginalPreview }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(imageVector = Icons.Default.Compare, contentDescription = null, tint = NavyPrimary, modifier = Modifier.size(13.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = if (showOneClickOriginalPreview) "Showing: Before" else "Before / After",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = NavyPrimary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(160.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color.White)
+                                .border(1.dp, EmeraldTertiary.copy(alpha = 0.4f), RoundedCornerShape(8.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val bmpToShow = if (showOneClickOriginalPreview && oneClickOriginalBitmap != null) {
+                                oneClickOriginalBitmap!!
+                            } else {
+                                bundle.cleanedBitmap
+                            }
+                            Image(
+                                bitmap = bmpToShow.asImageBitmap(),
+                                contentDescription = "Scanned Document Preview",
+                                modifier = Modifier.fillMaxSize().padding(6.dp),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        val jpgKb = bundle.jpgResult.fileSizeKb
+                        val pdfKb = bundle.pdfSizeKb
+                        Text(
+                            text = "JPG: ${bundle.jpgResult.widthPx}×${bundle.jpgResult.heightPx} px • ${String.format(Locale.US, "%.1f", jpgKb)} KB  |  PDF: ${String.format(Locale.US, "%.1f", pdfKb)} KB (<$targetMaxKb KB)",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = NavyPrimary
+                        )
+
+                        if (oneClickSaveMessage != null) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "✓ $oneClickSaveMessage",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = EmeraldTertiary
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    coroutineScope.launch {
+                                        val jpgFile = File(bundle.jpgResult.processedFilePath)
+                                        val uri = ImageProcessor.saveFileToGalleryMediaStore(
+                                            context = context,
+                                            sourceFile = jpgFile,
+                                            displayName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg",
+                                            mimeType = "image/jpeg"
+                                        )
+                                        if (uri != null) {
+                                            oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", jpgKb)} KB)"
+                                            Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f).testTag("download_doc_jpg_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Save JPG", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            Button(
+                                onClick = {
+                                    val suggestedName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
+                                    saveOneClickPdfLauncher.launch(suggestedName)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f).testTag("download_doc_pdf_btn")
+                            ) {
+                                Icon(imageVector = Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Save PDF", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    sharePreparedFiles(
+                                        context,
+                                        listOf(File(bundle.jpgResult.processedFilePath), bundle.pdfFile)
+                                    )
+                                },
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(15.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Spacer(modifier = Modifier.height(14.dp))
+
+    // 2. Multi-Page Images to Single A4 PDF Section
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text("Multi-Page Images to A4 PDF", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("Combine Class 10/12 Marksheets, Degrees, Certificates", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedButton(
@@ -351,17 +759,42 @@ fun ImagesToPdfSection() {
                         coroutineScope.launch {
                             isGenerating = true
                             saveStatusMessage = null
-                            val file = PdfProcessor.createPdfFromBitmaps(
-                                context = context,
-                                bitmaps = pickedBitmaps.toList(),
-                                outputFileName = "certificate_${System.currentTimeMillis()}.pdf"
-                            )
-                            generatedPdfFile = file
-                            isGenerating = false
-                            Toast.makeText(context, "PDF generated: ${String.format(Locale.US, "%.1f", file.length() / 1024.0)} KB", Toast.LENGTH_SHORT).show()
+                            try {
+                                val pagesSnapshot = pickedBitmaps.toList()
+                                val file = PdfProcessor.createPdfFromBitmaps(
+                                    context = context,
+                                    bitmaps = pagesSnapshot,
+                                    outputFileName = "certificate_${System.currentTimeMillis()}.pdf"
+                                )
+                                val validation = withContext(Dispatchers.IO) {
+                                    com.example.storage.DocumentValidationManager.validateFile(file)
+                                }
+                                if (validation.isValid && validation.pageCount == pagesSnapshot.size) {
+                                    generatedPdfFile = file
+                                    generatedPageCount = validation.pageCount
+                                    Toast.makeText(
+                                        context,
+                                        "PDF generated (${validation.pageCount} pages, ${String.format(Locale.US, "%.1f", file.length() / 1024.0)} KB)",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    file.delete()
+                                    generatedPdfFile = null
+                                    Toast.makeText(
+                                        context,
+                                        validation.errorMessage ?: "Generated PDF failed validation",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            } catch (e: Exception) {
+                                generatedPdfFile = null
+                                Toast.makeText(context, "PDF generation failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                            } finally {
+                                isGenerating = false
+                            }
                         }
                     },
-                    enabled = !isGenerating,
+                    enabled = !isGenerating && pickedBitmaps.isNotEmpty(),
                     shape = RoundedCornerShape(10.dp),
                     modifier = Modifier.fillMaxWidth().testTag("generate_pdf_btn")
                 ) {
@@ -406,7 +839,7 @@ fun ImagesToPdfSection() {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldTertiary)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("PDF Created Successfully!", fontWeight = FontWeight.Bold, color = EmeraldTertiary)
+                            Text("PDF Created Successfully! ($generatedPageCount Page${if (generatedPageCount == 1) "" else "s"})", fontWeight = FontWeight.Bold, color = EmeraldTertiary)
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("File: ${pdfFile.name} • ${String.format(Locale.US, "%.1f", pdfFile.length() / 1024.0)} KB", fontSize = 12.sp)
@@ -488,12 +921,12 @@ fun ImagesToPdfSection() {
 }
 
 @Composable
-fun CompressPdfSection() {
+fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
     var inputPdfFile by remember { mutableStateOf<File?>(null) }
-    var targetMaxKb by remember { mutableIntStateOf(300) }
+    var targetMaxKb by remember(defaultTargetMaxKb) { mutableIntStateOf(defaultTargetMaxKb) }
     var compressedPdfFile by remember { mutableStateOf<File?>(null) }
     var isCompressing by remember { mutableStateOf(false) }
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
@@ -789,6 +1222,7 @@ fun FrontBackMergeSection() {
             mode = CameraCaptureMode.DOCUMENT_PAGE,
             onMediaCaptured = { input ->
                 val bmp = input.toBitmap(context)
+                input.cleanupPrivateCameraFileIfTemporary()
                 if (bmp != null) {
                     if (cameraTargetForIdCard == "front") {
                         frontBitmap = bmp
@@ -797,6 +1231,8 @@ fun FrontBackMergeSection() {
                     }
                     mergedPdfFile = null
                     saveStatusMessage = null
+                } else {
+                    Toast.makeText(context, "Could not decode captured ID card side.", Toast.LENGTH_SHORT).show()
                 }
                 cameraTargetForIdCard = null
             },
