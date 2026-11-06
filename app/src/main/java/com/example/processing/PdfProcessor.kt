@@ -488,10 +488,15 @@ object PdfProcessor {
 
                 if (candidateFile.exists() && candidateFile.length() > 0L) {
                     if (bestCandidateFile == null || candidateFile.length() < bestCandidateFile.length()) {
+                        val previousBest = bestCandidateFile
                         bestCandidateFile = candidateFile
+                        if (previousBest != null && previousBest.exists() && previousBest.absolutePath != candidateFile.absolutePath) {
+                            previousBest.delete()
+                        }
+                    } else if (candidateFile.absolutePath != bestCandidateFile.absolutePath) {
+                        candidateFile.delete()
                     }
-                    if (candidateFile.length() <= targetMaxBytes) {
-                        bestCandidateFile = candidateFile
+                    if (bestCandidateFile.length() <= targetMaxBytes) {
                         break
                     }
                 }

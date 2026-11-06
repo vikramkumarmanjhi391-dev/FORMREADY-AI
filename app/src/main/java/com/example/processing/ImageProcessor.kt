@@ -165,13 +165,34 @@ object ImageProcessor {
     }
 
     /**
+     * Safely replaces an intermediate [current] bitmap with [next], recycling [current] ONLY when
+     * it is owned by the processing pipeline (not [originalBitmap], not [next], and not in [protectedBitmaps]).
+     */
+    private fun replaceIntermediateBitmap(
+        current: Bitmap?,
+        next: Bitmap,
+        originalBitmap: Bitmap,
+        protectedBitmaps: Set<Bitmap> = emptySet()
+    ): Bitmap {
+        if (current != null &&
+            current !== next &&
+            current !== originalBitmap &&
+            !protectedBitmaps.contains(current) &&
+            !current.isRecycled
+        ) {
+            current.recycle()
+        }
+        return next
+    }
+
+    /**
      * Comprehensive Image Preparation Engine:
      * - Respects aspect ratio cropping
      * - Resizes with proportional or exact scaling
      * - Applies official Name & Date of Photo strips
      * - Executes intelligent stepped compression
-     * - Checks for requirement conflicts (e.g., impossible dimensions for KB limit)
-     * - Validates actual written output file on disk
+     * - Checks for requirement conflicts (including minKb > maxKb or impossible format/dimension limits)
+     * - Validates actual written output file on disk using bounded reads and safe bitmap ownership
      */
     suspend fun processImageForRule(
         context: Context,
@@ -190,149 +211,182 @@ object ImageProcessor {
         inkThreshold: Int = 180,
         preserveInkColor: Boolean = true,
         removeBackgroundToWhite: Boolean = false,
-        customDpi: Int? = null
+        customDpi: Int? = null,
+        backgroundMask: BooleanArray? = null
     ): ProcessedFileResult = withContext(Dispatchers.Default) {
-        var workingBitmap = originalBitmap
-
-        // 1. Manual or Guide-Frame Crop if specified
-        if (cropRectNorm != null) {
-            workingBitmap = cropBitmap(workingBitmap, cropRectNorm)
-        }
-
-        // 2. Auto-crop blank margins (Signature & Thumb)
-        if (autoCropMargins) {
-            workingBitmap = cropBlankMargins(workingBitmap)
-        }
-
-        // 3. Aspect ratio conforming (if aspect ratio is designated and no custom exact stretch was chosen)
-        val desiredRatio = rule.targetAspectRatio
-        if (desiredRatio != null && desiredRatio > 0f && cropRectNorm == null && enforceProportional) {
-            workingBitmap = cropToAspectRatio(workingBitmap, desiredRatio)
-        }
-
-        // 4. Calculate target dimensions
-        val targetWidth: Int
-        val targetHeight: Int
-
-        val reqExactW = customWidthPx ?: rule.exactWidthPx
-        val reqExactH = customHeightPx ?: rule.exactHeightPx
-
-        if (reqExactW != null && reqExactH != null && reqExactW > 0 && reqExactH > 0) {
-            if (enforceProportional && cropRectNorm == null) {
-                // Crop to match target ratio first so scaling does not squish
-                val ratio = reqExactW.toFloat() / reqExactH.toFloat()
-                workingBitmap = cropToAspectRatio(workingBitmap, ratio)
-            }
-            targetWidth = reqExactW
-            targetHeight = reqExactH
-        } else {
-            val maxBound = rule.maxWidthPx ?: 800
-            val curRatio = workingBitmap.width.toFloat() / workingBitmap.height.toFloat()
-            if (workingBitmap.width > maxBound || workingBitmap.height > maxBound) {
-                if (curRatio >= 1.0f) {
-                    targetWidth = maxBound
-                    targetHeight = (maxBound / curRatio).toInt().coerceAtLeast(50)
-                } else {
-                    targetHeight = maxBound
-                    targetWidth = (maxBound * curRatio).toInt().coerceAtLeast(50)
-                }
-            } else {
-                targetWidth = workingBitmap.width
-                targetHeight = workingBitmap.height
-            }
-        }
-
-        // 5. Scale Bitmap
-        var scaled = Bitmap.createScaledBitmap(workingBitmap, targetWidth, targetHeight, true)
-
-        // 5b. On-Device White Background Replacement + Gentle Face Enhancement (for Passport Photos)
-        val shouldApplyWhiteBg = removeBackgroundToWhite &&
-            (rule.documentType == com.example.data.model.DocumentType.PASSPORT_PHOTO ||
-             rule.documentType == com.example.data.model.DocumentType.POSTCARD_PHOTO)
-        if (shouldApplyWhiteBg) {
-            scaled = applyAutoWhiteBackgroundAndFaceEnhance(scaled)
-        }
-
-        // 6. Signature Enhancement & Background Whitening
-        if (contrastFactor != 1.0f || brightnessOffset != 0f || inkThreshold != 180 || !preserveInkColor) {
-            scaled = adjustSignatureLighting(scaled, contrastFactor, brightnessOffset, inkThreshold, preserveInkColor)
-        }
-
-        // 7. Name & Date Strip (UPSC, NTA, SSC requirements)
-        if (rule.requiresNameAndDateStrip && (candidateName.isNotBlank() || dateOfPhoto.isNotBlank())) {
-            scaled = addNameAndDateStrip(scaled, candidateName, dateOfPhoto)
-        }
-
-        // 8. Color Mode Transformations
-        when (rule.colorMode) {
-            ColorMode.GRAYSCALE -> scaled = applyGrayscale(scaled)
-            ColorMode.BLACK_AND_WHITE -> scaled = applyHighContrastMonochrome(scaled, inkThreshold)
-            else -> {}
-        }
-
-        // 9. Intelligent Compression, Exact DPI Header & Safe Min-KB Guarantee
-        val targetMaxKb = customTargetKb ?: rule.maxKb
-        val targetMinKb = rule.minKb.coerceAtMost(targetMaxKb)
-        val targetDpi = (customDpi ?: rule.dpi ?: 300).coerceIn(72, 1200)
+        var workingBitmap: Bitmap = originalBitmap
+        var scaled: Bitmap? = null
 
         val chosenFormat = if (rule.allowedFormats.contains(FileFormat.PNG) && !rule.allowedFormats.contains(FileFormat.JPG)) {
             FileFormat.PNG
         } else {
             FileFormat.JPG
         }
-
         val compressFormat = if (chosenFormat == FileFormat.PNG) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
 
-        // Detect conflicts: e.g. PNG with high resolution requested under 30 KB
+        // Preserve original rule.minKb without silent coercion
+        val targetMaxKb = customTargetKb ?: rule.maxKb
+        val targetMinKb = rule.minKb
+        val targetDpi = (customDpi ?: rule.dpi ?: 300).coerceIn(72, 1200)
+        val dpiExplicitlyRequired = customDpi != null || rule.dpi != null || compressFormat == Bitmap.CompressFormat.JPEG
+
+        val reqExactW = customWidthPx ?: rule.exactWidthPx
+        val reqExactH = customHeightPx ?: rule.exactHeightPx
+
         var hasConflict = false
         var conflictReason: String? = null
 
-        if (compressFormat == Bitmap.CompressFormat.PNG && targetMaxKb < 35 && (scaled.width > 400 || scaled.height > 400)) {
+        if (targetMinKb < 0 || targetMaxKb <= 0) {
             hasConflict = true
-            conflictReason = "PNG is a lossless format and cannot compress ${scaled.width}x${scaled.height}px below $targetMaxKb KB. Consider JPG format."
+            conflictReason = "Requirements Conflict: Invalid file size bounds (minKb=$targetMinKb KB, maxKb=$targetMaxKb KB)."
+        } else if (targetMinKb > targetMaxKb) {
+            hasConflict = true
+            conflictReason = "Requirements Conflict: Minimum required size ($targetMinKb KB) exceeds maximum allowed limit ($targetMaxKb KB)."
         }
 
-        val compressionResult = compressToTargetKbWithDetails(
-            src = scaled,
-            targetMinKb = targetMinKb,
-            targetMaxKb = targetMaxKb,
-            format = compressFormat,
-            allowDownscale = !hasConflict,
-            dpi = targetDpi
-        )
+        val shouldApplyWhiteBg = removeBackgroundToWhite &&
+            (rule.documentType == com.example.data.model.DocumentType.PASSPORT_PHOTO ||
+             rule.documentType == com.example.data.model.DocumentType.POSTCARD_PHOTO)
 
-        // 10. Write actual file to cache directory with dual JFIF APP0 + EXIF DPI metadata
         val fileName = "formready_${rule.documentType.name.lowercase()}_${System.currentTimeMillis()}.${chosenFormat.extension}"
         val docsDir = File(context.cacheDir, "prepared_docs").apply { mkdirs() }
         val outputFile = File(docsDir, fileName)
 
-        withContext(Dispatchers.IO) {
-            FileOutputStream(outputFile).use { it.write(compressionResult.bytes) }
+        val compressionResult: CompressionDetails = try {
+            // 1. Manual or Guide-Frame Crop if specified
+            if (cropRectNorm != null) {
+                val cropped = cropBitmap(workingBitmap, cropRectNorm)
+                workingBitmap = replaceIntermediateBitmap(workingBitmap, cropped, originalBitmap)
+            }
+
+            // 2. Auto-crop blank margins (Signature & Thumb)
+            if (autoCropMargins) {
+                val marginTrimmed = cropBlankMargins(workingBitmap)
+                workingBitmap = replaceIntermediateBitmap(workingBitmap, marginTrimmed, originalBitmap)
+            }
+
+            // 3. Aspect ratio conforming (if aspect ratio is designated and no custom exact stretch was chosen)
+            val desiredRatio = rule.targetAspectRatio
+            if (desiredRatio != null && desiredRatio > 0f && cropRectNorm == null && enforceProportional) {
+                val ratioCropped = cropToAspectRatio(workingBitmap, desiredRatio)
+                workingBitmap = replaceIntermediateBitmap(workingBitmap, ratioCropped, originalBitmap)
+            }
+
+            // 4. Calculate target dimensions
+            val targetWidth: Int
+            val targetHeight: Int
+
+            if (reqExactW != null && reqExactH != null && reqExactW > 0 && reqExactH > 0) {
+                if (enforceProportional && cropRectNorm == null) {
+                    val ratio = reqExactW.toFloat() / reqExactH.toFloat()
+                    val exactRatioCropped = cropToAspectRatio(workingBitmap, ratio)
+                    workingBitmap = replaceIntermediateBitmap(workingBitmap, exactRatioCropped, originalBitmap)
+                }
+                targetWidth = reqExactW
+                targetHeight = reqExactH
+            } else {
+                val maxBound = rule.maxWidthPx ?: 800
+                val curRatio = workingBitmap.width.toFloat() / workingBitmap.height.toFloat()
+                if (workingBitmap.width > maxBound || workingBitmap.height > maxBound) {
+                    if (curRatio >= 1.0f) {
+                        targetWidth = maxBound
+                        targetHeight = (maxBound / curRatio).toInt().coerceAtLeast(50)
+                    } else {
+                        targetHeight = maxBound
+                        targetWidth = (maxBound * curRatio).toInt().coerceAtLeast(50)
+                    }
+                } else {
+                    targetWidth = workingBitmap.width
+                    targetHeight = workingBitmap.height
+                }
+            }
+
+            // 5. Scale Bitmap and release intermediate workingBitmap if distinct
+            val initialScaled = Bitmap.createScaledBitmap(workingBitmap, targetWidth, targetHeight, true)
+            scaled = replaceIntermediateBitmap(workingBitmap, initialScaled, originalBitmap)
+            workingBitmap = originalBitmap
+
+            // 5b. On-Device White Background Replacement + Gentle Face Enhancement (for Passport Photos)
+            if (shouldApplyWhiteBg && scaled != null) {
+                val bgWhitened = applyAutoWhiteBackgroundAndFaceEnhance(scaled!!)
+                scaled = replaceIntermediateBitmap(scaled, bgWhitened, originalBitmap)
+            }
+
+            // 6. Signature Enhancement & Background Whitening
+            if (scaled != null && (contrastFactor != 1.0f || brightnessOffset != 0f || inkThreshold != 180 || !preserveInkColor)) {
+                val sigAdjusted = adjustSignatureLighting(scaled!!, contrastFactor, brightnessOffset, inkThreshold, preserveInkColor)
+                scaled = replaceIntermediateBitmap(scaled, sigAdjusted, originalBitmap)
+            }
+
+            // 7. Name & Date Strip (UPSC, NTA, SSC requirements)
+            if (scaled != null && rule.requiresNameAndDateStrip && (candidateName.isNotBlank() || dateOfPhoto.isNotBlank())) {
+                val withStrip = addNameAndDateStrip(scaled!!, candidateName, dateOfPhoto)
+                scaled = replaceIntermediateBitmap(scaled, withStrip, originalBitmap)
+            }
+
+            // 8. Color Mode Transformations
+            if (scaled != null) {
+                when (rule.colorMode) {
+                    ColorMode.GRAYSCALE -> {
+                        val gray = applyGrayscale(scaled!!)
+                        scaled = replaceIntermediateBitmap(scaled, gray, originalBitmap)
+                    }
+                    ColorMode.BLACK_AND_WHITE -> {
+                        val bw = applyHighContrastMonochrome(scaled!!, inkThreshold)
+                        scaled = replaceIntermediateBitmap(scaled, bw, originalBitmap)
+                    }
+                    else -> {}
+                }
+            }
+
+            val activeScaled = scaled ?: originalBitmap
+            if (!hasConflict && compressFormat == Bitmap.CompressFormat.PNG && targetMaxKb < 35 && (activeScaled.width > 400 || activeScaled.height > 400)) {
+                hasConflict = true
+                conflictReason = "PNG is a lossless format and cannot compress ${activeScaled.width}x${activeScaled.height}px below $targetMaxKb KB. Consider JPG format."
+            }
+
+            val effectiveMaxKbForEncoding = targetMaxKb.coerceAtLeast(1)
+            val effectiveMinKbForEncoding = targetMinKb.coerceIn(0, effectiveMaxKbForEncoding)
+
+            val compRes = compressToTargetKbWithDetails(
+                src = activeScaled,
+                targetMinKb = effectiveMinKbForEncoding,
+                targetMaxKb = effectiveMaxKbForEncoding,
+                format = compressFormat,
+                allowDownscale = !hasConflict,
+                dpi = targetDpi
+            )
+
+            // 10. Write actual file to cache directory
+            withContext(Dispatchers.IO) {
+                FileOutputStream(outputFile).use { it.write(compRes.bytes) }
+            }
+            compRes
+        } finally {
+            if (scaled != null && scaled !== originalBitmap && !scaled!!.isRecycled) {
+                scaled!!.recycle()
+            }
+            if (workingBitmap !== originalBitmap && !workingBitmap.isRecycled) {
+                workingBitmap.recycle()
+            }
         }
 
-        // Release intermediate pre-compression bitmap if distinct from caller's originalBitmap
-        if (scaled !== originalBitmap && scaled !== workingBitmap && !scaled.isRecycled) {
-            scaled.recycle()
-        }
-        if (workingBitmap !== originalBitmap && !workingBitmap.isRecycled) {
-            workingBitmap.recycle()
-        }
-
-        // 11. Read back and inspect the ACTUAL saved output file on disk for truthful validation
-        val savedFileBytes = withContext(Dispatchers.IO) {
-            if (outputFile.exists() && outputFile.canRead()) outputFile.readBytes() else ByteArray(0)
-        }
-        val actualBytes = outputFile.length()
+        // 11. Inspect the ACTUAL saved output file on disk using streaming/bounded reads
+        val actualBytes = if (outputFile.exists()) outputFile.length() else 0L
         val actualSizeKb = actualBytes / 1024.0
 
-        val decodedSavedBitmap = if (savedFileBytes.isNotEmpty()) {
-            try {
-                BitmapFactory.decodeByteArray(savedFileBytes, 0, savedFileBytes.size)
-            } catch (_: Throwable) {
+        val decodedSavedBitmap = withContext(Dispatchers.IO) {
+            if (outputFile.exists() && outputFile.canRead() && actualBytes > 0L) {
+                try {
+                    outputFile.inputStream().buffered().use { stream ->
+                        BitmapFactory.decodeStream(stream)
+                    }
+                } catch (_: Throwable) {
+                    null
+                }
+            } else {
                 null
             }
-        } else {
-            null
         }
 
         val decodeSucceeded = decodedSavedBitmap != null && decodedSavedBitmap.width > 0 && decodedSavedBitmap.height > 0
@@ -348,11 +402,12 @@ object ImageProcessor {
                 measureBackgroundWhiteness(
                     bitmap = decodedSavedBitmap,
                     isSignatureOrDocument = isSigOrDoc,
-                    backgroundMask = null
+                    backgroundMask = backgroundMask
                 )
             } else {
                 BackgroundWhitenessReport(
-                    isWhiteBackground = false,
+                    measuredNearWhite = false,
+                    verifiedBackgroundCompliance = false,
                     whitePixelRatio = 0f,
                     exactWhitePixelRatio = 0f,
                     meanLuminance = 0,
@@ -365,36 +420,58 @@ object ImageProcessor {
                 decodedSavedBitmap.recycle()
             }
         }
-        val measuredWhiteBackground = whitenessReport.isWhiteBackground
 
-        // Read back JFIF DPI and EXIF XResolution, YResolution, and ResolutionUnit from saved file
+        val measuredNearWhite = whitenessReport.measuredNearWhite
+        val verifiedBackgroundCompliance = whitenessReport.verifiedBackgroundCompliance
+
+        // 11b. Format-specific DPI Metadata Verification from the saved file on disk
         val isJpegOutput = compressFormat == Bitmap.CompressFormat.JPEG
-        val jfifDpiReadback = if (isJpegOutput) readJfifDpiHeader(savedFileBytes) else targetDpi
-        val exifMetaReadback = if (isJpegOutput) readExifResolutionMetadata(outputFile) else ExifResolutionMetadata(targetDpi, targetDpi, 2)
-        val dpiVerified = if (isJpegOutput) {
-            jfifDpiReadback == targetDpi &&
-                exifMetaReadback != null &&
+        val jfifMetaReadback = if (isJpegOutput) readJfifResolutionMetadata(outputFile) else null
+        val exifMetaReadback = if (isJpegOutput) readExifResolutionMetadata(outputFile) else null
+        val pngMetaReadback = if (!isJpegOutput) readPngPhysMetadata(outputFile) else null
+
+        val dpiVerified: Boolean
+        val finalReportedDpi: Int
+
+        if (isJpegOutput) {
+            val jfifMatches = jfifMetaReadback != null &&
+                jfifMetaReadback.resolutionUnit == 1 &&
+                jfifMetaReadback.xDpi == targetDpi &&
+                jfifMetaReadback.yDpi == targetDpi
+            val exifMatches = exifMetaReadback != null &&
+                exifMetaReadback.resolutionUnit == 2 &&
                 exifMetaReadback.xDpi == targetDpi &&
-                exifMetaReadback.yDpi == targetDpi &&
-                exifMetaReadback.resolutionUnit == 2
+                exifMetaReadback.yDpi == targetDpi
+            dpiVerified = jfifMatches && exifMatches
+            finalReportedDpi = if (dpiVerified) {
+                targetDpi
+            } else {
+                jfifMetaReadback?.xDpi ?: exifMetaReadback?.xDpi ?: 0
+            }
         } else {
-            true
+            val pngMatches = pngMetaReadback != null &&
+                pngMetaReadback.resolutionUnit == 2 &&
+                pngMetaReadback.xDpi == targetDpi &&
+                pngMetaReadback.yDpi == targetDpi
+            dpiVerified = if (dpiExplicitlyRequired) pngMatches else true
+            finalReportedDpi = if (pngMatches) targetDpi else (pngMetaReadback?.xDpi ?: 0)
         }
-        val finalReportedDpi = jfifDpiReadback ?: exifMetaReadback?.xDpi ?: 0
 
         // 12. Deterministic Validation against Rule on the Saved File
         val validationMessages = mutableListOf<String>()
-        val targetMinBytes = targetMinKb * 1024L
-        val targetMaxBytes = targetMaxKb * 1024L
+        val targetMinBytes = targetMinKb.toLong() * 1024L
+        val targetMaxBytes = targetMaxKb.toLong() * 1024L
 
-        val sizeWithinMax = actualBytes in 1L..targetMaxBytes
-        val sizeAboveMin = actualBytes >= targetMinBytes
+        val sizeWithinMax = !hasConflict && actualBytes in 1L..targetMaxBytes
+        val sizeAboveMin = !hasConflict && actualBytes >= targetMinBytes
 
         if (!decodeSucceeded) {
             validationMessages.add("Saved output file could not be decoded as a valid image.")
         }
 
-        if (!sizeWithinMax) {
+        if (hasConflict && conflictReason != null) {
+            validationMessages.add(conflictReason!!)
+        } else if (!sizeWithinMax) {
             validationMessages.add("File size (${String.format(Locale.US, "%.1f", actualSizeKb)} KB / $actualBytes bytes) exceeds the maximum allowed limit of $targetMaxKb KB.")
         } else if (!sizeAboveMin) {
             validationMessages.add("File size (${String.format(Locale.US, "%.1f", actualSizeKb)} KB / $actualBytes bytes) is below the required portal minimum of $targetMinKb KB.")
@@ -402,11 +479,12 @@ object ImageProcessor {
             validationMessages.add("File size verified: ${String.format(Locale.US, "%.1f", actualSizeKb)} KB ($actualBytes bytes, Allowed: $targetMinKb - $targetMaxKb KB)")
         }
 
+        // Keep pixel dimensions separate from physical print resolution
         val exactDimsMet: Boolean
         if (reqExactW != null && reqExactH != null) {
             if (finalWidth == reqExactW && finalHeight == reqExactH) {
                 exactDimsMet = true
-                validationMessages.add("Dimensions verified: $finalWidth x $finalHeight px @ $finalReportedDpi DPI (Exact match)")
+                validationMessages.add("Pixel Dimensions verified: $finalWidth x $finalHeight px (Exact match)")
             } else {
                 exactDimsMet = false
                 if (compressionResult.wasDownscaled) {
@@ -417,7 +495,7 @@ object ImageProcessor {
             }
         } else {
             exactDimsMet = true
-            validationMessages.add("Resolution: $finalWidth x $finalHeight px @ $finalReportedDpi DPI (Aspect Ratio: ${String.format(Locale.US, "%.2f", finalAspectRatio)})")
+            validationMessages.add("Pixel Dimensions: $finalWidth x $finalHeight px (Aspect Ratio: ${String.format(Locale.US, "%.2f", finalAspectRatio)})")
         }
 
         val boundedDimsMet = (rule.minWidthPx == null || finalWidth >= rule.minWidthPx) &&
@@ -428,36 +506,45 @@ object ImageProcessor {
             validationMessages.add("Dimensions ($finalWidth x $finalHeight px) fall outside rule bounds.")
         }
 
-        val whiteBgMet = !rule.requiresWhiteBackground || measuredWhiteBackground
+        // Strict Background Compliance: when rule requires a white background, only verifiedBackgroundCompliance
+        // (backed by an explicit reliable segmentation mask) satisfies strict compliance.
+        val whiteBgMet = !rule.requiresWhiteBackground || verifiedBackgroundCompliance
         if (rule.requiresWhiteBackground || shouldApplyWhiteBg) {
             val nearWhitePct = (whitenessReport.whitePixelRatio * 100).toInt()
             val exactWhitePct = (whitenessReport.exactWhitePixelRatio * 100).toInt()
-            val modeLabel = if (whitenessReport.isMaskVerified) {
-                "Verified segmentation mask"
-            } else {
-                "Unverified — no AI segmentation mask (${whitenessReport.verificationState})"
-            }
-            if (measuredWhiteBackground) {
-                validationMessages.add(
-                    "Background Status ($modeLabel): Near-white (>=240): $nearWhitePct%, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255."
-                )
-            } else {
-                validationMessages.add(
-                    "Background Warning ($modeLabel): Measured near-white is $nearWhitePct%, Exact #FFFFFF is $exactWhitePct%, Avg lum ${whitenessReport.meanLuminance}/255 (Does not meet white background requirement)."
-                )
+            when {
+                verifiedBackgroundCompliance -> {
+                    validationMessages.add(
+                        "Background Verified (${whitenessReport.verificationState}): Near-white (>=240): $nearWhitePct%, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255."
+                    )
+                }
+                measuredNearWhite -> {
+                    validationMessages.add(
+                        "Background Unverified (${whitenessReport.verificationState}): Perimeter sample is near-white ($nearWhitePct% >=240, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255), but no segmentation mask is available to verify full background compliance."
+                    )
+                }
+                else -> {
+                    validationMessages.add(
+                        "Background Warning (${whitenessReport.verificationState}): Measured near-white is $nearWhitePct%, Exact #FFFFFF is $exactWhitePct%, Avg lum ${whitenessReport.meanLuminance}/255 (Does not meet white background requirement)."
+                    )
+                }
             }
         }
 
         if (isJpegOutput) {
             if (dpiVerified) {
-                validationMessages.add("DPI Metadata verified: JFIF=$jfifDpiReadback DPI, EXIF=${exifMetaReadback?.xDpi}x${exifMetaReadback?.yDpi} DPI (Unit=Inches).")
+                validationMessages.add("Print Resolution Metadata verified: JFIF=${jfifMetaReadback?.xDpi} DPI, EXIF=${exifMetaReadback?.xDpi}x${exifMetaReadback?.yDpi} DPI (Unit=Inches).")
             } else {
-                validationMessages.add("DPI Metadata Mismatch: Expected $targetDpi DPI, read JFIF=$jfifDpiReadback, EXIF=${exifMetaReadback?.xDpi}x${exifMetaReadback?.yDpi} (unit=${exifMetaReadback?.resolutionUnit}).")
+                validationMessages.add("DPI Metadata Mismatch: Expected $targetDpi DPI, read JFIF=${jfifMetaReadback?.xDpi}, EXIF=${exifMetaReadback?.xDpi}x${exifMetaReadback?.yDpi} (unit=${exifMetaReadback?.resolutionUnit}).")
             }
-        }
-
-        if (hasConflict && conflictReason != null) {
-            validationMessages.add(conflictReason)
+        } else {
+            if (pngMetaReadback != null && dpiVerified) {
+                validationMessages.add("Print Resolution Metadata verified (PNG pHYs): ${pngMetaReadback.xDpi}x${pngMetaReadback.yDpi} DPI.")
+            } else {
+                validationMessages.add(
+                    "DPI Metadata Limitation: PNG output does not embed physical print resolution (pHYs/EXIF) metadata on disk; requested $targetDpi DPI is unverified. Pixel dimensions ($finalWidth x $finalHeight px) are preserved separately from print DPI."
+                )
+            }
         }
 
         val isCompliant = decodeSucceeded &&
@@ -475,7 +562,7 @@ object ImageProcessor {
             !sizeWithinMax -> PreparationStatus.SIZE_EXCEEDED
             !sizeAboveMin -> PreparationStatus.SIZE_BELOW_MIN
             !exactDimsMet || !boundedDimsMet -> PreparationStatus.DIMENSIONS_MISMATCH
-            !whiteBgMet -> PreparationStatus.BACKGROUND_NOT_WHITE
+            !whiteBgMet -> if (!measuredNearWhite) PreparationStatus.BACKGROUND_NOT_WHITE else PreparationStatus.BACKGROUND_UNVERIFIED
             !dpiVerified -> PreparationStatus.DPI_MISMATCH
             else -> PreparationStatus.SUCCESS_PREPARED
         }
@@ -499,7 +586,9 @@ object ImageProcessor {
             conflictReason = conflictReason,
             dpi = finalReportedDpi,
             wasPaddedToMinKb = false,
-            hasWhiteBackground = measuredWhiteBackground,
+            measuredNearWhite = measuredNearWhite,
+            verifiedBackgroundCompliance = verifiedBackgroundCompliance,
+            hasWhiteBackground = verifiedBackgroundCompliance,
             backgroundVerificationState = whitenessReport.verificationState,
             nearWhitePixelRatio = whitenessReport.whitePixelRatio,
             exactWhitePixelRatio = whitenessReport.exactWhitePixelRatio,
@@ -508,7 +597,9 @@ object ImageProcessor {
     }
 
     data class BackgroundWhitenessReport(
-        val isWhiteBackground: Boolean,
+        val measuredNearWhite: Boolean,
+        val verifiedBackgroundCompliance: Boolean,
+        val isWhiteBackground: Boolean = verifiedBackgroundCompliance,
         val whitePixelRatio: Float,
         val exactWhitePixelRatio: Float = 0f,
         val meanLuminance: Int,
@@ -518,11 +609,12 @@ object ImageProcessor {
 
     /**
      * Evaluates background pixels on the decoded saved image.
-     * - If an explicit [backgroundMask] (where true = background) is supplied, marks [isMaskVerified] = true.
-     * - If no reliable mask is supplied ([backgroundMask] == null), samples the outer perimeter border/margin
-     *   and marks [isMaskVerified] = false ([verificationState] = "UNVERIFIED_PERIMETER_SAMPLE" or "UNVERIFIED_DOCUMENT_MARGIN")
-     *   rather than claiming an estimated ellipse is a verified AI segmentation mask.
-     * - Clearly distinguishes near-white tolerance (R/G/B >= 240, chroma diff <= 15) from exact #FFFFFF (R=255, G=255, B=255).
+     * - Separates [BackgroundWhitenessReport.measuredNearWhite] (informational perimeter/mask pixel statistics)
+     *   from [BackgroundWhitenessReport.verifiedBackgroundCompliance] (strict compliance).
+     * - An unverified perimeter or margin sample ([backgroundMask] == null) NEVER produces
+     *   [BackgroundWhitenessReport.verifiedBackgroundCompliance] = true.
+     * - Only when an explicit, valid [backgroundMask] (size == width * height with >= 1 background pixel)
+     *   is provided AND meets the whiteness threshold does [verifiedBackgroundCompliance] become true.
      */
     fun measureBackgroundWhiteness(
         bitmap: Bitmap,
@@ -533,7 +625,8 @@ object ImageProcessor {
         val height = bitmap.height
         if (width <= 0 || height <= 0) {
             return BackgroundWhitenessReport(
-                isWhiteBackground = false,
+                measuredNearWhite = false,
+                verifiedBackgroundCompliance = false,
                 whitePixelRatio = 0f,
                 exactWhitePixelRatio = 0f,
                 meanLuminance = 0,
@@ -545,7 +638,10 @@ object ImageProcessor {
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
-        val hasExplicitMask = backgroundMask != null && backgroundMask.size == pixels.size
+        val hasExplicitMask = backgroundMask != null &&
+            backgroundMask.size == pixels.size &&
+            backgroundMask.any { it }
+
         val verificationState = when {
             hasExplicitMask -> "VERIFIED_MASK"
             isSignatureOrDocument -> "UNVERIFIED_DOCUMENT_MARGIN"
@@ -604,11 +700,12 @@ object ImageProcessor {
 
         if (bgCount == 0) {
             return BackgroundWhitenessReport(
-                isWhiteBackground = false,
+                measuredNearWhite = false,
+                verifiedBackgroundCompliance = false,
                 whitePixelRatio = 0f,
                 exactWhitePixelRatio = 0f,
                 meanLuminance = 0,
-                isMaskVerified = hasExplicitMask,
+                isMaskVerified = false,
                 verificationState = verificationState
             )
         }
@@ -616,9 +713,12 @@ object ImageProcessor {
         val nearWhiteRatio = nearWhiteCount.toFloat() / bgCount.toFloat()
         val exactWhiteRatio = exactWhiteCount.toFloat() / bgCount.toFloat()
         val meanLum = (lumSum / bgCount).toInt()
-        val isWhite = nearWhiteRatio >= 0.85f && meanLum >= 242
+        val measuredNearWhite = nearWhiteRatio >= 0.85f && meanLum >= 242
+        val verifiedCompliance = hasExplicitMask && measuredNearWhite
         return BackgroundWhitenessReport(
-            isWhiteBackground = isWhite,
+            measuredNearWhite = measuredNearWhite,
+            verifiedBackgroundCompliance = verifiedCompliance,
+            isWhiteBackground = verifiedCompliance,
             whitePixelRatio = nearWhiteRatio,
             exactWhitePixelRatio = exactWhiteRatio,
             meanLuminance = meanLum,
@@ -929,6 +1029,7 @@ object ImageProcessor {
     /**
      * Combines a candidate's Passport Photo (top) and Signature (bottom) into a single Joint Image
      * required by several State & Central exam portals.
+     * Safely recycles all intermediate bitmaps while preserving caller-owned [photoBitmap] and [signatureBitmap].
      */
     suspend fun createJointPhotoAndSignature(
         context: Context,
@@ -947,33 +1048,52 @@ object ImageProcessor {
         val photoAreaH = (safeH * 0.78f).toInt()
         val signAreaH = safeH - photoAreaH
 
+        val protectedSources = setOf(photoBitmap, signatureBitmap)
         val combined = Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(combined)
-        canvas.drawColor(Color.WHITE)
+        var workingPhoto: Bitmap? = null
+        var workingSign: Bitmap? = null
 
-        // Prepare top photo portion
-        var croppedPhoto = cropToAspectRatio(photoBitmap, safeW.toFloat() / photoAreaH.toFloat())
-        croppedPhoto = Bitmap.createScaledBitmap(croppedPhoto, safeW, photoAreaH, true)
-        if (candidateName.isNotBlank() || dateOfPhoto.isNotBlank()) {
-            croppedPhoto = addNameAndDateStrip(croppedPhoto, candidateName, dateOfPhoto)
+        try {
+            val canvas = Canvas(combined)
+            canvas.drawColor(Color.WHITE)
+
+            // Prepare top photo portion with safe intermediate bitmap replacement
+            val ratioCroppedPhoto = cropToAspectRatio(photoBitmap, safeW.toFloat() / photoAreaH.toFloat())
+            workingPhoto = ratioCroppedPhoto
+            val scaledPhoto = Bitmap.createScaledBitmap(workingPhoto, safeW, photoAreaH, true)
+            workingPhoto = replaceIntermediateBitmap(workingPhoto, scaledPhoto, photoBitmap, protectedSources)
+            if (candidateName.isNotBlank() || dateOfPhoto.isNotBlank()) {
+                val stripPhoto = addNameAndDateStrip(workingPhoto, candidateName, dateOfPhoto)
+                workingPhoto = replaceIntermediateBitmap(workingPhoto, stripPhoto, photoBitmap, protectedSources)
+            }
+            canvas.drawBitmap(workingPhoto, 0f, 0f, null)
+
+            // Draw clean divider line
+            val dividerPaint = Paint().apply {
+                color = Color.rgb(203, 213, 225)
+                strokeWidth = 2f
+            }
+            canvas.drawLine(0f, photoAreaH.toFloat(), safeW.toFloat(), photoAreaH.toFloat(), dividerPaint)
+
+            // Prepare bottom cleaned signature portion with safe intermediate bitmap replacement
+            val trimmedSign = cropBlankMargins(signatureBitmap)
+            workingSign = trimmedSign
+            val cleanedSign = adjustSignatureLighting(workingSign, 1.3f, 0f, 185, true)
+            workingSign = replaceIntermediateBitmap(workingSign, cleanedSign, signatureBitmap, protectedSources)
+            val pad = 8
+            val availSignW = (safeW - pad * 2).coerceAtLeast(40)
+            val availSignH = (signAreaH - pad * 2).coerceAtLeast(24)
+            val scaledSign = Bitmap.createScaledBitmap(workingSign, availSignW, availSignH, true)
+            workingSign = replaceIntermediateBitmap(workingSign, scaledSign, signatureBitmap, protectedSources)
+            canvas.drawBitmap(workingSign, pad.toFloat(), (photoAreaH + pad).toFloat(), null)
+        } finally {
+            if (workingPhoto != null && !protectedSources.contains(workingPhoto) && !workingPhoto.isRecycled) {
+                workingPhoto.recycle()
+            }
+            if (workingSign != null && !protectedSources.contains(workingSign) && !workingSign.isRecycled) {
+                workingSign.recycle()
+            }
         }
-        canvas.drawBitmap(croppedPhoto, 0f, 0f, null)
-
-        // Draw clean divider line
-        val dividerPaint = Paint().apply {
-            color = Color.rgb(203, 213, 225)
-            strokeWidth = 2f
-        }
-        canvas.drawLine(0f, photoAreaH.toFloat(), safeW.toFloat(), photoAreaH.toFloat(), dividerPaint)
-
-        // Prepare bottom cleaned signature portion
-        val trimmedSign = cropBlankMargins(signatureBitmap)
-        val cleanedSign = adjustSignatureLighting(trimmedSign, 1.3f, 0f, 185, true)
-        val pad = 8
-        val availSignW = (safeW - pad * 2).coerceAtLeast(40)
-        val availSignH = (signAreaH - pad * 2).coerceAtLeast(24)
-        val scaledSign = Bitmap.createScaledBitmap(cleanedSign, availSignW, availSignH, true)
-        canvas.drawBitmap(scaledSign, pad.toFloat(), (photoAreaH + pad).toFloat(), null)
 
         val jointRule = DocumentRule(
             id = "joint_photo_sign_${System.currentTimeMillis()}",
@@ -984,24 +1104,31 @@ object ImageProcessor {
             exactWidthPx = safeW,
             exactHeightPx = safeH,
             dpi = dpi,
-            requiresWhiteBackground = true
+            requiresWhiteBackground = false
         )
 
-        processImageForRule(
-            context = context,
-            originalBitmap = combined,
-            rule = jointRule,
-            customTargetKb = maxKb,
-            customWidthPx = safeW,
-            customHeightPx = safeH,
-            enforceProportional = false,
-            customDpi = dpi
-        )
+        try {
+            processImageForRule(
+                context = context,
+                originalBitmap = combined,
+                rule = jointRule,
+                customTargetKb = maxKb,
+                customWidthPx = safeW,
+                customHeightPx = safeH,
+                enforceProportional = false,
+                customDpi = dpi
+            )
+        } finally {
+            if (!combined.isRecycled && !protectedSources.contains(combined)) {
+                combined.recycle()
+            }
+        }
     }
 
     /**
      * Generates a Printable 300 DPI Sheet containing 8 or 12 tiled passport photos with cut guides
      * on a 4x6 inch (1200x1800 px) or A4 (1654x2339 px) canvas for ₹10 shop printing.
+     * Safely recycles all intermediate bitmaps while preserving caller-owned [photoBitmap].
      */
     suspend fun createPrintablePassportSheet(
         context: Context,
@@ -1015,44 +1142,57 @@ object ImageProcessor {
         val sheetH = 1800
 
         val sheetBitmap = Bitmap.createBitmap(sheetW, sheetH, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(sheetBitmap)
-        canvas.drawColor(Color.WHITE)
+        var workingTile: Bitmap? = null
 
-        val marginX = 48
-        val marginY = 48
-        val gapX = 28
-        val gapY = 28
+        val rawBytes: ByteArray = try {
+            val canvas = Canvas(sheetBitmap)
+            canvas.drawColor(Color.WHITE)
 
-        val cellW = (sheetW - marginX * 2 - gapX * (cols - 1)) / cols
-        val cellH = (sheetH - marginY * 2 - gapY * (rows - 1)) / rows
+            val marginX = 48
+            val marginY = 48
+            val gapX = 28
+            val gapY = 28
 
-        val croppedTile = cropToAspectRatio(photoBitmap, cellW.toFloat() / cellH.toFloat())
-        val tileBmp = Bitmap.createScaledBitmap(croppedTile, cellW, cellH, true)
+            val cellW = (sheetW - marginX * 2 - gapX * (cols - 1)) / cols
+            val cellH = (sheetH - marginY * 2 - gapY * (rows - 1)) / rows
 
-        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(148, 163, 184)
-            style = Paint.Style.STROKE
-            strokeWidth = 2f
-        }
+            val croppedTile = cropToAspectRatio(photoBitmap, cellW.toFloat() / cellH.toFloat())
+            workingTile = croppedTile
+            val tileBmp = Bitmap.createScaledBitmap(workingTile, cellW, cellH, true)
+            workingTile = replaceIntermediateBitmap(workingTile, tileBmp, photoBitmap)
 
-        for (r in 0 until rows) {
-            for (c in 0 until cols) {
-                val left = marginX + c * (cellW + gapX)
-                val top = marginY + r * (cellH + gapY)
-                canvas.drawBitmap(tileBmp, left.toFloat(), top.toFloat(), null)
-                canvas.drawRect(
-                    left.toFloat(),
-                    top.toFloat(),
-                    (left + cellW).toFloat(),
-                    (top + cellH).toFloat(),
-                    borderPaint
-                )
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(148, 163, 184)
+                style = Paint.Style.STROKE
+                strokeWidth = 2f
+            }
+
+            for (r in 0 until rows) {
+                for (c in 0 until cols) {
+                    val left = marginX + c * (cellW + gapX)
+                    val top = marginY + r * (cellH + gapY)
+                    canvas.drawBitmap(workingTile, left.toFloat(), top.toFloat(), null)
+                    canvas.drawRect(
+                        left.toFloat(),
+                        top.toFloat(),
+                        (left + cellW).toFloat(),
+                        (top + cellH).toFloat(),
+                        borderPaint
+                    )
+                }
+            }
+
+            val stream = ByteArrayOutputStream()
+            sheetBitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+            injectJfifDpiHeader(stream.toByteArray(), dpi)
+        } finally {
+            if (workingTile != null && workingTile !== photoBitmap && !workingTile.isRecycled) {
+                workingTile.recycle()
+            }
+            if (!sheetBitmap.isRecycled && sheetBitmap !== photoBitmap) {
+                sheetBitmap.recycle()
             }
         }
-
-        val stream = ByteArrayOutputStream()
-        sheetBitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
-        val rawBytes = injectJfifDpiHeader(stream.toByteArray(), dpi)
 
         val fileName = "formready_print_sheet_${photoCount}photos_${System.currentTimeMillis()}.jpg"
         val docsDir = File(context.cacheDir, "prepared_docs").apply { mkdirs() }
@@ -1063,6 +1203,9 @@ object ImageProcessor {
 
         val sizeBytes = outputFile.length()
         val sizeKb = sizeBytes / 1024.0
+        val jfifDpi = readJfifDpiHeader(outputFile)
+        val exifDpi = readExifDpi(outputFile)
+        val verifiedDpi = if (jfifDpi == dpi && exifDpi == dpi) dpi else (jfifDpi ?: exifDpi ?: 0)
 
         ProcessedFileResult(
             ruleId = "print_sheet_${photoCount}",
@@ -1075,14 +1218,17 @@ object ImageProcessor {
             widthPx = sheetW,
             heightPx = sheetH,
             pageCount = 1,
-            isCompliant = true,
+            isCompliant = verifiedDpi == dpi && sizeBytes > 0L,
             validationMessages = listOf(
                 "Printable Sheet Ready: $photoCount Passport Photos ($cols x $rows grid)",
-                "Sheet Dimensions: $sheetW x $sheetH px @ $dpi DPI (${String.format(Locale.US, "%.1f", sizeKb)} KB)"
+                "Pixel Dimensions: $sheetW x $sheetH px • Print Resolution: $verifiedDpi DPI (${String.format(Locale.US, "%.1f", sizeKb)} KB)"
             ),
-            status = PreparationStatus.SUCCESS_PREPARED,
-            dpi = dpi,
-            hasWhiteBackground = true
+            status = if (verifiedDpi == dpi) PreparationStatus.SUCCESS_PREPARED else PreparationStatus.DPI_MISMATCH,
+            dpi = verifiedDpi,
+            measuredNearWhite = true,
+            verifiedBackgroundCompliance = false,
+            hasWhiteBackground = false,
+            backgroundVerificationState = "PRINT_SHEET_CANVAS"
         )
     }
 
@@ -1138,6 +1284,26 @@ object ImageProcessor {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    /**
+     * Reads at most [maxBytes] from the beginning of [file] using a bounded buffer
+     * to avoid unnecessary full-file `readBytes()` allocations on large output files.
+     */
+    private fun readBoundedHeaderBytes(file: File, maxBytes: Int = 8192): ByteArray {
+        if (!file.exists() || !file.canRead() || maxBytes <= 0) return ByteArray(0)
+        val cap = minOf(file.length(), maxBytes.toLong()).toInt()
+        if (cap <= 0) return ByteArray(0)
+        val buffer = ByteArray(cap)
+        var offset = 0
+        file.inputStream().use { input ->
+            while (offset < cap) {
+                val read = input.read(buffer, offset, cap - offset)
+                if (read <= 0) break
+                offset += read
+            }
+        }
+        return if (offset == cap) buffer else buffer.copyOf(offset)
     }
 
     /**
@@ -1251,6 +1417,15 @@ object ImageProcessor {
     )
 
     /**
+     * Reads Xdensity, Ydensity, and density units (1 = DPI / dots per inch) from a JPEG's JFIF APP0 header
+     * using bounded header bytes from [file] without reading the entire file into memory.
+     */
+    fun readJfifResolutionMetadata(file: File): ExifResolutionMetadata? {
+        val header = readBoundedHeaderBytes(file, 4096)
+        return readJfifResolutionMetadata(header)
+    }
+
+    /**
      * Reads Xdensity, Ydensity, and density units (1 = DPI / dots per inch) from a JPEG's JFIF APP0 header.
      */
     fun readJfifResolutionMetadata(jpegBytes: ByteArray): ExifResolutionMetadata? {
@@ -1275,6 +1450,14 @@ object ImageProcessor {
     }
 
     /**
+     * Reads the DPI value from a JPEG file's JFIF APP0 header using bounded header reads, or returns null if not present.
+     */
+    fun readJfifDpiHeader(file: File): Int? {
+        val meta = readJfifResolutionMetadata(file) ?: return null
+        return if (meta.resolutionUnit == 1 && meta.xDpi == meta.yDpi) meta.xDpi else null
+    }
+
+    /**
      * Reads the DPI value from a JPEG's JFIF APP0 header, or returns null if not present.
      */
     fun readJfifDpiHeader(jpegBytes: ByteArray): Int? {
@@ -1284,7 +1467,7 @@ object ImageProcessor {
 
     /**
      * Reads EXIF XResolution, YResolution, and ResolutionUnit (2 = Inches, 3 = Centimeters)
-     * from a saved JPEG file on disk.
+     * from a saved JPEG file on disk using [ExifInterface] and a bounded 8 KB header fallback.
      */
     fun readExifResolutionMetadata(file: File): ExifResolutionMetadata? {
         if (!file.exists() || !file.canRead()) return null
@@ -1301,9 +1484,10 @@ object ImageProcessor {
         } catch (_: Exception) {
         }
 
-        // Parse APP1 "Exif\0\0" Big-Endian TIFF IFD0 tags 0x011A (XResolution), 0x011B (YResolution), 0x0128 (ResolutionUnit)
+        // Bounded fallback: read at most 8192 header bytes to inspect APP1 "Exif\0\0" Big-Endian TIFF IFD0
         return try {
-            val bytes = file.readBytes()
+            val bytes = readBoundedHeaderBytes(file, 8192)
+            if (bytes.size < 64) return null
             val limit = kotlin.math.min(bytes.size - 64, 4096)
             for (i in 2 until limit) {
                 if (bytes[i] == 'E'.code.toByte() &&
@@ -1364,6 +1548,65 @@ object ImageProcessor {
         }
     }
 
+    /**
+     * Streams PNG chunk headers (`IHDR`, `pHYs`, etc.) from [file] using bounded reads to check whether
+     * physical pixel density (`pHYs` chunk with unit = 1 / meter) is actually present on disk.
+     * Returns null if no valid `pHYs` chunk exists (e.g., standard Android `Bitmap.CompressFormat.PNG` output).
+     */
+    fun readPngPhysMetadata(file: File): ExifResolutionMetadata? {
+        if (!file.exists() || !file.canRead() || file.length() < 33L) return null
+        return try {
+            val header = readBoundedHeaderBytes(file, 4096)
+            if (header.size < 33) return null
+            val pngSig = byteArrayOf(
+                0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A
+            )
+            for (i in pngSig.indices) {
+                if (header[i] != pngSig[i]) return null
+            }
+            var pos = 8
+            while (pos + 12 <= header.size) {
+                val len = ((header[pos].toInt() and 0xFF) shl 24) or
+                    ((header[pos + 1].toInt() and 0xFF) shl 16) or
+                    ((header[pos + 2].toInt() and 0xFF) shl 8) or
+                    (header[pos + 3].toInt() and 0xFF)
+                if (len < 0) return null
+                val type0 = header[pos + 4].toInt().toChar()
+                val type1 = header[pos + 5].toInt().toChar()
+                val type2 = header[pos + 6].toInt().toChar()
+                val type3 = header[pos + 7].toInt().toChar()
+                val chunkType = "$type0$type1$type2$type3"
+                val dataStart = pos + 8
+                if (chunkType == "pHYs" && len == 9 && dataStart + 9 <= header.size) {
+                    val ppuX = ((header[dataStart].toInt() and 0xFF).toLong() shl 24) or
+                        ((header[dataStart + 1].toInt() and 0xFF).toLong() shl 16) or
+                        ((header[dataStart + 2].toInt() and 0xFF).toLong() shl 8) or
+                        (header[dataStart + 3].toInt() and 0xFF).toLong()
+                    val ppuY = ((header[dataStart + 4].toInt() and 0xFF).toLong() shl 24) or
+                        ((header[dataStart + 5].toInt() and 0xFF).toLong() shl 16) or
+                        ((header[dataStart + 6].toInt() and 0xFF).toLong() shl 8) or
+                        (header[dataStart + 7].toInt() and 0xFF).toLong()
+                    val unit = header[dataStart + 8].toInt() and 0xFF
+                    if (unit == 1 && ppuX > 0 && ppuY > 0) {
+                        val xDpi = kotlin.math.round(ppuX * 0.0254).toInt()
+                        val yDpi = kotlin.math.round(ppuY * 0.0254).toInt()
+                        if (xDpi > 0 && yDpi > 0) {
+                            return ExifResolutionMetadata(xDpi = xDpi, yDpi = yDpi, resolutionUnit = 2)
+                        }
+                    }
+                    return null
+                }
+                if (chunkType == "IDAT" || chunkType == "IEND") {
+                    break
+                }
+                pos = dataStart + len + 4 // Skip chunk data + 4-byte CRC
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun parseExifRationalToInt(rational: String?): Int? {
         if (rational.isNullOrBlank()) return null
         return if (rational.contains("/")) {
@@ -1382,6 +1625,55 @@ object ImageProcessor {
     fun readExifDpi(file: File): Int? {
         val meta = readExifResolutionMetadata(file) ?: return null
         return if (meta.resolutionUnit == 2 && meta.xDpi == meta.yDpi) meta.xDpi else null
+    }
+
+    /**
+     * Streams JPEG markers from [file] without reading the entire file into memory to check
+     * whether any JPEG Comment (0xFF 0xFE) padding segment is present.
+     */
+    fun hasJpegComSegment(file: File): Boolean {
+        if (!file.exists() || !file.canRead() || file.length() < 4L) return false
+        return try {
+            file.inputStream().buffered().use { input ->
+                val b0 = input.read()
+                val b1 = input.read()
+                if (b0 != 0xFF || b1 != 0xD8) return false
+                while (true) {
+                    var b = input.read()
+                    if (b == -1) break
+                    if (b != 0xFF) continue
+                    var marker = input.read()
+                    while (marker == 0xFF) {
+                        marker = input.read()
+                    }
+                    if (marker == -1) break
+                    if (marker == 0xFE) return true // COM segment found
+                    if (marker == 0xDA || marker == 0xD9) break // Start of Scan or End of Image
+                    if (marker == 0xD8 || marker in 0xD0..0xD7 || marker == 0x01) continue
+                    val lenHi = input.read()
+                    val lenLo = input.read()
+                    if (lenHi == -1 || lenLo == -1) break
+                    val segLen = ((lenHi and 0xFF) shl 8) or (lenLo and 0xFF)
+                    if (segLen < 2) break
+                    var remaining = (segLen - 2).toLong()
+                    while (remaining > 0L) {
+                        val skipped = input.skip(remaining)
+                        if (skipped <= 0L) {
+                            if (input.read() == -1) {
+                                remaining = 0L
+                                break
+                            }
+                            remaining--
+                        } else {
+                            remaining -= skipped
+                        }
+                    }
+                }
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**
@@ -1440,6 +1732,7 @@ object ImageProcessor {
      * Genuine binary-search compression algorithm that adjusts JPEG quality (100 down to 15),
      * injects exact JFIF + EXIF DPI headers, and applies controlled downscaling when above [targetMaxKb].
      * Never injects artificial JPEG comment segments or noise to fake [targetMinKb].
+     * Never recycles caller-owned [src].
      */
     private fun compressToTargetKbWithDetails(
         src: Bitmap,
@@ -1450,13 +1743,17 @@ object ImageProcessor {
         dpi: Int = 300
     ): CompressionDetails {
         var currentBitmap = src
-        var stream = ByteArrayOutputStream()
-        currentBitmap.compress(format, 95, stream)
-        var bytes = stream.toByteArray()
-        var currentKb = bytes.size / 1024.0
+        var stream: ByteArrayOutputStream
+        var bytes: ByteArray
+        var currentKb: Double
         var wasDownscaled = false
 
         if (format == Bitmap.CompressFormat.PNG) {
+            stream = ByteArrayOutputStream()
+            currentBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            bytes = stream.toByteArray()
+            currentKb = bytes.size / 1024.0
+
             if (currentKb <= targetMaxKb || !allowDownscale) {
                 return CompressionDetails(bytes, currentBitmap.width, currentBitmap.height, 100, false)
             }
@@ -1549,4 +1846,5 @@ object ImageProcessor {
         )
     }
 }
+
 

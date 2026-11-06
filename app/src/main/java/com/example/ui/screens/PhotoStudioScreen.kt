@@ -593,8 +593,9 @@ fun PhotoStudioScreen(
 
                         Spacer(modifier = Modifier.height(6.dp))
 
+                        val dpiLabel = if (res.dpi > 0) "${res.dpi} DPI" else "DPI Unverified"
                         Text(
-                            text = "Exact Output: ${res.widthPx} × ${res.heightPx} px • ${res.dpi} DPI • ${res.fileFormat.extension.uppercase()} (Allowed: $targetMinKb–$targetMaxKb KB)",
+                            text = "Exact Output: ${res.widthPx} × ${res.heightPx} px • $dpiLabel • ${res.fileFormat.extension.uppercase()} (Allowed: $targetMinKb–$targetMaxKb KB)",
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.sp
                         )

@@ -549,11 +549,13 @@ class Phase5FeaturesTest {
         assertEquals(213, processed.widthPx)
         assertEquals(213, processed.heightPx)
         assertEquals(300, processed.dpi)
-        assertTrue(processed.hasWhiteBackground)
+        assertTrue(processed.measuredNearWhite)
+        assertFalse(processed.verifiedBackgroundCompliance)
+        assertFalse(processed.hasWhiteBackground)
+        assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, processed.status)
 
         val outFile = File(processed.processedFilePath)
-        val outBytes = outFile.readBytes()
-        assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(outBytes))
+        assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(outFile))
         assertEquals(300, com.example.processing.ImageProcessor.readExifDpi(outFile))
     }
 
@@ -581,13 +583,12 @@ class Phase5FeaturesTest {
         )
 
         val savedFile = File(result.processedFilePath)
-        val savedBytes = savedFile.readBytes()
 
         // 1. Must NEVER pad with JPEG COM (0xFF 0xFE) metadata
         assertFalse("wasPaddedToMinKb must always be false", result.wasPaddedToMinKb)
         assertFalse(
             "JPEG file must NOT contain any 0xFF 0xFE COM padding segment",
-            com.example.processing.ImageProcessor.hasJpegComSegment(savedBytes)
+            com.example.processing.ImageProcessor.hasJpegComSegment(savedFile)
         )
 
         // 2. Because natural quality 100 size is below 12 KB, compliance must be false with SIZE_BELOW_MIN
@@ -669,7 +670,7 @@ class Phase5FeaturesTest {
         assertTrue(jointResult.fileSizeBytes <= 50 * 1024L)
         assertFalse(
             com.example.processing.ImageProcessor.hasJpegComSegment(
-                File(jointResult.processedFilePath).readBytes()
+                File(jointResult.processedFilePath)
             )
         )
 
@@ -715,8 +716,8 @@ class Phase5FeaturesTest {
             requiresWhiteBackground = true
         )
 
-        // Process WITHOUT background removal -> measured hasWhiteBackground MUST be false,
-        // isCompliant MUST be false, and status MUST be BACKGROUND_NOT_WHITE
+        // Process WITHOUT background removal -> measuredNearWhite MUST be false,
+        // verifiedBackgroundCompliance MUST be false, isCompliant MUST be false, and status MUST be BACKGROUND_NOT_WHITE
         val unfilteredResult = com.example.processing.ImageProcessor.processImageForRule(
             context = context,
             originalBitmap = nonWhiteBgPhoto,
@@ -725,6 +726,8 @@ class Phase5FeaturesTest {
             customDpi = 200
         )
 
+        assertFalse(unfilteredResult.measuredNearWhite)
+        assertFalse(unfilteredResult.verifiedBackgroundCompliance)
         assertFalse(
             "ProcessedFileResult.hasWhiteBackground must be false when actual background is blue",
             unfilteredResult.hasWhiteBackground
@@ -745,8 +748,7 @@ class Phase5FeaturesTest {
 
         // 2. Verify BOTH JFIF APP0 header AND EXIF XResolution/YResolution/ResolutionUnit are written at 200 DPI
         val outFile = File(unfilteredResult.processedFilePath)
-        val outBytes = outFile.readBytes()
-        val jfifMeta = com.example.processing.ImageProcessor.readJfifResolutionMetadata(outBytes)
+        val jfifMeta = com.example.processing.ImageProcessor.readJfifResolutionMetadata(outFile)
         val exifMeta = com.example.processing.ImageProcessor.readExifResolutionMetadata(outFile)
         assertNotNull(jfifMeta)
         assertNotNull(exifMeta)
@@ -757,24 +759,54 @@ class Phase5FeaturesTest {
         assertEquals(200, exifMeta.xDpi)
         assertEquals(200, exifMeta.yDpi)
 
-        // 3. Process a light-background portrait with background whitening -> measured on saved output
+        // 3. Process a light-background portrait with background whitening WITHOUT a mask ->
+        // perimeter sample is near-white (measuredNearWhite = true), but verifiedBackgroundCompliance = false
         val studioLightPhoto = createTexturedSubjectBitmap(400, 500, Color.rgb(245, 245, 245))
-        val whitenedResult = com.example.processing.ImageProcessor.processImageForRule(
+        val unverifiedWhitenedResult = com.example.processing.ImageProcessor.processImageForRule(
             context = context,
             originalBitmap = studioLightPhoto,
             rule = whiteRequiredRule,
             removeBackgroundToWhite = true,
             customDpi = 300
         )
-        assertTrue(
-            "ProcessedFileResult.hasWhiteBackground must be true when saved background pixels are near-white",
-            whitenedResult.hasWhiteBackground
+        assertTrue(unverifiedWhitenedResult.measuredNearWhite)
+        assertFalse(
+            "Perimeter-only sample must NEVER set verifiedBackgroundCompliance = true",
+            unverifiedWhitenedResult.verifiedBackgroundCompliance
         )
-        assertTrue("Whitened photo meeting all rules must be compliant", whitenedResult.isCompliant)
-        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, whitenedResult.status)
-        assertTrue(whitenedResult.nearWhitePixelRatio >= 0.85f)
-        val whitenedFile = File(whitenedResult.processedFilePath)
-        assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(whitenedFile.readBytes()))
+        assertFalse(unverifiedWhitenedResult.hasWhiteBackground)
+        assertFalse(
+            "Strict white-background rule must NOT be marked compliant from perimeter-only estimate",
+            unverifiedWhitenedResult.isCompliant
+        )
+        assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, unverifiedWhitenedResult.status)
+        assertEquals("UNVERIFIED_PERIMETER_SAMPLE", unverifiedWhitenedResult.backgroundVerificationState)
+
+        // 4. Process WITH an explicit verified backgroundMask -> verifiedBackgroundCompliance = true & compliant
+        val maskWidth = 350
+        val maskHeight = 450
+        val verifiedBgMask = BooleanArray(maskWidth * maskHeight) { idx ->
+            val x = idx % maskWidth
+            val y = idx / maskWidth
+            x < 35 || x >= maskWidth - 35 || y < 35
+        }
+        val verifiedWhitenedResult = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = studioLightPhoto,
+            rule = whiteRequiredRule,
+            removeBackgroundToWhite = true,
+            customDpi = 300,
+            backgroundMask = verifiedBgMask
+        )
+        assertTrue(verifiedWhitenedResult.measuredNearWhite)
+        assertTrue(verifiedWhitenedResult.verifiedBackgroundCompliance)
+        assertTrue(verifiedWhitenedResult.hasWhiteBackground)
+        assertTrue(verifiedWhitenedResult.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, verifiedWhitenedResult.status)
+        assertEquals("VERIFIED_MASK", verifiedWhitenedResult.backgroundVerificationState)
+        assertTrue(verifiedWhitenedResult.nearWhitePixelRatio >= 0.85f)
+        val whitenedFile = File(verifiedWhitenedResult.processedFilePath)
+        assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(whitenedFile))
         assertEquals(300, com.example.processing.ImageProcessor.readExifDpi(whitenedFile))
     }
 
@@ -916,6 +948,236 @@ class Phase5FeaturesTest {
         assertFalse(failedUi.isSuccess)
         assertFalse(failedUi.geometryPreserved)
     }
+
+    @Test
+    fun testPhase0_1WhiteBorderDarkInteriorCannotPassStrictWhiteBackgroundRule() = runBlocking {
+        // Create an image that has pure white outer borders (including top, side, and upper corner bands)
+        // and a dark navy interior (representing a colored studio backdrop behind the subject)
+        val width = 350
+        val height = 450
+        val whiteBorderDarkInteriorBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(width * height)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val inDarkInterior = x >= (width * 0.26f).toInt() &&
+                    x <= (width * 0.74f).toInt() &&
+                    y >= (height * 0.30f).toInt() &&
+                    y <= (height * 0.95f).toInt()
+                pixels[y * width + x] = if (inDarkInterior) {
+                    Color.rgb(15, 25, 90)
+                } else {
+                    Color.WHITE
+                }
+            }
+        }
+        whiteBorderDarkInteriorBmp.setPixels(pixels, 0, width, 0, 0, width, height)
+
+        val strictWhiteRule = DocumentRule(
+            id = "strict_white_bg_check",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = width,
+            exactHeightPx = height,
+            dpi = 300,
+            requiresWhiteBackground = true
+        )
+
+        val result = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = whiteBorderDarkInteriorBmp,
+            rule = strictWhiteRule,
+            removeBackgroundToWhite = false
+        )
+
+        // Perimeter sample sees the white outer frame, so measuredNearWhite is true,
+        // but verifiedBackgroundCompliance MUST be false and isCompliant MUST be false!
+        assertTrue("Perimeter sample should detect near-white outer margin", result.measuredNearWhite)
+        assertFalse("Unsegmented perimeter sample must NEVER set verifiedBackgroundCompliance", result.verifiedBackgroundCompliance)
+        assertFalse("hasWhiteBackground must reflect verifiedBackgroundCompliance", result.hasWhiteBackground)
+        assertFalse("Rule requiring white background must NOT be compliant without verified background mask", result.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, result.status)
+        assertEquals("UNVERIFIED_PERIMETER_SAMPLE", result.backgroundVerificationState)
+    }
+
+    @Test
+    fun testPhase0_1MinMaxKbConflictsAndBounds() = runBlocking {
+        val sampleBmp = createTexturedSubjectBitmap(350, 450, Color.WHITE)
+
+        // 1. Conflicting rule where rule.minKb > rule.maxKb -> CONFLICT_LIMITS
+        val conflictingRule = DocumentRule(
+            id = "conflicting_kb_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 50,
+            maxKb = 20,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+        val conflictRes = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = sampleBmp,
+            rule = conflictingRule
+        )
+        assertTrue("hasConflict must be true when minKb > maxKb", conflictRes.hasConflict)
+        assertFalse("isCompliant must be false on conflicting KB limits", conflictRes.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.CONFLICT_LIMITS, conflictRes.status)
+
+        // 2. Custom targetMaxKb lower than rule.minKb -> must NOT silently lower minKb via coerceAtMost
+        val validRule = DocumentRule(
+            id = "valid_kb_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 20,
+            maxKb = 50,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+        val customConflictRes = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = sampleBmp,
+            rule = validRule,
+            customTargetKb = 10 // 10 KB < rule.minKb (20 KB) -> conflict!
+        )
+        assertTrue(
+            "customTargetKb < rule.minKb must be detected as a conflict instead of silently lowering minKb",
+            customConflictRes.hasConflict
+        )
+        assertFalse(customConflictRes.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.CONFLICT_LIMITS, customConflictRes.status)
+
+        // 3. Above-maximum output without exact dimension constraints -> SIZE_EXCEEDED
+        val flexibleDimImpossibleKbRule = DocumentRule(
+            id = "flexible_dim_impossible_kb",
+            documentType = DocumentType.AADHAAR_CARD,
+            allowedFormats = listOf(FileFormat.PNG), // Lossless PNG of 350x350 textured image exceeds 1 KB even after downscale steps
+            minKb = 0,
+            maxKb = 1,
+            exactWidthPx = null,
+            exactHeightPx = null,
+            dpi = null,
+            requiresWhiteBackground = false
+        )
+        val exceededRes = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = createTexturedSubjectBitmap(350, 350, Color.WHITE),
+            rule = flexibleDimImpossibleKbRule
+        )
+        assertFalse(exceededRes.hasConflict)
+        assertTrue("File size should exceed 1 KB", exceededRes.fileSizeBytes > 1024L)
+        assertFalse("isCompliant must be false when size > maxKb", exceededRes.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SIZE_EXCEEDED, exceededRes.status)
+    }
+
+    @Test
+    fun testPhase0_1FormatSpecificDpiValidationJpegVsPng() = runBlocking {
+        val sampleBmp = createTexturedSubjectBitmap(300, 400, Color.WHITE)
+
+        // 1. JPEG output with required DPI = 300 -> verified via both JFIF and EXIF
+        val jpegRule = DocumentRule(
+            id = "jpeg_dpi_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 100,
+            exactWidthPx = 300,
+            exactHeightPx = 400,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+        val jpegRes = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = sampleBmp,
+            rule = jpegRule
+        )
+        assertEquals(300, jpegRes.dpi)
+        assertTrue(jpegRes.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, jpegRes.status)
+
+        // 2. PNG output with required DPI = 300 -> Android PNG encoder does not embed pHYs DPI metadata,
+        // so readPngPhysMetadata is null, reported dpi MUST be 0 (not 300!), and status MUST be DPI_MISMATCH
+        val pngRuleWithDpi = DocumentRule(
+            id = "png_dpi_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.PNG),
+            minKb = 2,
+            maxKb = 500,
+            exactWidthPx = 300,
+            exactHeightPx = 400,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+        val pngRes = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = sampleBmp,
+            rule = pngRuleWithDpi
+        )
+        val pngFile = File(pngRes.processedFilePath)
+        assertNull(
+            "Standard Android PNG output has no pHYs chunk",
+            com.example.processing.ImageProcessor.readPngPhysMetadata(pngFile)
+        )
+        assertEquals("PNG without verified pHYs metadata must report dpi = 0, never 300", 0, pngRes.dpi)
+        assertEquals("Pixel width must still be validated separately", 300, pngRes.widthPx)
+        assertEquals("Pixel height must still be validated separately", 400, pngRes.heightPx)
+        assertFalse("PNG without verified DPI metadata must not claim compliance when rule requires DPI", pngRes.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.DPI_MISMATCH, pngRes.status)
+    }
+
+    @Test
+    fun testPhase0_1CallerBitmapPreservedAndBoundedHeaderVerification() = runBlocking {
+        val callerPhoto = createTexturedSubjectBitmap(500, 600, Color.WHITE)
+        val callerSig = createSampleBitmap(300, 120, Color.WHITE)
+
+        val rule = DocumentRule(
+            id = "lifecycle_test_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 5,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = false,
+            requiresNameAndDateStrip = true
+        )
+
+        val res = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = callerPhoto,
+            rule = rule,
+            candidateName = "VIKRAM KUMAR",
+            dateOfPhoto = "06/11/2026",
+            removeBackgroundToWhite = true,
+            autoCropMargins = true,
+            cropRectNorm = CameraCaptureMode.PASSPORT_PHOTO.guideCropRectNorm
+        )
+        assertFalse("Caller-supplied photo bitmap must NEVER be recycled by processImageForRule", callerPhoto.isRecycled)
+        assertTrue(File(res.processedFilePath).exists())
+
+        val jointRes = com.example.processing.ImageProcessor.createJointPhotoAndSignature(
+            context = context,
+            photoBitmap = callerPhoto,
+            signatureBitmap = callerSig
+        )
+        assertFalse("Caller photo must not be recycled by createJointPhotoAndSignature", callerPhoto.isRecycled)
+        assertFalse("Caller signature must not be recycled by createJointPhotoAndSignature", callerSig.isRecycled)
+        assertTrue(File(jointRes.processedFilePath).exists())
+
+        val sheetRes = com.example.processing.ImageProcessor.createPrintablePassportSheet(
+            context = context,
+            photoBitmap = callerPhoto,
+            photoCount = 8
+        )
+        assertFalse("Caller photo must not be recycled by createPrintablePassportSheet", callerPhoto.isRecycled)
+        assertTrue(File(sheetRes.processedFilePath).exists())
+    }
 }
+
 
 
