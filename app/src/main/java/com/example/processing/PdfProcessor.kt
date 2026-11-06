@@ -27,9 +27,39 @@ object PdfProcessor {
     // Standard A4 dimensions in PDF points (72 points per inch)
     const val A4_WIDTH_POINTS = 595
     const val A4_HEIGHT_POINTS = 842
+    private const val MAX_RASTER_SIDE_PX = 2400
+
+    data class PdfPageGeometry(
+        val pageNumber: Int,
+        val widthPoints: Int,
+        val heightPoints: Int
+    ) {
+        val aspectRatio: Float
+            get() = if (heightPoints > 0) widthPoints.toFloat() / heightPoints.toFloat() else 1.0f
+    }
+
+    data class PdfCompressionReport(
+        val outputFile: File,
+        val actualSizeBytes: Long,
+        val actualSizeKb: Double,
+        val targetMaxKb: Int,
+        val metTarget: Boolean,
+        val isValidPdf: Boolean,
+        val originalPageCount: Int,
+        val outputPageCount: Int,
+        val pageCountPreserved: Boolean,
+        val geometryPreserved: Boolean,
+        val originalPages: List<PdfPageGeometry>,
+        val outputPages: List<PdfPageGeometry>,
+        val errorMessage: String? = null
+    ) {
+        val compressedPages: List<PdfPageGeometry>
+            get() = outputPages
+    }
 
     /**
-     * Converts a list of Bitmaps into a single standard A4 PDF document.
+     * Converts a list of Bitmaps into a single PDF document with configurable physical page dimensions
+     * (defaulting to standard A4: 595 x 842 pt).
      * Ensures that [PdfDocument] is always closed in a `finally` block and that empty or unreadable
      * page lists fail safely.
      */
@@ -37,29 +67,61 @@ object PdfProcessor {
         context: Context,
         bitmaps: List<Bitmap>,
         outputFileName: String = "document_${System.currentTimeMillis()}.pdf",
-        marginPoints: Int = 24
+        marginPoints: Int = 24,
+        pageWidthPoints: Int = A4_WIDTH_POINTS,
+        pageHeightPoints: Int = A4_HEIGHT_POINTS
     ): File = withContext(Dispatchers.IO) {
+        require(pageWidthPoints > 0 && pageHeightPoints > 0) {
+            "Page dimensions must be positive (got ${pageWidthPoints}x${pageHeightPoints})"
+        }
         val validBitmaps = bitmaps.filter { !it.isRecycled && it.width > 0 && it.height > 0 }
         require(validBitmaps.isNotEmpty()) { "Cannot generate PDF from an empty or invalid page list" }
+
+        val pagesWithSizes = validBitmaps.map { bmp -> bmp to (pageWidthPoints to pageHeightPoints) }
+        createCustomGeometryPdfFromBitmaps(
+            context = context,
+            pages = pagesWithSizes,
+            outputFileName = outputFileName,
+            marginPoints = marginPoints
+        )
+    }
+
+    /**
+     * Creates a multi-page PDF where each page can have its own physical width and height in PDF points
+     * (e.g., A4, Letter, Legal, or custom landscape/portrait dimensions).
+     */
+    suspend fun createCustomGeometryPdfFromBitmaps(
+        context: Context,
+        pages: List<Pair<Bitmap, Pair<Int, Int>>>,
+        outputFileName: String = "document_${System.currentTimeMillis()}.pdf",
+        marginPoints: Int = 24
+    ): File = withContext(Dispatchers.IO) {
+        val validPages = pages.filter { (bmp, dims) ->
+            !bmp.isRecycled && bmp.width > 0 && bmp.height > 0 && dims.first > 0 && dims.second > 0
+        }
+        require(validPages.isNotEmpty()) { "Cannot generate PDF from an empty or invalid page list" }
 
         val pdfDocument = PdfDocument()
         val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
         val outFile = File(outDir, outputFileName)
 
         try {
-            validBitmaps.forEachIndexed { index, bitmap ->
-                val pageInfo = PdfDocument.PageInfo.Builder(A4_WIDTH_POINTS, A4_HEIGHT_POINTS, index + 1).create()
+            validPages.forEachIndexed { index, (bitmap, dims) ->
+                val pageW = dims.first
+                val pageH = dims.second
+                val safeMargin = marginPoints.coerceIn(0, minOf(pageW, pageH) / 4)
+                val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, index + 1).create()
                 val page = pdfDocument.startPage(pageInfo)
                 try {
                     val canvas: Canvas = page.canvas
 
                     // Fill white background
                     val bgPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.FILL }
-                    canvas.drawRect(0f, 0f, A4_WIDTH_POINTS.toFloat(), A4_HEIGHT_POINTS.toFloat(), bgPaint)
+                    canvas.drawRect(0f, 0f, pageW.toFloat(), pageH.toFloat(), bgPaint)
 
                     // Calculate scaled rect inside margins preserving aspect ratio
-                    val availW = A4_WIDTH_POINTS - (marginPoints * 2)
-                    val availH = A4_HEIGHT_POINTS - (marginPoints * 2)
+                    val availW = (pageW - (safeMargin * 2)).coerceAtLeast(1)
+                    val availH = (pageH - (safeMargin * 2)).coerceAtLeast(1)
 
                     val bmpW = bitmap.width.toFloat()
                     val bmpH = bitmap.height.toFloat()
@@ -67,10 +129,15 @@ object PdfProcessor {
 
                     val drawW = bmpW * scale
                     val drawH = bmpH * scale
-                    val left = marginPoints + (availW - drawW) / 2f
-                    val top = marginPoints + (availH - drawH) / 2f
+                    val left = safeMargin + (availW - drawW) / 2f
+                    val top = safeMargin + (availH - drawH) / 2f
 
-                    val destRect = Rect(left.toInt(), top.toInt(), (left + drawW).toInt(), (top + drawH).toInt())
+                    val destRect = Rect(
+                        left.toInt(),
+                        top.toInt(),
+                        (left + drawW).toInt().coerceAtLeast(left.toInt() + 1),
+                        (top + drawH).toInt().coerceAtLeast(top.toInt() + 1)
+                    )
                     canvas.drawBitmap(bitmap, null, destRect, Paint(Paint.FILTER_BITMAP_FLAG))
                 } finally {
                     pdfDocument.finishPage(page)
@@ -157,108 +224,359 @@ object PdfProcessor {
     }
 
     /**
-     * Checks whether a generated or compressed PDF file actually meets the requested maximum KB limit on disk.
+     * Checks whether a generated or compressed PDF file is a valid PDF AND meets the requested maximum KB limit on disk.
      */
     fun isPdfWithinTargetKb(pdfFile: File, targetMaxKb: Int): Boolean {
         if (!pdfFile.exists() || targetMaxKb <= 0) return false
+        val validation = com.example.storage.DocumentValidationManager.validateFile(pdfFile)
+        if (!validation.isValid || validation.detectedFormat != FileFormat.PDF) return false
         return pdfFile.length() in 1L..(targetMaxKb * 1024L)
     }
 
     /**
-     * Compresses a PDF file toward a target KB limit by iteratively stepping through
-     * resolution scales and JPEG re-encoding passes until `outFile.length() <= targetMaxKb * 1024L`
-     * or the minimum readable floor is reached.
+     * Inspects a PDF file and returns the ordered list of [PdfPageGeometry] (physical width & height in PDF points)
+     * for every page in the document.
+     */
+    fun inspectPdfGeometry(pdfFile: File): List<PdfPageGeometry> {
+        if (!pdfFile.exists() || !pdfFile.canRead() || pdfFile.length() < 100L) {
+            return emptyList()
+        }
+
+        // 1. Try Android PdfRenderer first
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        try {
+            pfd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd)
+            val count = renderer.pageCount
+            if (count > 0) {
+                val pages = mutableListOf<PdfPageGeometry>()
+                for (i in 0 until count) {
+                    val page = renderer.openPage(i)
+                    try {
+                        val w = page.width
+                        val h = page.height
+                        if (w > 0 && h > 0) {
+                            pages.add(PdfPageGeometry(pageNumber = i + 1, widthPoints = w, heightPoints = h))
+                        }
+                    } finally {
+                        try {
+                            page.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                if (pages.size == count) {
+                    return pages
+                }
+            }
+        } catch (_: Throwable) {
+            // Fall through to PDF structure /MediaBox parser on JVM tests where native PdfRenderer is unavailable
+        } finally {
+            try {
+                renderer?.close()
+            } catch (_: Exception) {
+            }
+            try {
+                pfd?.close()
+            } catch (_: Exception) {
+            }
+        }
+
+        // 2. Fallback: parse /MediaBox [x0 y0 x1 y1] entries from valid PDF structure
+        val validation = com.example.storage.DocumentValidationManager.validateFile(pdfFile)
+        if (!validation.isValid || validation.detectedFormat != FileFormat.PDF) {
+            return emptyList()
+        }
+        return try {
+            val maxScanBytes = minOf(pdfFile.length(), 8L * 1024L * 1024L).toInt()
+            val bytes = ByteArray(maxScanBytes)
+            pdfFile.inputStream().use { input ->
+                var total = 0
+                while (total < maxScanBytes) {
+                    val r = input.read(bytes, total, maxScanBytes - total)
+                    if (r == -1) break
+                    total += r
+                }
+            }
+            val content = String(bytes, Charsets.ISO_8859_1)
+            val mediaBoxRegex = Regex("""/MediaBox\s*\[\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*]""")
+            val matches = mediaBoxRegex.findAll(content).toList()
+            if (matches.isNotEmpty()) {
+                matches.mapIndexedNotNull { idx, match ->
+                    val x0 = match.groupValues[1].toDoubleOrNull() ?: 0.0
+                    val y0 = match.groupValues[2].toDoubleOrNull() ?: 0.0
+                    val x1 = match.groupValues[3].toDoubleOrNull() ?: 0.0
+                    val y1 = match.groupValues[4].toDoubleOrNull() ?: 0.0
+                    val w = kotlin.math.round(x1 - x0).toInt()
+                    val h = kotlin.math.round(y1 - y0).toInt()
+                    if (w > 0 && h > 0) PdfPageGeometry(pageNumber = idx + 1, widthPoints = w, heightPoints = h) else null
+                }
+            } else {
+                emptyList()
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Compresses a PDF file toward a target KB limit while strictly preserving each original page's
+     * physical dimensions (widthPoints x heightPoints), aspect ratio, page count, and page order.
+     *
+     * Rejects invalid [targetMaxKb] (<= 0) or invalid/corrupt PDF inputs explicitly with [IllegalArgumentException].
      */
     suspend fun compressPdfToTargetKb(
         context: Context,
         inputPdfFile: File,
         targetMaxKb: Int
-    ): File = withContext(Dispatchers.IO) {
-        val targetMaxBytes = targetMaxKb.coerceAtLeast(10) * 1024L
-        val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
-        val outFile = File(outDir, "compressed_${targetMaxKb}kb_${inputPdfFile.name}")
+    ): File {
+        return compressPdfToTargetKbWithReport(context, inputPdfFile, targetMaxKb).outputFile
+    }
 
-        // Candidate (scale, jpegQuality) steps ordered from highest visual fidelity to minimum readable floor
+    /**
+     * Compresses a PDF file toward [targetMaxKb] and reopens the saved output PDF to verify:
+     * - Valid PDF structure
+     * - Actual file size in bytes
+     * - Page count preservation
+     * - Original physical page dimensions and aspect ratio preservation for every page
+     * - Honest [PdfCompressionReport.metTarget] status
+     */
+    suspend fun compressPdfToTargetKbWithReport(
+        context: Context,
+        inputPdfFile: File,
+        targetMaxKb: Int
+    ): PdfCompressionReport = withContext(Dispatchers.IO) {
+        require(targetMaxKb > 0) { "targetMaxKb must be greater than 0 (received $targetMaxKb)" }
+        require(inputPdfFile.exists() && inputPdfFile.canRead() && inputPdfFile.length() > 0L) {
+            "Input PDF file does not exist, is unreadable, or is empty"
+        }
+
+        val inputValidation = com.example.storage.DocumentValidationManager.validateFile(inputPdfFile)
+        require(inputValidation.isValid && inputValidation.detectedFormat == FileFormat.PDF) {
+            inputValidation.errorMessage ?: "Input file is not a valid PDF document"
+        }
+
+        val originalPages = inspectPdfGeometry(inputPdfFile)
+        require(originalPages.isNotEmpty()) {
+            "Input PDF contains 0 readable pages or invalid page geometry"
+        }
+
+        val targetMaxBytes = targetMaxKb.toLong() * 1024L
+        val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
+        val outFile = File(outDir, "compressed_${targetMaxKb}kb_${System.currentTimeMillis()}_${inputPdfFile.name}")
+
+        // Candidate (renderScale, jpegQuality) steps ordered from highest visual fidelity to minimum floor.
+        // Note: renderScale ONLY affects raster bitmap resolution; each output PDF page's physical PageInfo
+        // always uses the original page's exact widthPoints x heightPoints.
         val compressionSteps = listOf(
-            1.75f to 85,
-            1.40f to 75,
-            1.15f to 65,
-            0.95f to 55,
-            0.80f to 45,
-            0.65f to 36
+            2.00f to 88,
+            1.60f to 78,
+            1.25f to 68,
+            1.00f to 58,
+            0.80f to 46,
+            0.60f to 34
         )
 
-        val pfd = ParcelFileDescriptor.open(inputPdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        val renderer = PdfRenderer(pfd)
-        val pageCount = renderer.pageCount
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        val tempStepFiles = mutableListOf<File>()
 
         try {
-            var smallestCandidateBytes: ByteArray? = null
+            pfd = ParcelFileDescriptor.open(inputPdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = try {
+                PdfRenderer(pfd)
+            } catch (_: Throwable) {
+                null
+            }
 
-            for ((scale, jpegQuality) in compressionSteps) {
-                val renderedBitmaps = mutableListOf<Bitmap>()
-                for (i in 0 until pageCount) {
-                    val page = renderer.openPage(i)
-                    val w = (page.width * scale).toInt().coerceAtLeast(200)
-                    val h = (page.height * scale).toInt().coerceAtLeast(280)
-                    val rawBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    rawBmp.eraseColor(Color.WHITE)
-                    page.render(rawBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
-                    page.close()
+            var bestCandidateFile: File? = null
 
-                    // Re-encode page bitmap through JPEG at jpegQuality to strip high-frequency noise
-                    val jpegBaos = ByteArrayOutputStream()
-                    rawBmp.compress(Bitmap.CompressFormat.JPEG, jpegQuality, jpegBaos)
-                    val jpegBytes = jpegBaos.toByteArray()
-                    val quantizedBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size) ?: rawBmp
-                    renderedBitmaps.add(quantizedBmp)
-                }
+            for ((stepIndex, step) in compressionSteps.withIndex()) {
+                val (renderScale, jpegQuality) = step
+                val candidateFile = File(outDir, "temp_step_${stepIndex}_${System.nanoTime()}.pdf")
+                tempStepFiles.add(candidateFile)
 
                 val pdfDoc = PdfDocument()
                 try {
-                    renderedBitmaps.forEachIndexed { idx, bmp ->
-                        val pageW = (A4_WIDTH_POINTS * scale.coerceAtMost(1.0f)).toInt().coerceAtLeast(360)
-                        val pageH = (A4_HEIGHT_POINTS * scale.coerceAtMost(1.0f)).toInt().coerceAtLeast(509)
-                        val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, idx + 1).create()
-                        val pdfPage = pdfDoc.startPage(pageInfo)
-                        pdfPage.canvas.drawColor(Color.WHITE)
-                        val dest = Rect(0, 0, pageW, pageH)
-                        pdfPage.canvas.drawBitmap(bmp, null, dest, Paint(Paint.FILTER_BITMAP_FLAG))
-                        pdfDoc.finishPage(pdfPage)
+                    for (pageIdx in originalPages.indices) {
+                        val origGeom = originalPages[pageIdx]
+                        val origWidthPts = origGeom.widthPoints
+                        val origHeightPts = origGeom.heightPoints
+
+                        // Compute raster resolution preserving exact original page aspect ratio, capped to prevent OOM
+                        val rawRasterW = kotlin.math.round(origWidthPts * renderScale).toInt().coerceAtLeast(72)
+                        val rawRasterH = kotlin.math.round(origHeightPts * renderScale).toInt().coerceAtLeast(72)
+                        val maxSide = maxOf(rawRasterW, rawRasterH)
+                        val capFactor = if (maxSide > MAX_RASTER_SIDE_PX) {
+                            MAX_RASTER_SIDE_PX.toFloat() / maxSide.toFloat()
+                        } else {
+                            1.0f
+                        }
+                        val rasterW = kotlin.math.round(rawRasterW * capFactor).toInt().coerceAtLeast(72)
+                        val rasterH = kotlin.math.round(rawRasterH * capFactor).toInt().coerceAtLeast(72)
+
+                        var rawBmp: Bitmap? = null
+                        var quantizedBmp: Bitmap? = null
+                        try {
+                            rawBmp = Bitmap.createBitmap(rasterW, rasterH, Bitmap.Config.ARGB_8888)
+                            rawBmp.eraseColor(Color.WHITE)
+
+                            if (renderer != null && pageIdx < renderer.pageCount) {
+                                val srcPage = renderer.openPage(pageIdx)
+                                try {
+                                    srcPage.render(rawBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                                } finally {
+                                    srcPage.close()
+                                }
+                            }
+
+                            // Re-encode page bitmap through JPEG at jpegQuality
+                            val jpegBaos = ByteArrayOutputStream()
+                            rawBmp.compress(Bitmap.CompressFormat.JPEG, jpegQuality, jpegBaos)
+                            val jpegBytes = jpegBaos.toByteArray()
+
+                            // Release rawBmp immediately before decoding quantizedBmp
+                            rawBmp.recycle()
+                            rawBmp = null
+
+                            quantizedBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+
+                            // Start PDF page with EXACT original physical page dimensions (origWidthPts x origHeightPts)
+                            val pageInfo = PdfDocument.PageInfo.Builder(origWidthPts, origHeightPts, pageIdx + 1).create()
+                            val pdfPage = pdfDoc.startPage(pageInfo)
+                            try {
+                                val canvas = pdfPage.canvas
+                                canvas.drawColor(Color.WHITE)
+                                if (quantizedBmp != null) {
+                                    // Fit proportionally inside (0, 0, origWidthPts, origHeightPts) without stretching
+                                    val bmpW = quantizedBmp.width.toFloat()
+                                    val bmpH = quantizedBmp.height.toFloat()
+                                    val fitScale = minOf(origWidthPts / bmpW, origHeightPts / bmpH)
+                                    val drawW = bmpW * fitScale
+                                    val drawH = bmpH * fitScale
+                                    val left = ((origWidthPts - drawW) / 2f).toInt()
+                                    val top = ((origHeightPts - drawH) / 2f).toInt()
+                                    val destRect = Rect(
+                                        left,
+                                        top,
+                                        (left + drawW).toInt().coerceAtMost(origWidthPts),
+                                        (top + drawH).toInt().coerceAtMost(origHeightPts)
+                                    )
+                                    canvas.drawBitmap(quantizedBmp, null, destRect, Paint(Paint.FILTER_BITMAP_FLAG))
+                                }
+                            } finally {
+                                pdfDoc.finishPage(pdfPage)
+                            }
+                        } finally {
+                            if (rawBmp != null && !rawBmp.isRecycled) {
+                                rawBmp.recycle()
+                            }
+                            if (quantizedBmp != null && !quantizedBmp.isRecycled) {
+                                quantizedBmp.recycle()
+                            }
+                        }
                     }
 
-                    val pdfBaos = ByteArrayOutputStream()
-                    pdfDoc.writeTo(pdfBaos)
-                    val pdfBytes = pdfBaos.toByteArray()
-
-                    if (smallestCandidateBytes == null || pdfBytes.size < smallestCandidateBytes!!.size) {
-                        smallestCandidateBytes = pdfBytes
-                    }
-
-                    if (pdfBytes.size <= targetMaxBytes) {
-                        break
-                    }
+                    FileOutputStream(candidateFile).use { pdfDoc.writeTo(it) }
                 } finally {
                     try {
                         pdfDoc.close()
                     } catch (_: Exception) {
                     }
                 }
+
+                if (candidateFile.exists() && candidateFile.length() > 0L) {
+                    if (bestCandidateFile == null || candidateFile.length() < bestCandidateFile.length()) {
+                        bestCandidateFile = candidateFile
+                    }
+                    if (candidateFile.length() <= targetMaxBytes) {
+                        bestCandidateFile = candidateFile
+                        break
+                    }
+                }
             }
 
-            val finalBytes = smallestCandidateBytes ?: inputPdfFile.readBytes()
-            FileOutputStream(outFile).use { it.write(finalBytes) }
-            outFile
+            val chosenSource = bestCandidateFile ?: inputPdfFile
+            chosenSource.copyTo(outFile, overwrite = true)
         } finally {
             try {
-                renderer.close()
+                renderer?.close()
             } catch (_: Exception) {
             }
             try {
-                pfd.close()
+                pfd?.close()
             } catch (_: Exception) {
             }
+            tempStepFiles.forEach { temp ->
+                if (temp.exists() && temp.absolutePath != outFile.absolutePath) {
+                    temp.delete()
+                }
+            }
         }
+
+        // Reopen final written PDF on disk and verify validity, size, page count, and page geometry
+        verifyCompressedPdf(
+            outputFile = outFile,
+            originalPages = originalPages,
+            targetMaxKb = targetMaxKb
+        )
+    }
+
+    /**
+     * Reopens a written PDF file and verifies its format validity, byte size, page count,
+     * physical page dimensions, and page aspect ratios against [originalPages].
+     */
+    fun verifyCompressedPdf(
+        outputFile: File,
+        originalPages: List<PdfPageGeometry>,
+        targetMaxKb: Int
+    ): PdfCompressionReport {
+        val actualSizeBytes = if (outputFile.exists()) outputFile.length() else 0L
+        val actualSizeKb = actualSizeBytes / 1024.0
+        val validation = com.example.storage.DocumentValidationManager.validateFile(outputFile)
+        val outputPages = if (validation.isValid && validation.detectedFormat == FileFormat.PDF) {
+            inspectPdfGeometry(outputFile)
+        } else {
+            emptyList()
+        }
+
+        val isValidPdf = validation.isValid && validation.detectedFormat == FileFormat.PDF && outputPages.isNotEmpty()
+        val pageCountPreserved = isValidPdf && outputPages.size == originalPages.size
+        val geometryPreserved = pageCountPreserved && originalPages.indices.all { idx ->
+            val orig = originalPages[idx]
+            val out = outputPages[idx]
+            orig.widthPoints == out.widthPoints &&
+                orig.heightPoints == out.heightPoints &&
+                kotlin.math.abs(orig.aspectRatio - out.aspectRatio) < 0.005f
+        }
+        val metTarget = isValidPdf &&
+            pageCountPreserved &&
+            geometryPreserved &&
+            actualSizeBytes in 1L..(targetMaxKb.toLong() * 1024L)
+
+        val errorMsg = when {
+            !isValidPdf -> validation.errorMessage ?: "Compressed output is not a valid PDF document"
+            !pageCountPreserved -> "Page count changed unexpectedly: expected ${originalPages.size} pages, got ${outputPages.size} pages"
+            !geometryPreserved -> "Page physical dimensions or aspect ratio changed unexpectedly during compression"
+            else -> null
+        }
+
+        return PdfCompressionReport(
+            outputFile = outputFile,
+            actualSizeBytes = actualSizeBytes,
+            actualSizeKb = actualSizeKb,
+            targetMaxKb = targetMaxKb,
+            metTarget = metTarget,
+            isValidPdf = isValidPdf,
+            originalPageCount = originalPages.size,
+            outputPageCount = outputPages.size,
+            pageCountPreserved = pageCountPreserved,
+            geometryPreserved = geometryPreserved,
+            originalPages = originalPages,
+            outputPages = outputPages,
+            errorMessage = errorMsg
+        )
     }
 
     /**

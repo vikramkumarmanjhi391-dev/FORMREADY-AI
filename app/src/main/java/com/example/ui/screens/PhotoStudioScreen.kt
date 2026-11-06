@@ -102,6 +102,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+const val PHOTO_FALLBACK_BUTTON_LABEL = "Keep Original Background"
+const val PHOTO_FALLBACK_TOAST_MESSAGE = "Processed with original background (resize & KB rules applied)"
+
 data class PhotoPreset(
     val name: String,
     val widthPx: Int,
@@ -683,7 +686,7 @@ fun PhotoStudioScreen(
 
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        // 1-Tap Restore Original (Unfiltered) Fallback Button
+                        // 1-Tap Keep Original Background (No White BG Filter) Fallback Button
                         OutlinedButton(
                             onClick = {
                                 autoWhiteBackground = false
@@ -726,7 +729,7 @@ fun PhotoStudioScreen(
                                             customDpi = customDpi
                                         )
                                         isProcessing = false
-                                        Toast.makeText(context, "Restored original unfiltered background!", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, PHOTO_FALLBACK_TOAST_MESSAGE, Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             },
@@ -735,7 +738,7 @@ fun PhotoStudioScreen(
                         ) {
                             Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Restore Original Background (No Filter)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text(PHOTO_FALLBACK_BUTTON_LABEL, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
 
                         Spacer(modifier = Modifier.height(8.dp))

@@ -70,6 +70,8 @@ enum class PreparationStatus(val label: String) {
     SIZE_EXCEEDED("File Size Exceeded"),
     SIZE_BELOW_MIN("File Size Too Small"),
     DIMENSIONS_MISMATCH("Dimensions Mismatch"),
+    BACKGROUND_NOT_WHITE("Background Not White"),
+    DPI_MISMATCH("DPI Metadata Mismatch"),
     CONFLICT_LIMITS("Requirements Conflict"),
     FAILED("Processing Failed")
 }
@@ -133,7 +135,11 @@ data class ProcessedFileResult(
     val conflictReason: String? = null,
     val dpi: Int = 300,
     val wasPaddedToMinKb: Boolean = false,
-    val hasWhiteBackground: Boolean = false
+    val hasWhiteBackground: Boolean = false,
+    val backgroundVerificationState: String = "UNVERIFIED",
+    val nearWhitePixelRatio: Float = 0f,
+    val exactWhitePixelRatio: Float = 0f,
+    val backgroundMeanLuminance: Int = 0
 )
 
 data class ValidationIssue(

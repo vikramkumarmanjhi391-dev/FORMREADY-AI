@@ -54,8 +54,14 @@ class SafeRobolectricPdfDocumentShadow {
     @RealObject
     private lateinit var realPdfDocument: PdfDocument
 
-    private val createdPages = mutableListOf<PdfDocument.PageInfo>()
+    private data class ShadowPageRecord(
+        val info: PdfDocument.PageInfo,
+        val bitmap: Bitmap
+    )
+
+    private val createdPages = mutableListOf<ShadowPageRecord>()
     private var currentActivePage: PdfDocument.Page? = null
+    private var currentActiveBitmap: Bitmap? = null
     private var isClosed = false
 
     @Implementation
@@ -82,6 +88,7 @@ class SafeRobolectricPdfDocumentShadow {
         pageConstructor.isAccessible = true
         val page = pageConstructor.newInstance(pageCanvas, pageInfo)
         currentActivePage = page
+        currentActiveBitmap = backingBitmap
         return page
     }
 
@@ -90,13 +97,15 @@ class SafeRobolectricPdfDocumentShadow {
         check(!isClosed) { "PdfDocument is already closed" }
         requireNotNull(page) { "Page cannot be null" }
         check(currentActivePage === page) { "Finished page does not match active page" }
-        createdPages.add(page.info)
+        val bmp = currentActiveBitmap ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        createdPages.add(ShadowPageRecord(page.info, bmp))
         currentActivePage = null
+        currentActiveBitmap = null
     }
 
     @Implementation
     protected fun getPages(): List<PdfDocument.PageInfo> {
-        return createdPages.toList()
+        return createdPages.map { it.info }
     }
 
     @Implementation
@@ -112,10 +121,14 @@ class SafeRobolectricPdfDocumentShadow {
         val kidsRefs = createdPages.indices.joinToString(" ") { idx -> "${idx + 3} 0 R" }
         sb.append("2 0 obj\n<< /Type /Pages /Kids [ $kidsRefs ] /Count ${createdPages.size} >>\nendobj\n")
 
-        createdPages.forEachIndexed { idx, info ->
+        createdPages.forEachIndexed { idx, record ->
+            val info = record.info
             val objId = idx + 3
+            val baos = java.io.ByteArrayOutputStream()
+            record.bitmap.compress(Bitmap.CompressFormat.JPEG, 75, baos)
+            val encodedHex = baos.toByteArray().joinToString("") { "%02x".format(it) }
             sb.append(
-                "$objId 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${info.pageWidth} ${info.pageHeight}] >>\nendobj\n"
+                "$objId 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${info.pageWidth} ${info.pageHeight}] /Length ${encodedHex.length} >>\nstream\n$encodedHex\nendstream\nendobj\n"
             )
         }
 
@@ -134,6 +147,16 @@ class SafeRobolectricPdfDocumentShadow {
     protected fun close() {
         isClosed = true
         currentActivePage = null
+        currentActiveBitmap?.let {
+            if (!it.isRecycled) it.recycle()
+        }
+        currentActiveBitmap = null
+        createdPages.forEach { record ->
+            if (!record.bitmap.isRecycled) {
+                record.bitmap.recycle()
+            }
+        }
+        createdPages.clear()
     }
 }
 
@@ -177,6 +200,41 @@ class Phase5FeaturesTest {
             strokeWidth = 6f
         }
         canvas.drawLine(10f, 10f, (width - 10).toFloat(), (height - 10).toFloat(), paint)
+        return bitmap
+    }
+
+    /**
+     * Creates a high-detail textured portrait bitmap (simulating real camera sensor detail inside the central
+     * subject silhouette) while preserving [backgroundColor] in the surrounding background so JPEG compression
+     * produces realistic file sizes and guide-frame cropping still includes the background around the head.
+     */
+    private fun createTexturedSubjectBitmap(
+        width: Int,
+        height: Int,
+        backgroundColor: Int = Color.WHITE
+    ): Bitmap {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(width * height)
+        val centerX = width * 0.50f
+        val centerY = height * 0.58f
+        val radiusX = (width * 0.25f).coerceAtLeast(10f)
+        val radiusY = (height * 0.28f).coerceAtLeast(10f)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val dx = (x - centerX) / radiusX
+                val dy = (y - centerY) / radiusY
+                val isSubjectRegion = (dx * dx + dy * dy) <= 1.0f
+                pixels[y * width + x] = if (isSubjectRegion) {
+                    val r = ((x * 73 + y * 29 + (x xor y) * 19) and 0x7F) + 60
+                    val g = ((x * 41 + y * 97 + (x * y) * 7) and 0x7F) + 50
+                    val b = ((x * 59 + y * 53 + (x + y * 3) * 23) and 0x7F) + 45
+                    Color.rgb(r.coerceIn(0, 220), g.coerceIn(0, 220), b.coerceIn(0, 220))
+                } else {
+                    backgroundColor
+                }
+            }
+        }
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
         return bitmap
     }
 
@@ -250,7 +308,7 @@ class Phase5FeaturesTest {
 
     @Test
     fun testCameraAndGalleryProduceEquivalentPreparedPhotoResults() = runBlocking {
-        val bmp = createSampleBitmap(640, 800, Color.CYAN)
+        val bmp = createTexturedSubjectBitmap(640, 800, Color.WHITE)
         val sourceFile = saveBitmapToTestFile(bmp, "shared_source_photo.jpg")
 
         val cameraInput = UnifiedMediaInput.fromCameraFile(sourceFile, CameraCaptureMode.PASSPORT_PHOTO)
@@ -320,7 +378,7 @@ class Phase5FeaturesTest {
             id = "test_signature_rule",
             documentType = DocumentType.SIGNATURE_ENGLISH,
             allowedFormats = listOf(FileFormat.JPG),
-            minKb = 5,
+            minKb = 1,
             maxKb = 20,
             exactWidthPx = 300,
             exactHeightPx = 120
@@ -478,7 +536,7 @@ class Phase5FeaturesTest {
         val utiSigRule = utiPortal!!.documents.first { it.documentType == DocumentType.SIGNATURE_ENGLISH }
         assertEquals(600, utiSigRule.dpi)
 
-        val sourceBmp = createSampleBitmap(600, 600, Color.LTGRAY)
+        val sourceBmp = createTexturedSubjectBitmap(600, 600, Color.rgb(245, 245, 245))
         val processed = com.example.processing.ImageProcessor.processImageForRule(
             context = context,
             originalBitmap = sourceBmp,
@@ -493,13 +551,15 @@ class Phase5FeaturesTest {
         assertEquals(300, processed.dpi)
         assertTrue(processed.hasWhiteBackground)
 
-        val outBytes = File(processed.processedFilePath).readBytes()
+        val outFile = File(processed.processedFilePath)
+        val outBytes = outFile.readBytes()
         assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(outBytes))
+        assertEquals(300, com.example.processing.ImageProcessor.readExifDpi(outFile))
     }
 
     @Test
-    fun testSafeJpegPaddingToMinKbGuarantee() = runBlocking {
-        // Tiny solid-white signature image naturally compresses to < 3 KB
+    fun testPhase0NoJpegComPaddingAndSizeBelowMinFailure() = runBlocking {
+        // Tiny solid-white signature image naturally compresses to < 3 KB even at quality 100
         val tinySigBmp = Bitmap.createBitmap(140, 60, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.WHITE)
         }
@@ -520,15 +580,65 @@ class Phase5FeaturesTest {
             rule = strictRule
         )
 
-        assertTrue("File must be padded to at least 12 KB (12288 bytes), actual=${result.fileSizeBytes}", result.fileSizeBytes >= 12 * 1024L)
-        assertTrue("File must remain <= 20 KB", result.fileSizeBytes <= 20 * 1024L)
-        assertTrue("wasPaddedToMinKb flag should be true", result.wasPaddedToMinKb)
+        val savedFile = File(result.processedFilePath)
+        val savedBytes = savedFile.readBytes()
 
-        // Ensure padded JPEG is still 100% valid and decodable
+        // 1. Must NEVER pad with JPEG COM (0xFF 0xFE) metadata
+        assertFalse("wasPaddedToMinKb must always be false", result.wasPaddedToMinKb)
+        assertFalse(
+            "JPEG file must NOT contain any 0xFF 0xFE COM padding segment",
+            com.example.processing.ImageProcessor.hasJpegComSegment(savedBytes)
+        )
+
+        // 2. Because natural quality 100 size is below 12 KB, compliance must be false with SIZE_BELOW_MIN
+        assertTrue("Natural file size should be below 12 KB", result.fileSizeBytes < 12 * 1024L)
+        assertFalse("isCompliant must be false when size < minKb", result.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SIZE_BELOW_MIN, result.status)
+
+        // 3. Saved file on disk must match reported size and dimensions
+        assertEquals(savedFile.length(), result.fileSizeBytes)
         val decoded = android.graphics.BitmapFactory.decodeFile(result.processedFilePath)
         assertNotNull(decoded)
-        assertEquals(140, decoded.width)
-        assertEquals(60, decoded.height)
+        assertEquals(result.widthPx, decoded.width)
+        assertEquals(result.heightPx, decoded.height)
+    }
+
+    @Test
+    fun testPhase0ExactDimensionMismatchAfterDownscalingFailsCompliance() = runBlocking {
+        // High-frequency large image with an impossible 2 KB maxKb limit at 800x1000 exact dimensions
+        val detailedBmp = createTexturedSubjectBitmap(800, 1000, Color.WHITE)
+        val exactRuleWithTinyMaxKb = DocumentRule(
+            id = "exact_dim_downscale_test",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 1,
+            maxKb = 2, // Forces downscaling below 800x1000
+            exactWidthPx = 800,
+            exactHeightPx = 1000,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+
+        val result = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = detailedBmp,
+            rule = exactRuleWithTinyMaxKb,
+            removeBackgroundToWhite = false
+        )
+
+        // Downscaling occurred, so final saved dimensions are smaller than 800x1000
+        assertTrue("Final width must be < 800 after downscaling", result.widthPx < 800)
+        assertTrue("Final height must be < 1000 after downscaling", result.heightPx < 1000)
+
+        // Reported dimensions must match the actual saved file on disk
+        val decodedSaved = android.graphics.BitmapFactory.decodeFile(result.processedFilePath)
+        assertNotNull(decodedSaved)
+        assertEquals(decodedSaved.width, result.widthPx)
+        assertEquals(decodedSaved.height, result.heightPx)
+
+        // Must fail compliance with DIMENSIONS_MISMATCH
+        assertFalse("Exact-dimension rule must NOT be compliant after downscaling", result.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.DIMENSIONS_MISMATCH, result.status)
     }
 
     @Test
@@ -540,7 +650,7 @@ class Phase5FeaturesTest {
         assertNotNull(com.example.data.portal.PortalDatabase.findPortalById("up_police_recruitment"))
         assertNotNull(com.example.data.portal.PortalDatabase.findPortalById("bihar_police_csbc"))
 
-        val photoBmp = createSampleBitmap(350, 450, Color.BLUE)
+        val photoBmp = createTexturedSubjectBitmap(350, 450, Color.WHITE)
         val sigBmp = createSampleBitmap(300, 100, Color.WHITE)
 
         // 1. Joint Photo + Signature Combiner
@@ -550,13 +660,18 @@ class Phase5FeaturesTest {
             signatureBitmap = sigBmp,
             targetWidthPx = 300,
             targetHeightPx = 450,
-            minKb = 15,
+            minKb = 10,
             maxKb = 50,
             dpi = 300
         )
         assertEquals(300, jointResult.widthPx)
         assertEquals(450, jointResult.heightPx)
-        assertTrue(jointResult.fileSizeBytes in (15 * 1024L)..(50 * 1024L))
+        assertTrue(jointResult.fileSizeBytes <= 50 * 1024L)
+        assertFalse(
+            com.example.processing.ImageProcessor.hasJpegComSegment(
+                File(jointResult.processedFilePath).readBytes()
+            )
+        )
 
         // 2. Printable 8-Photo 4x6 Sheet
         val sheetResult = com.example.processing.ImageProcessor.createPrintablePassportSheet(
@@ -587,12 +702,12 @@ class Phase5FeaturesTest {
     @Test
     fun testPhase0HonestBackgroundWhitenessMeasurementAndDualDpiMetadata() = runBlocking {
         // 1. Create a photo with a dark blue background (non-white)
-        val nonWhiteBgPhoto = createSampleBitmap(400, 500, Color.BLUE)
+        val nonWhiteBgPhoto = createTexturedSubjectBitmap(400, 500, Color.BLUE)
         val whiteRequiredRule = DocumentRule(
             id = "phase0_honest_bg_rule",
             documentType = DocumentType.PASSPORT_PHOTO,
             allowedFormats = listOf(FileFormat.JPG),
-            minKb = 10,
+            minKb = 5,
             maxKb = 60,
             exactWidthPx = 350,
             exactHeightPx = 450,
@@ -600,7 +715,8 @@ class Phase5FeaturesTest {
             requiresWhiteBackground = true
         )
 
-        // Process WITHOUT background removal -> measured hasWhiteBackground MUST be false (never echoed from rule)
+        // Process WITHOUT background removal -> measured hasWhiteBackground MUST be false,
+        // isCompliant MUST be false, and status MUST be BACKGROUND_NOT_WHITE
         val unfilteredResult = com.example.processing.ImageProcessor.processImageForRule(
             context = context,
             originalBitmap = nonWhiteBgPhoto,
@@ -613,20 +729,36 @@ class Phase5FeaturesTest {
             "ProcessedFileResult.hasWhiteBackground must be false when actual background is blue",
             unfilteredResult.hasWhiteBackground
         )
+        assertFalse(
+            "ProcessedFileResult.isCompliant must be false when rule requires white background and background is blue",
+            unfilteredResult.isCompliant
+        )
+        assertEquals(
+            com.example.data.model.PreparationStatus.BACKGROUND_NOT_WHITE,
+            unfilteredResult.status
+        )
+        assertEquals("UNVERIFIED_PERIMETER_SAMPLE", unfilteredResult.backgroundVerificationState)
         assertTrue(
             "Validation messages must warn when background is not white",
             unfilteredResult.validationMessages.any { it.contains("Background Warning", ignoreCase = true) }
         )
 
-        // 2. Verify BOTH JFIF APP0 header AND EXIF XResolution/YResolution are written at 200 DPI
+        // 2. Verify BOTH JFIF APP0 header AND EXIF XResolution/YResolution/ResolutionUnit are written at 200 DPI
         val outFile = File(unfilteredResult.processedFilePath)
-        val jfifDpi = com.example.processing.ImageProcessor.readJfifDpiHeader(outFile.readBytes())
-        val exifDpi = com.example.processing.ImageProcessor.readExifDpi(outFile)
-        assertEquals(200, jfifDpi)
-        assertEquals(200, exifDpi)
+        val outBytes = outFile.readBytes()
+        val jfifMeta = com.example.processing.ImageProcessor.readJfifResolutionMetadata(outBytes)
+        val exifMeta = com.example.processing.ImageProcessor.readExifResolutionMetadata(outFile)
+        assertNotNull(jfifMeta)
+        assertNotNull(exifMeta)
+        assertEquals(1, jfifMeta!!.resolutionUnit)
+        assertEquals(200, jfifMeta.xDpi)
+        assertEquals(200, jfifMeta.yDpi)
+        assertEquals(2, exifMeta!!.resolutionUnit)
+        assertEquals(200, exifMeta.xDpi)
+        assertEquals(200, exifMeta.yDpi)
 
-        // 3. Process a light-background portrait with background whitening -> measured hasWhiteBackground MUST be true
-        val studioLightPhoto = createSampleBitmap(400, 500, Color.rgb(245, 245, 245))
+        // 3. Process a light-background portrait with background whitening -> measured on saved output
+        val studioLightPhoto = createTexturedSubjectBitmap(400, 500, Color.rgb(245, 245, 245))
         val whitenedResult = com.example.processing.ImageProcessor.processImageForRule(
             context = context,
             originalBitmap = studioLightPhoto,
@@ -635,26 +767,155 @@ class Phase5FeaturesTest {
             customDpi = 300
         )
         assertTrue(
-            "ProcessedFileResult.hasWhiteBackground must be true when background pixels are pure white",
+            "ProcessedFileResult.hasWhiteBackground must be true when saved background pixels are near-white",
             whitenedResult.hasWhiteBackground
         )
+        assertTrue("Whitened photo meeting all rules must be compliant", whitenedResult.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, whitenedResult.status)
+        assertTrue(whitenedResult.nearWhitePixelRatio >= 0.85f)
         val whitenedFile = File(whitenedResult.processedFilePath)
         assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(whitenedFile.readBytes()))
         assertEquals(300, com.example.processing.ImageProcessor.readExifDpi(whitenedFile))
     }
 
     @Test
-    fun testPhase0PdfTargetSizeVerificationHonesty() = runBlocking {
+    fun testPhase0PdfGeometryPreservationAndTargetVerification() = runBlocking {
+        // 1. Multi-page A4 (595 x 842) PDF compression preserves page count, order, and A4 geometry
+        val a4Pdf = PdfProcessor.createPdfFromBitmaps(
+            context = context,
+            bitmaps = listOf(
+                createSampleBitmap(600, 800, Color.WHITE),
+                createSampleBitmap(600, 800, Color.LTGRAY),
+                createSampleBitmap(600, 800, Color.WHITE)
+            ),
+            outputFileName = "phase0_a4_multipage.pdf"
+        )
+        val a4Report = PdfProcessor.compressPdfToTargetKbWithReport(
+            context = context,
+            inputPdfFile = a4Pdf,
+            targetMaxKb = 300
+        )
+        assertTrue(a4Report.isValidPdf)
+        assertTrue(a4Report.pageCountPreserved)
+        assertTrue(a4Report.geometryPreserved)
+        assertTrue(a4Report.metTarget)
+        assertEquals(3, a4Report.compressedPages.size)
+        a4Report.compressedPages.forEach { pageGeom ->
+            assertEquals(595, pageGeom.widthPoints)
+            assertEquals(842, pageGeom.heightPoints)
+        }
+
+        // 2. Non-A4 mixed page geometries: US Letter (612x792), Landscape A4 (842x595), Custom (500x700)
+        val customPages = listOf(
+            createSampleBitmap(612, 792, Color.WHITE) to (612 to 792),
+            createSampleBitmap(842, 595, Color.LTGRAY) to (842 to 595),
+            createSampleBitmap(500, 700, Color.WHITE) to (500 to 700)
+        )
+        val nonA4Pdf = PdfProcessor.createCustomGeometryPdfFromBitmaps(
+            context = context,
+            pages = customPages,
+            outputFileName = "phase0_custom_geometry.pdf"
+        )
+        val nonA4Report = PdfProcessor.compressPdfToTargetKbWithReport(
+            context = context,
+            inputPdfFile = nonA4Pdf,
+            targetMaxKb = 300
+        )
+        assertTrue("Compressed non-A4 PDF must be valid", nonA4Report.isValidPdf)
+        assertTrue("Page count must be preserved", nonA4Report.pageCountPreserved)
+        assertTrue("Non-A4 page geometry and aspect ratios must be preserved", nonA4Report.geometryPreserved)
+        assertEquals(612, nonA4Report.compressedPages[0].widthPoints)
+        assertEquals(792, nonA4Report.compressedPages[0].heightPoints)
+        assertEquals(842, nonA4Report.compressedPages[1].widthPoints)
+        assertEquals(595, nonA4Report.compressedPages[1].heightPoints)
+        assertEquals(500, nonA4Report.compressedPages[2].widthPoints)
+        assertEquals(700, nonA4Report.compressedPages[2].heightPoints)
+
+        // 3. Impossible target KB reports metTarget = false without falsely claiming success
+        val multiPageDetailedPdf = PdfProcessor.createPdfFromBitmaps(
+            context = context,
+            bitmaps = List(5) { createTexturedSubjectBitmap(600, 800, Color.WHITE) },
+            outputFileName = "phase0_heavy_5page.pdf"
+        )
+        val impossibleReport = PdfProcessor.compressPdfToTargetKbWithReport(
+            context = context,
+            inputPdfFile = multiPageDetailedPdf,
+            targetMaxKb = 1 // 1 KB is impossible for a 5-page raster PDF
+        )
+        assertTrue(impossibleReport.isValidPdf)
+        assertTrue(impossibleReport.pageCountPreserved)
+        assertTrue(impossibleReport.geometryPreserved)
+        assertFalse("Impossible 1 KB target must report metTarget = false", impossibleReport.metTarget)
+        assertTrue(impossibleReport.actualSizeBytes > 1024L)
+
+        // 4. Invalid / corrupt / empty PDF and invalid targetMaxKb <= 0 must fail safely
+        val corruptPdf = File(testDir, "corrupt.pdf").apply { writeBytes(byteArrayOf(0x00, 0x01, 0x02)) }
+        var threwForCorrupt = false
+        try {
+            PdfProcessor.compressPdfToTargetKbWithReport(context, corruptPdf, 100)
+        } catch (e: IllegalArgumentException) {
+            threwForCorrupt = true
+        }
+        assertTrue("Corrupt PDF must throw IllegalArgumentException", threwForCorrupt)
+
+        var threwForZeroTarget = false
+        try {
+            PdfProcessor.compressPdfToTargetKbWithReport(context, a4Pdf, 0)
+        } catch (e: IllegalArgumentException) {
+            threwForZeroTarget = true
+        }
+        assertTrue("targetMaxKb <= 0 must throw IllegalArgumentException", threwForZeroTarget)
+
+        // 5. Repeated compression runs cleanly without leaking temp step files
+        repeat(3) {
+            val rep = PdfProcessor.compressPdfToTargetKbWithReport(context, nonA4Pdf, 250)
+            assertTrue(rep.isValidPdf)
+            assertTrue(rep.geometryPreserved)
+        }
+    }
+
+    @Test
+    fun testPhase0UiStatusCardAndTruthfulFallbackLabels() = runBlocking {
+        // 1. Verify truthful fallback button labels
+        assertEquals("Keep Original Background", com.example.ui.screens.PHOTO_FALLBACK_BUTTON_LABEL)
+        assertEquals("Gentle Ink Processing", com.example.ui.screens.SIGNATURE_FALLBACK_BUTTON_LABEL)
+        assertFalse(com.example.ui.screens.PHOTO_FALLBACK_BUTTON_LABEL.contains("Restore Original", ignoreCase = true))
+        assertFalse(com.example.ui.screens.SIGNATURE_FALLBACK_BUTTON_LABEL.contains("Restore", ignoreCase = true))
+
+        // 2. Verify buildPdfCompressionUiState agrees with actual final disk size, metTarget, and geometry
         val samplePdf = PdfProcessor.createPdfFromBitmaps(
             context = context,
-            bitmaps = listOf(createSampleBitmap(600, 800, Color.WHITE)),
-            outputFileName = "phase0_size_check.pdf"
+            bitmaps = listOf(createSampleBitmap(595, 842, Color.WHITE)),
+            outputFileName = "ui_state_test.pdf"
         )
-        assertTrue(samplePdf.exists())
-        // Should be well under 300 KB
-        assertTrue(PdfProcessor.isPdfWithinTargetKb(samplePdf, 300))
-        // Should be false for an impossible 0 KB target
-        assertFalse(PdfProcessor.isPdfWithinTargetKb(samplePdf, 0))
+        val successReport = PdfProcessor.compressPdfToTargetKbWithReport(context, samplePdf, 300)
+        val successUi = com.example.ui.screens.buildPdfCompressionUiState(successReport)
+        assertEquals(com.example.ui.screens.PdfCompressionUiStatus.SUCCESS, successUi.status)
+        assertTrue(successUi.isSuccess)
+        assertTrue(successUi.metTarget)
+        assertEquals(successReport.outputFile.length(), successUi.actualSizeBytes)
+        assertFalse("UI must not claim guaranteed readability", successUi.subtitle.contains("guaranteed", ignoreCase = true))
+
+        // Oversized warning UI state
+        val heavyPdf = PdfProcessor.createPdfFromBitmaps(
+            context = context,
+            bitmaps = List(4) { createTexturedSubjectBitmap(500, 700, Color.WHITE) },
+            outputFileName = "ui_oversized_test.pdf"
+        )
+        val oversizedReport = PdfProcessor.compressPdfToTargetKbWithReport(context, heavyPdf, 1)
+        val oversizedUi = com.example.ui.screens.buildPdfCompressionUiState(oversizedReport)
+        assertEquals(com.example.ui.screens.PdfCompressionUiStatus.WARNING_OVERSIZED, oversizedUi.status)
+        assertFalse(oversizedUi.isSuccess)
+        assertFalse(oversizedUi.metTarget)
+        assertEquals(oversizedReport.outputFile.length(), oversizedUi.actualSizeBytes)
+
+        // Geometry validation failure UI state
+        val brokenGeomReport = successReport.copy(geometryPreserved = false)
+        val failedUi = com.example.ui.screens.buildPdfCompressionUiState(brokenGeomReport)
+        assertEquals(com.example.ui.screens.PdfCompressionUiStatus.VALIDATION_FAILED, failedUi.status)
+        assertFalse(failedUi.isSuccess)
+        assertFalse(failedUi.geometryPreserved)
     }
 }
+
 

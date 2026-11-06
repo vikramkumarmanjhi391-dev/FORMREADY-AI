@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.Compare
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -922,6 +923,88 @@ fun ImagesToPdfSection(
     }
 }
 
+enum class PdfCompressionUiStatus {
+    SUCCESS,
+    WARNING_OVERSIZED,
+    VALIDATION_FAILED
+}
+
+data class PdfCompressionUiState(
+    val status: PdfCompressionUiStatus,
+    val isSuccess: Boolean,
+    val title: String,
+    val subtitle: String,
+    val actualSizeBytes: Long,
+    val actualSizeKbFormatted: String,
+    val targetMaxKb: Int,
+    val isValidPdf: Boolean,
+    val metTarget: Boolean,
+    val pageCountPreserved: Boolean,
+    val geometryPreserved: Boolean,
+    val pageCount: Int
+)
+
+fun buildPdfCompressionUiState(report: PdfProcessor.PdfCompressionReport): PdfCompressionUiState {
+    val diskBytes = if (report.outputFile.exists()) report.outputFile.length() else report.actualSizeBytes
+    val actualKbStr = String.format(Locale.US, "%.1f", diskBytes / 1024.0)
+    val withinTarget = diskBytes in 1L..(report.targetMaxKb * 1024L) && report.metTarget
+    return when {
+        !report.isValidPdf || !report.pageCountPreserved || !report.geometryPreserved -> {
+            val failureReason = when {
+                !report.isValidPdf -> "Output PDF failed structure validation."
+                !report.pageCountPreserved -> "Page count changed unexpectedly (${report.originalPages.size} -> ${report.compressedPages.size})."
+                else -> "Page geometry or aspect ratio changed unexpectedly."
+            }
+            PdfCompressionUiState(
+                status = PdfCompressionUiStatus.VALIDATION_FAILED,
+                isSuccess = false,
+                title = "PDF Validation Failed",
+                subtitle = "$failureReason Measured size: $actualKbStr KB.",
+                actualSizeBytes = diskBytes,
+                actualSizeKbFormatted = actualKbStr,
+                targetMaxKb = report.targetMaxKb,
+                isValidPdf = report.isValidPdf,
+                metTarget = false,
+                pageCountPreserved = report.pageCountPreserved,
+                geometryPreserved = report.geometryPreserved,
+                pageCount = report.compressedPages.size
+            )
+        }
+        withinTarget -> {
+            PdfCompressionUiState(
+                status = PdfCompressionUiStatus.SUCCESS,
+                isSuccess = true,
+                title = "Compressed Within Target ($actualKbStr KB)",
+                subtitle = "Measured Size: $actualKbStr KB (≤ ${report.targetMaxKb} KB limit) • ${report.compressedPages.size} page(s) geometry preserved. Inspect text clarity before portal upload.",
+                actualSizeBytes = diskBytes,
+                actualSizeKbFormatted = actualKbStr,
+                targetMaxKb = report.targetMaxKb,
+                isValidPdf = true,
+                metTarget = true,
+                pageCountPreserved = true,
+                geometryPreserved = true,
+                pageCount = report.compressedPages.size
+            )
+        }
+        else -> {
+            PdfCompressionUiState(
+                status = PdfCompressionUiStatus.WARNING_OVERSIZED,
+                isSuccess = false,
+                title = "Target Limit Exceeded ($actualKbStr KB > ${report.targetMaxKb} KB)",
+                subtitle = "Measured Size: $actualKbStr KB exceeds the ${report.targetMaxKb} KB limit (${report.compressedPages.size} page(s) geometry preserved). Try fewer pages or a higher KB limit.",
+                actualSizeBytes = diskBytes,
+                actualSizeKbFormatted = actualKbStr,
+                targetMaxKb = report.targetMaxKb,
+                isValidPdf = true,
+                metTarget = false,
+                pageCountPreserved = true,
+                geometryPreserved = true,
+                pageCount = report.compressedPages.size
+            )
+        }
+    }
+}
+
 @Composable
 fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
     val context = LocalContext.current
@@ -929,7 +1012,8 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
 
     var inputPdfFile by remember { mutableStateOf<File?>(null) }
     var targetMaxKb by remember(defaultTargetMaxKb) { mutableIntStateOf(defaultTargetMaxKb) }
-    var compressedPdfFile by remember { mutableStateOf<File?>(null) }
+    var compressionReport by remember { mutableStateOf<PdfProcessor.PdfCompressionReport?>(null) }
+    var compressionError by remember { mutableStateOf<String?>(null) }
     var isCompressing by remember { mutableStateOf(false) }
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
 
@@ -945,7 +1029,8 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
                         FileOutputStream(temp).use { stream.copyTo(it) }
                         stream.close()
                         inputPdfFile = temp
-                        compressedPdfFile = null
+                        compressionReport = null
+                        compressionError = null
                         saveStatusMessage = null
                     }
                 } catch (e: Exception) {
@@ -958,16 +1043,17 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
     val saveCompressedPdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { destUri: Uri? ->
-        if (destUri != null && compressedPdfFile != null) {
+        val compFile = compressionReport?.outputFile
+        if (destUri != null && compFile != null) {
             coroutineScope.launch(Dispatchers.IO) {
                 try {
                     context.contentResolver.openOutputStream(destUri)?.use { out ->
-                        FileInputStream(compressedPdfFile!!).use { inStream ->
+                        FileInputStream(compFile).use { inStream ->
                             inStream.copyTo(out)
                         }
                     }
                     withContext(Dispatchers.Main) {
-                        saveStatusMessage = "Compressed PDF saved (${String.format(Locale.US, "%.1f", compressedPdfFile!!.length() / 1024.0)} KB)"
+                        saveStatusMessage = "Compressed PDF saved (${String.format(Locale.US, "%.1f", compFile.length() / 1024.0)} KB)"
                         Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
@@ -1036,14 +1122,31 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
                         coroutineScope.launch {
                             isCompressing = true
                             saveStatusMessage = null
-                            val compressed = PdfProcessor.compressPdfToTargetKb(
-                                context = context,
-                                inputPdfFile = inputPdfFile!!,
-                                targetMaxKb = targetMaxKb
-                            )
-                            compressedPdfFile = compressed
-                            isCompressing = false
-                            Toast.makeText(context, "Compressed to ${String.format(Locale.US, "%.1f", compressed.length() / 1024.0)} KB!", Toast.LENGTH_SHORT).show()
+                            compressionError = null
+                            try {
+                                val report = PdfProcessor.compressPdfToTargetKbWithReport(
+                                    context = context,
+                                    inputPdfFile = inputPdfFile!!,
+                                    targetMaxKb = targetMaxKb
+                                )
+                                compressionReport = report
+                                val uiState = buildPdfCompressionUiState(report)
+                                Toast.makeText(
+                                    context,
+                                    if (uiState.isSuccess) {
+                                        "Compressed to ${uiState.actualSizeKbFormatted} KB (≤ $targetMaxKb KB)"
+                                    } else {
+                                        uiState.title
+                                    },
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } catch (e: Exception) {
+                                compressionReport = null
+                                compressionError = e.message ?: "Invalid or unreadable PDF file."
+                                Toast.makeText(context, "PDF compression failed: $compressionError", Toast.LENGTH_LONG).show()
+                            } finally {
+                                isCompressing = false
+                            }
                         }
                     },
                     enabled = !isCompressing,
@@ -1072,11 +1175,46 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
                 }
             }
 
-            compressedPdfFile?.let { compFile ->
-                val metTarget = PdfProcessor.isPdfWithinTargetKb(compFile, targetMaxKb)
-                val statusColor = if (metTarget) EmeraldTertiary else SaffronSecondary
-                val cardBg = if (metTarget) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
-                val actualKbStr = String.format(Locale.US, "%.1f", compFile.length() / 1024.0)
+            if (compressionError != null) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth().testTag("compressed_pdf_error_card"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ErrorOutline,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = compressionError!!,
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+
+            compressionReport?.let { report ->
+                val compFile = report.outputFile
+                val uiState = buildPdfCompressionUiState(report)
+                val statusColor = when (uiState.status) {
+                    PdfCompressionUiStatus.SUCCESS -> EmeraldTertiary
+                    PdfCompressionUiStatus.WARNING_OVERSIZED -> SaffronSecondary
+                    PdfCompressionUiStatus.VALIDATION_FAILED -> MaterialTheme.colorScheme.error
+                }
+                val cardBg = when (uiState.status) {
+                    PdfCompressionUiStatus.SUCCESS -> Color(0xFFE8F5E9)
+                    PdfCompressionUiStatus.WARNING_OVERSIZED -> Color(0xFFFFF3E0)
+                    PdfCompressionUiStatus.VALIDATION_FAILED -> MaterialTheme.colorScheme.errorContainer
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
                 Card(
@@ -1088,24 +1226,24 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
                     Column(modifier = Modifier.padding(14.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = if (metTarget) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                imageVector = when (uiState.status) {
+                                    PdfCompressionUiStatus.SUCCESS -> Icons.Default.CheckCircle
+                                    PdfCompressionUiStatus.WARNING_OVERSIZED -> Icons.Default.Warning
+                                    PdfCompressionUiStatus.VALIDATION_FAILED -> Icons.Default.ErrorOutline
+                                },
                                 contentDescription = null,
                                 tint = statusColor
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = if (metTarget) "Compressed Successfully!" else "Minimum Readable Size Reached ($actualKbStr KB)",
+                                text = uiState.title,
                                 fontWeight = FontWeight.Bold,
                                 color = statusColor
                             )
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = if (metTarget) {
-                                "New Size: $actualKbStr KB (Verified ≤ $targetMaxKb KB portal limit)"
-                            } else {
-                                "New Size: $actualKbStr KB — Exceeds $targetMaxKb KB limit. Further compression would make text unreadable; try fewer pages or a higher KB limit."
-                            },
+                            text = uiState.subtitle,
                             fontSize = 12.sp
                         )
 
@@ -1122,6 +1260,7 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
                                     val suggestedName = "compressed_${targetMaxKb}kb_${compFile.name}"
                                     saveCompressedPdfLauncher.launch(suggestedName)
                                 },
+                                enabled = uiState.isValidPdf,
                                 colors = ButtonDefaults.buttonColors(containerColor = statusColor),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.weight(1f)
@@ -1133,6 +1272,7 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
 
                             OutlinedButton(
                                 onClick = { sharePreparedFiles(context, listOf(compFile)) },
+                                enabled = uiState.isValidPdf,
                                 shape = RoundedCornerShape(8.dp)
                             ) {
                                 Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))

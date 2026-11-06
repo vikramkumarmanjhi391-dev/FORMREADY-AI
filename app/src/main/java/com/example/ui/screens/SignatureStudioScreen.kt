@@ -95,6 +95,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+const val SIGNATURE_FALLBACK_BUTTON_LABEL = "Gentle Ink Processing"
+const val SIGNATURE_FALLBACK_TOAST_MESSAGE = "Applied gentle ink processing (resize & KB rules applied)"
+
 data class SignaturePreset(
     val title: String,
     val type: DocumentType,
@@ -605,7 +608,7 @@ fun SignatureStudioScreen(
 
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        // 1-Tap Restore Original (Natural Ink, Gentle Threshold) Fallback Button
+                        // 1-Tap Gentle Ink Processing (Soft Threshold, Preserved Ink Color) Fallback Button
                         OutlinedButton(
                             onClick = {
                                 preserveInkColor = true
@@ -613,7 +616,7 @@ fun SignatureStudioScreen(
                                 inkThreshold = 245
                                 sourceBitmap?.let { bmp ->
                                     triggerOneClickSignaturePrepare(bmp, currentMediaInput)
-                                    Toast.makeText(context, "Restored natural unfiltered ink strokes!", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, SIGNATURE_FALLBACK_TOAST_MESSAGE, Toast.LENGTH_SHORT).show()
                                 }
                             },
                             modifier = Modifier.fillMaxWidth().testTag("restore_original_signature_btn"),
@@ -621,7 +624,7 @@ fun SignatureStudioScreen(
                         ) {
                             Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Restore Natural Ink (No Hard Filter)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text(SIGNATURE_FALLBACK_BUTTON_LABEL, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
 
                         Spacer(modifier = Modifier.height(8.dp))
