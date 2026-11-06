@@ -14,8 +14,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      -       - name: Checkout latest main source
         uses: actions/checkout@v7
+        with:
+          ref: main
 
       - name: Set up Java 17
         uses: actions/setup-java@v6
