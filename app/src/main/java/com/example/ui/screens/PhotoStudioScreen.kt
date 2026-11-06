@@ -683,6 +683,63 @@ fun PhotoStudioScreen(
 
                         Spacer(modifier = Modifier.height(8.dp))
 
+                        // 1-Tap Restore Original (Unfiltered) Fallback Button
+                        OutlinedButton(
+                            onClick = {
+                                autoWhiteBackground = false
+                                colorMode = ColorMode.COLOUR
+                                sourceBitmap?.let { bmp ->
+                                    val w = customWidthPx.toIntOrNull()?.coerceAtLeast(50) ?: 350
+                                    val h = customHeightPx.toIntOrNull()?.coerceAtLeast(50) ?: 450
+                                    coroutineScope.launch {
+                                        isProcessing = true
+                                        val unfilteredRule = DocumentRule(
+                                            id = "photo_unfiltered_${System.currentTimeMillis()}",
+                                            documentType = DocumentType.PASSPORT_PHOTO,
+                                            allowedFormats = listOf(selectedFormat),
+                                            minKb = targetMinKb,
+                                            maxKb = targetMaxKb,
+                                            exactWidthPx = w,
+                                            exactHeightPx = h,
+                                            dpi = customDpi,
+                                            targetAspectRatio = selectedCropRatio.ratio ?: (w.toFloat() / h.toFloat()),
+                                            requiresWhiteBackground = false,
+                                            requiresNameAndDateStrip = addNameDateStrip,
+                                            colorMode = ColorMode.COLOUR
+                                        )
+                                        val cropRect = if (currentMediaInput?.isFromCamera == true) {
+                                            CameraCaptureMode.PASSPORT_PHOTO.guideCropRectNorm
+                                        } else null
+                                        processedResult = OneClickPreparationCoordinator.autoPreparePhoto(
+                                            context = context,
+                                            input = currentMediaInput,
+                                            rule = unfilteredRule,
+                                            preDecodedBitmap = bmp,
+                                            candidateName = candidateName,
+                                            dateOfPhoto = dateOfPhoto,
+                                            customTargetKb = targetMaxKb,
+                                            customWidthPx = w,
+                                            customHeightPx = h,
+                                            enforceProportional = lockAspectRatio,
+                                            cropRectNorm = cropRect,
+                                            removeBackgroundToWhite = false,
+                                            customDpi = customDpi
+                                        )
+                                        isProcessing = false
+                                        Toast.makeText(context, "Restored original unfiltered background!", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("restore_original_photo_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Restore Original Background (No Filter)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
                         OutlinedButton(
                             onClick = {
                                 coroutineScope.launch(Dispatchers.IO) {

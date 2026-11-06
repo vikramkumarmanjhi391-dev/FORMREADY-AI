@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -86,6 +87,7 @@ import com.example.processing.PdfProcessor
 import com.example.ui.components.PortalPresetSelectorBar
 import com.example.ui.theme.EmeraldTertiary
 import com.example.ui.theme.NavyPrimary
+import com.example.ui.theme.SaffronSecondary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -1071,25 +1073,45 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
             }
 
             compressedPdfFile?.let { compFile ->
+                val metTarget = PdfProcessor.isPdfWithinTargetKb(compFile, targetMaxKb)
+                val statusColor = if (metTarget) EmeraldTertiary else SaffronSecondary
+                val cardBg = if (metTarget) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
+                val actualKbStr = String.format(Locale.US, "%.1f", compFile.length() / 1024.0)
+
                 Spacer(modifier = Modifier.height(16.dp))
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("compressed_pdf_result_card"),
                     shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldTertiary)
+                    colors = CardDefaults.cardColors(containerColor = cardBg),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, statusColor)
                 ) {
                     Column(modifier = Modifier.padding(14.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldTertiary)
+                            Icon(
+                                imageVector = if (metTarget) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = statusColor
+                            )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Compressed Successfully!", fontWeight = FontWeight.Bold, color = EmeraldTertiary)
+                            Text(
+                                text = if (metTarget) "Compressed Successfully!" else "Minimum Readable Size Reached ($actualKbStr KB)",
+                                fontWeight = FontWeight.Bold,
+                                color = statusColor
+                            )
                         }
                         Spacer(modifier = Modifier.height(6.dp))
-                        Text("New Size: ${String.format(Locale.US, "%.1f", compFile.length() / 1024.0)} KB (Below $targetMaxKb KB limit)", fontSize = 12.sp)
+                        Text(
+                            text = if (metTarget) {
+                                "New Size: $actualKbStr KB (Verified ≤ $targetMaxKb KB portal limit)"
+                            } else {
+                                "New Size: $actualKbStr KB — Exceeds $targetMaxKb KB limit. Further compression would make text unreadable; try fewer pages or a higher KB limit."
+                            },
+                            fontSize = 12.sp
+                        )
 
                         if (saveStatusMessage != null) {
                             Spacer(modifier = Modifier.height(4.dp))
-                            Text("✓ $saveStatusMessage", fontSize = 11.sp, color = EmeraldTertiary, fontWeight = FontWeight.Bold)
+                            Text("✓ $saveStatusMessage", fontSize = 11.sp, color = statusColor, fontWeight = FontWeight.Bold)
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
@@ -1100,7 +1122,7 @@ fun CompressPdfSection(defaultTargetMaxKb: Int = 300) {
                                     val suggestedName = "compressed_${targetMaxKb}kb_${compFile.name}"
                                     saveCompressedPdfLauncher.launch(suggestedName)
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                colors = ButtonDefaults.buttonColors(containerColor = statusColor),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {

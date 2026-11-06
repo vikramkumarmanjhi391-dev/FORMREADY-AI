@@ -301,21 +301,30 @@ object ImageProcessor {
             dpi = targetDpi
         )
 
-        // 10. Write actual file to cache directory
+        // 10. Write actual file to cache directory with dual JFIF APP0 + EXIF DPI metadata
         val fileName = "formready_${rule.documentType.name.lowercase()}_${System.currentTimeMillis()}.${chosenFormat.extension}"
         val docsDir = File(context.cacheDir, "prepared_docs").apply { mkdirs() }
         val outputFile = File(docsDir, fileName)
+        var wasPaddedFinal = compressionResult.wasPaddedToMinKb
 
         withContext(Dispatchers.IO) {
             FileOutputStream(outputFile).use { it.write(compressionResult.bytes) }
         }
 
-        // Measure actual disk file size
+        // Measure actual disk file size and decode final written image for truthful validation
         val actualBytes = outputFile.length()
         val actualSizeKb = actualBytes / 1024.0
         val finalWidth = compressionResult.finalWidth
         val finalHeight = compressionResult.finalHeight
         val finalAspectRatio = if (finalHeight > 0) finalWidth.toFloat() / finalHeight.toFloat() else 1.0f
+
+        val isSigOrDoc = rule.documentType != com.example.data.model.DocumentType.PASSPORT_PHOTO &&
+            rule.documentType != com.example.data.model.DocumentType.POSTCARD_PHOTO
+        val whitenessReport = measureBackgroundWhiteness(
+            bitmap = scaled,
+            isSignatureOrDocument = isSigOrDoc
+        )
+        val measuredWhiteBackground = whitenessReport.isWhiteBackground
 
         // 11. Rigorous Validation against Rule
         val validationMessages = mutableListOf<String>()
@@ -334,8 +343,8 @@ object ImageProcessor {
             validationMessages.add("File size verified: ${String.format(Locale.US, "%.1f", actualSizeKb)} KB (Allowed: $targetMinKb - $targetMaxKb KB)")
         }
 
-        if (compressionResult.wasPaddedToMinKb) {
-            validationMessages.add("Auto-KB Engine: Safe JPEG buffer padding applied to satisfy minimum $targetMinKb KB portal requirement.")
+        if (wasPaddedFinal) {
+            validationMessages.add("Auto-KB Note: JPEG comment metadata padding applied to reach minimum $targetMinKb KB.")
         }
 
         if (reqExactW != null && reqExactH != null) {
@@ -354,8 +363,12 @@ object ImageProcessor {
             validationMessages.add("Resolution: $finalWidth x $finalHeight px @ $targetDpi DPI (Aspect Ratio: ${String.format(Locale.US, "%.2f", finalAspectRatio)})")
         }
 
-        if (shouldApplyWhiteBg || rule.requiresWhiteBackground) {
-            validationMessages.add("Background verified: Pure White (#FFFFFF) studio compliance.")
+        if (rule.requiresWhiteBackground || shouldApplyWhiteBg) {
+            if (measuredWhiteBackground) {
+                validationMessages.add("Background verified: Measured white background (${(whitenessReport.whitePixelRatio * 100).toInt()}% pure white, avg lum ${whitenessReport.meanLuminance}/255).")
+            } else {
+                validationMessages.add("Background Warning: Measured background whiteness is ${(whitenessReport.whitePixelRatio * 100).toInt()}% (Pure White #FFFFFF required by rule).")
+            }
         }
 
         if (hasConflict && conflictReason != null) {
@@ -381,8 +394,105 @@ object ImageProcessor {
             hasConflict = hasConflict,
             conflictReason = conflictReason,
             dpi = targetDpi,
-            wasPaddedToMinKb = compressionResult.wasPaddedToMinKb,
-            hasWhiteBackground = shouldApplyWhiteBg || rule.requiresWhiteBackground
+            wasPaddedToMinKb = wasPaddedFinal,
+            hasWhiteBackground = measuredWhiteBackground
+        )
+    }
+
+    data class BackgroundWhitenessReport(
+        val isWhiteBackground: Boolean,
+        val whitePixelRatio: Float,
+        val meanLuminance: Int
+    )
+
+    /**
+     * Evaluates actual background pixels (either via an explicit [backgroundMask] where true = background,
+     * or across the non-subject background region) to determine honestly whether the image has a white background.
+     */
+    fun measureBackgroundWhiteness(
+        bitmap: Bitmap,
+        isSignatureOrDocument: Boolean = false,
+        backgroundMask: BooleanArray? = null
+    ): BackgroundWhitenessReport {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) {
+            return BackgroundWhitenessReport(false, 0f, 0)
+        }
+
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        var bgCount = 0
+        var whiteCount = 0
+        var lumSum = 0L
+
+        val headCenterX = width * 0.50f
+        val headCenterY = height * 0.42f
+        val headRadiusX = width * 0.32f
+        val headRadiusY = height * 0.34f
+        val shoulderCenterY = height * 0.88f
+        val shoulderRadiusX = width * 0.46f
+        val shoulderRadiusY = height * 0.28f
+
+        // Exclude bottom 18% if a Name & Date strip could be present on portraits
+        val maxPortraitY = (height * 0.80f).toInt().coerceAtLeast(1)
+
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val idx = y * width + x
+                val isBgPixel = when {
+                    backgroundMask != null && backgroundMask.size == pixels.size -> backgroundMask[idx]
+                    isSignatureOrDocument -> {
+                        // For signatures/documents, sample outer 18% margin frame + background canvas
+                        val inOuterMargin = x < width * 0.15f || x >= width * 0.85f ||
+                            y < height * 0.18f || y >= height * 0.82f
+                        inOuterMargin
+                    }
+                    else -> {
+                        // For portraits, sample the background region outside the head/shoulder silhouette
+                        if (y >= maxPortraitY) {
+                            false
+                        } else {
+                            val dxH = (x - headCenterX) / headRadiusX
+                            val dyH = (y - headCenterY) / headRadiusY
+                            val distH = dxH * dxH + dyH * dyH
+                            val dxS = (x - headCenterX) / shoulderRadiusX
+                            val dyS = (y - shoulderCenterY) / shoulderRadiusY
+                            val distS = if (y >= headCenterY) (dxS * dxS + dyS * dyS) else 99f
+                            kotlin.math.min(distH, distS) > 1.25f
+                        }
+                    }
+                }
+
+                if (isBgPixel) {
+                    val c = pixels[idx]
+                    val r = Color.red(c)
+                    val g = Color.green(c)
+                    val b = Color.blue(c)
+                    val lum = ((r * 299 + g * 587 + b * 114) / 1000)
+                    val maxChromaDiff = maxOf(r, g, b) - minOf(r, g, b)
+
+                    bgCount++
+                    lumSum += lum
+                    if (r >= 232 && g >= 232 && b >= 232 && maxChromaDiff <= 20) {
+                        whiteCount++
+                    }
+                }
+            }
+        }
+
+        if (bgCount == 0) {
+            return BackgroundWhitenessReport(false, 0f, 0)
+        }
+
+        val whiteRatio = whiteCount.toFloat() / bgCount.toFloat()
+        val meanLum = (lumSum / bgCount).toInt()
+        val isWhite = whiteRatio >= 0.78f && meanLum >= 238
+        return BackgroundWhitenessReport(
+            isWhiteBackground = isWhite,
+            whitePixelRatio = whiteRatio,
+            meanLuminance = meanLum
         )
     }
 
@@ -900,8 +1010,9 @@ object ImageProcessor {
     }
 
     /**
-     * Injects exact DPI (e.g., 300 DPI or 600 DPI) into the JPEG JFIF APP0 segment header
-     * so portals like NSDL and UTI PAN validate the exact resolution metadata.
+     * Injects exact DPI (e.g., 200 DPI, 300 DPI, or 600 DPI) into BOTH the JPEG JFIF APP0 segment header
+     * AND the EXIF APP1 (TIFF IFD0 XResolution, YResolution, ResolutionUnit=2) segment so portals that
+     * inspect either JFIF or EXIF headers validate the exact resolution metadata.
      */
     fun injectJfifDpiHeader(jpegBytes: ByteArray, dpi: Int): ByteArray {
         if (jpegBytes.size < 20) return jpegBytes
@@ -911,44 +1022,95 @@ object ImageProcessor {
         val hi = ((safeDpi shr 8) and 0xFF).toByte()
         val lo = (safeDpi and 0xFF).toByte()
 
-        // Search for "JFIF\0" within first 64 bytes
-        val limit = kotlin.math.min(jpegBytes.size - 10, 64)
+        // 1. Update existing JFIF APP0 if present, or prepare a standard 18-byte APP0 segment
+        var working = jpegBytes.copyOf()
+        var foundJfif = false
+        val limit = kotlin.math.min(working.size - 12, 512)
         for (i in 2 until limit) {
-            if (jpegBytes[i] == 'J'.code.toByte() &&
-                jpegBytes[i + 1] == 'F'.code.toByte() &&
-                jpegBytes[i + 2] == 'I'.code.toByte() &&
-                jpegBytes[i + 3] == 'F'.code.toByte() &&
-                jpegBytes[i + 4] == 0.toByte()
+            if (working[i] == 'J'.code.toByte() &&
+                working[i + 1] == 'F'.code.toByte() &&
+                working[i + 2] == 'I'.code.toByte() &&
+                working[i + 3] == 'F'.code.toByte() &&
+                working[i + 4] == 0.toByte()
             ) {
-                val out = jpegBytes.copyOf()
-                // Offset +7 from 'J' is units (1 = dots per inch)
-                // Offset +8..9 is Xdensity, +10..11 is Ydensity
-                out[i + 7] = 1.toByte()
-                out[i + 8] = hi
-                out[i + 9] = lo
-                out[i + 10] = hi
-                out[i + 11] = lo
-                return out
+                working[i + 7] = 1.toByte() // Units = 1 (dots per inch)
+                working[i + 8] = hi
+                working[i + 9] = lo
+                working[i + 10] = hi
+                working[i + 11] = lo
+                foundJfif = true
+                break
             }
         }
 
-        // If no JFIF segment was present, insert a standard 18-byte APP0 JFIF segment right after SOI (FF D8)
-        val app0 = byteArrayOf(
-            0xFF.toByte(), 0xE0.toByte(),
-            0x00, 0x10, // Length = 16
-            'J'.code.toByte(), 'F'.code.toByte(), 'I'.code.toByte(), 'F'.code.toByte(), 0x00,
-            0x01, 0x01, // Version 1.1
-            0x01,       // Units = 1 (DPI)
-            hi, lo,     // Xdensity
-            hi, lo,     // Ydensity
-            0x00, 0x00  // No thumbnail
-        )
-        val combined = ByteArray(jpegBytes.size + app0.size)
-        combined[0] = jpegBytes[0]
-        combined[1] = jpegBytes[1]
-        System.arraycopy(app0, 0, combined, 2, app0.size)
-        System.arraycopy(jpegBytes, 2, combined, 2 + app0.size, jpegBytes.size - 2)
+        if (!foundJfif) {
+            val app0 = byteArrayOf(
+                0xFF.toByte(), 0xE0.toByte(),
+                0x00, 0x10, // Length = 16
+                'J'.code.toByte(), 'F'.code.toByte(), 'I'.code.toByte(), 'F'.code.toByte(), 0x00,
+                0x01, 0x01, // Version 1.1
+                0x01,       // Units = 1 (DPI)
+                hi, lo,     // Xdensity
+                hi, lo,     // Ydensity
+                0x00, 0x00  // No thumbnail
+            )
+            val withApp0 = ByteArray(working.size + app0.size)
+            withApp0[0] = working[0]
+            withApp0[1] = working[1]
+            System.arraycopy(app0, 0, withApp0, 2, app0.size)
+            System.arraycopy(working, 2, withApp0, 2 + app0.size, working.size - 2)
+            working = withApp0
+        }
+
+        // 2. Inject or update standard EXIF APP1 segment (TIFF IFD0 with XResolution, YResolution, ResolutionUnit=2)
+        val app1Exif = buildExifApp1DpiSegment(safeDpi)
+        // Insert APP1 right after APP0 (at offset 20 if standard 18-byte APP0 follows 2-byte SOI)
+        val insertPos = if (working.size >= 20 && working[2] == 0xFF.toByte() && working[3] == 0xE0.toByte()) {
+            val app0Len = ((working[4].toInt() and 0xFF) shl 8) or (working[5].toInt() and 0xFF)
+            (2 + 2 + app0Len).coerceAtMost(working.size)
+        } else {
+            2
+        }
+
+        val combined = ByteArray(working.size + app1Exif.size)
+        System.arraycopy(working, 0, combined, 0, insertPos)
+        System.arraycopy(app1Exif, 0, combined, insertPos, app1Exif.size)
+        System.arraycopy(working, insertPos, combined, insertPos + app1Exif.size, working.size - insertPos)
         return combined
+    }
+
+    /**
+     * Builds a standards-compliant 76-byte JPEG APP1 Exif segment containing a Big-Endian ("MM")
+     * TIFF IFD0 with XResolution (0x011A), YResolution (0x011B), and ResolutionUnit (0x0128 = 2 / Inches).
+     */
+    private fun buildExifApp1DpiSegment(dpi: Int): ByteArray {
+        val hi = ((dpi shr 8) and 0xFF).toByte()
+        val lo = (dpi and 0xFF).toByte()
+        return byteArrayOf(
+            // APP1 Marker + Length (74 = 0x004A)
+            0xFF.toByte(), 0xE1.toByte(),
+            0x00, 0x4A,
+            // Exif Header ("Exif\0\0")
+            'E'.code.toByte(), 'x'.code.toByte(), 'i'.code.toByte(), 'f'.code.toByte(), 0x00, 0x00,
+            // TIFF Header (offset 0..7): Big-Endian "MM", magic 42, IFD0 at offset 8
+            'M'.code.toByte(), 'M'.code.toByte(),
+            0x00, 0x2A,
+            0x00, 0x00, 0x00, 0x08,
+            // IFD0 Entry Count = 3 (offset 8..9)
+            0x00, 0x03,
+            // Entry 1 (offset 10..21): Tag 0x011A (XResolution), Type 5 (RATIONAL), Count 1, Value Offset 50 (0x32)
+            0x01, 0x1A, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x32,
+            // Entry 2 (offset 22..33): Tag 0x011B (YResolution), Type 5 (RATIONAL), Count 1, Value Offset 58 (0x3A)
+            0x01, 0x1B, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3A,
+            // Entry 3 (offset 34..45): Tag 0x0128 (ResolutionUnit), Type 3 (SHORT), Count 1, Value = 2 (Inches)
+            0x01, 0x28, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00,
+            // Next IFD Offset = 0 (offset 46..49)
+            0x00, 0x00, 0x00, 0x00,
+            // XResolution Rational (offset 50..57): dpi / 1
+            0x00, 0x00, hi, lo, 0x00, 0x00, 0x00, 0x01,
+            // YResolution Rational (offset 58..65): dpi / 1
+            0x00, 0x00, hi, lo, 0x00, 0x00, 0x00, 0x01
+        )
     }
 
     /**
@@ -956,7 +1118,7 @@ object ImageProcessor {
      */
     fun readJfifDpiHeader(jpegBytes: ByteArray): Int? {
         if (jpegBytes.size < 20) return null
-        val limit = kotlin.math.min(jpegBytes.size - 12, 64)
+        val limit = kotlin.math.min(jpegBytes.size - 12, 4096)
         for (i in 2 until limit) {
             if (jpegBytes[i] == 'J'.code.toByte() &&
                 jpegBytes[i + 1] == 'F'.code.toByte() &&
@@ -972,6 +1134,80 @@ object ImageProcessor {
             }
         }
         return null
+    }
+
+    /**
+     * Reads the EXIF XResolution DPI tag from a JPEG file on disk (via ExifInterface or APP1 TIFF IFD0),
+     * or returns null if absent.
+     */
+    fun readExifDpi(file: File): Int? {
+        if (!file.exists()) return null
+        try {
+            val exif = ExifInterface(file.absolutePath)
+            val rational = exif.getAttribute(ExifInterface.TAG_X_RESOLUTION)
+            if (!rational.isNullOrBlank()) {
+                val parsed = if (rational.contains("/")) {
+                    val parts = rational.split("/")
+                    val num = parts[0].trim().toDoubleOrNull()
+                    val den = parts.getOrNull(1)?.trim()?.toDoubleOrNull()?.takeIf { it > 0.0 } ?: 1.0
+                    if (num != null) (num / den).toInt().takeIf { it > 0 } else null
+                } else {
+                    rational.trim().toDoubleOrNull()?.toInt()?.takeIf { it > 0 }
+                }
+                if (parsed != null) return parsed
+            }
+        } catch (_: Exception) {
+        }
+
+        // Fallback: parse APP1 "Exif\0\0" Big-Endian TIFF IFD0 XResolution (tag 0x011A) directly from file bytes
+        return try {
+            val bytes = file.readBytes()
+            val limit = kotlin.math.min(bytes.size - 64, 4096)
+            for (i in 2 until limit) {
+                if (bytes[i] == 'E'.code.toByte() &&
+                    bytes[i + 1] == 'x'.code.toByte() &&
+                    bytes[i + 2] == 'i'.code.toByte() &&
+                    bytes[i + 3] == 'f'.code.toByte() &&
+                    bytes[i + 4] == 0.toByte() &&
+                    bytes[i + 5] == 0.toByte()
+                ) {
+                    val tiffStart = i + 6
+                    if (tiffStart + 58 <= bytes.size &&
+                        bytes[tiffStart] == 'M'.code.toByte() &&
+                        bytes[tiffStart + 1] == 'M'.code.toByte()
+                    ) {
+                        val entryCount = ((bytes[tiffStart + 8].toInt() and 0xFF) shl 8) or (bytes[tiffStart + 9].toInt() and 0xFF)
+                        for (e in 0 until entryCount) {
+                            val entryPos = tiffStart + 10 + (e * 12)
+                            if (entryPos + 12 <= bytes.size) {
+                                val tag = ((bytes[entryPos].toInt() and 0xFF) shl 8) or (bytes[entryPos + 1].toInt() and 0xFF)
+                                if (tag == 0x011A) { // XResolution
+                                    val valOffset = ((bytes[entryPos + 8].toInt() and 0xFF) shl 24) or
+                                        ((bytes[entryPos + 9].toInt() and 0xFF) shl 16) or
+                                        ((bytes[entryPos + 10].toInt() and 0xFF) shl 8) or
+                                        (bytes[entryPos + 11].toInt() and 0xFF)
+                                    val ratPos = tiffStart + valOffset
+                                    if (ratPos + 8 <= bytes.size) {
+                                        val num = ((bytes[ratPos].toInt() and 0xFF) shl 24) or
+                                            ((bytes[ratPos + 1].toInt() and 0xFF) shl 16) or
+                                            ((bytes[ratPos + 2].toInt() and 0xFF) shl 8) or
+                                            (bytes[ratPos + 3].toInt() and 0xFF)
+                                        val den = (((bytes[ratPos + 4].toInt() and 0xFF) shl 24) or
+                                            ((bytes[ratPos + 5].toInt() and 0xFF) shl 16) or
+                                            ((bytes[ratPos + 6].toInt() and 0xFF) shl 8) or
+                                            (bytes[ratPos + 7].toInt() and 0xFF)).coerceAtLeast(1)
+                                        return (num / den).takeIf { it > 0 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**

@@ -157,56 +157,108 @@ object PdfProcessor {
     }
 
     /**
-     * Compresses a PDF file down to a target KB limit by rendering pages
-     * to bitmaps and re-encoding at optimized resolution and compression.
+     * Checks whether a generated or compressed PDF file actually meets the requested maximum KB limit on disk.
+     */
+    fun isPdfWithinTargetKb(pdfFile: File, targetMaxKb: Int): Boolean {
+        if (!pdfFile.exists() || targetMaxKb <= 0) return false
+        return pdfFile.length() in 1L..(targetMaxKb * 1024L)
+    }
+
+    /**
+     * Compresses a PDF file toward a target KB limit by iteratively stepping through
+     * resolution scales and JPEG re-encoding passes until `outFile.length() <= targetMaxKb * 1024L`
+     * or the minimum readable floor is reached.
      */
     suspend fun compressPdfToTargetKb(
         context: Context,
         inputPdfFile: File,
         targetMaxKb: Int
     ): File = withContext(Dispatchers.IO) {
+        val targetMaxBytes = targetMaxKb.coerceAtLeast(10) * 1024L
+        val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
+        val outFile = File(outDir, "compressed_${targetMaxKb}kb_${inputPdfFile.name}")
+
+        // Candidate (scale, jpegQuality) steps ordered from highest visual fidelity to minimum readable floor
+        val compressionSteps = listOf(
+            1.75f to 85,
+            1.40f to 75,
+            1.15f to 65,
+            0.95f to 55,
+            0.80f to 45,
+            0.65f to 36
+        )
+
         val pfd = ParcelFileDescriptor.open(inputPdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
         val renderer = PdfRenderer(pfd)
         val pageCount = renderer.pageCount
 
-        val renderedBitmaps = mutableListOf<Bitmap>()
-        // Calculate target scale depending on page count and target KB
-        val targetDpiScale = when {
-            targetMaxKb <= 100 -> 1.0f // ~72-96 DPI
-            targetMaxKb <= 300 -> 1.5f // ~120-150 DPI
-            else -> 2.0f // ~180-200 DPI
+        try {
+            var smallestCandidateBytes: ByteArray? = null
+
+            for ((scale, jpegQuality) in compressionSteps) {
+                val renderedBitmaps = mutableListOf<Bitmap>()
+                for (i in 0 until pageCount) {
+                    val page = renderer.openPage(i)
+                    val w = (page.width * scale).toInt().coerceAtLeast(200)
+                    val h = (page.height * scale).toInt().coerceAtLeast(280)
+                    val rawBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    rawBmp.eraseColor(Color.WHITE)
+                    page.render(rawBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                    page.close()
+
+                    // Re-encode page bitmap through JPEG at jpegQuality to strip high-frequency noise
+                    val jpegBaos = ByteArrayOutputStream()
+                    rawBmp.compress(Bitmap.CompressFormat.JPEG, jpegQuality, jpegBaos)
+                    val jpegBytes = jpegBaos.toByteArray()
+                    val quantizedBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size) ?: rawBmp
+                    renderedBitmaps.add(quantizedBmp)
+                }
+
+                val pdfDoc = PdfDocument()
+                try {
+                    renderedBitmaps.forEachIndexed { idx, bmp ->
+                        val pageW = (A4_WIDTH_POINTS * scale.coerceAtMost(1.0f)).toInt().coerceAtLeast(360)
+                        val pageH = (A4_HEIGHT_POINTS * scale.coerceAtMost(1.0f)).toInt().coerceAtLeast(509)
+                        val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, idx + 1).create()
+                        val pdfPage = pdfDoc.startPage(pageInfo)
+                        pdfPage.canvas.drawColor(Color.WHITE)
+                        val dest = Rect(0, 0, pageW, pageH)
+                        pdfPage.canvas.drawBitmap(bmp, null, dest, Paint(Paint.FILTER_BITMAP_FLAG))
+                        pdfDoc.finishPage(pdfPage)
+                    }
+
+                    val pdfBaos = ByteArrayOutputStream()
+                    pdfDoc.writeTo(pdfBaos)
+                    val pdfBytes = pdfBaos.toByteArray()
+
+                    if (smallestCandidateBytes == null || pdfBytes.size < smallestCandidateBytes!!.size) {
+                        smallestCandidateBytes = pdfBytes
+                    }
+
+                    if (pdfBytes.size <= targetMaxBytes) {
+                        break
+                    }
+                } finally {
+                    try {
+                        pdfDoc.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+
+            val finalBytes = smallestCandidateBytes ?: inputPdfFile.readBytes()
+            FileOutputStream(outFile).use { it.write(finalBytes) }
+            outFile
+        } finally {
+            try {
+                renderer.close()
+            } catch (_: Exception) {
+            }
+            try {
+                pfd.close()
+            } catch (_: Exception) {
+            }
         }
-
-        for (i in 0 until pageCount) {
-            val page = renderer.openPage(i)
-            val w = (page.width * targetDpiScale).toInt()
-            val h = (page.height * targetDpiScale).toInt()
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            bmp.eraseColor(Color.WHITE)
-            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
-            page.close()
-            renderedBitmaps.add(bmp)
-        }
-        renderer.close()
-        pfd.close()
-
-        // Write to new PDF with compressed bitmaps
-        val pdfDoc = PdfDocument()
-        renderedBitmaps.forEachIndexed { idx, bmp ->
-            val pageInfo = PdfDocument.PageInfo.Builder(A4_WIDTH_POINTS, A4_HEIGHT_POINTS, idx + 1).create()
-            val page = pdfDoc.startPage(pageInfo)
-            page.canvas.drawColor(Color.WHITE)
-            val dest = Rect(0, 0, A4_WIDTH_POINTS, A4_HEIGHT_POINTS)
-            page.canvas.drawBitmap(bmp, null, dest, Paint(Paint.FILTER_BITMAP_FLAG))
-            pdfDoc.finishPage(page)
-        }
-
-        val outDir = File(context.cacheDir, "prepared_pdfs").apply { mkdirs() }
-        val outFile = File(outDir, "compressed_${targetMaxKb}kb_${inputPdfFile.name}")
-        FileOutputStream(outFile).use { pdfDoc.writeTo(it) }
-        pdfDoc.close()
-
-        outFile
     }
 
     /**

@@ -1,6 +1,6 @@
 {
-  "summary": "Comprehensive implementation plan for upgrading FormReady AI with a 100% on-device (₹0 server cost) 1-Click Smart Camera & Auto-Processing Engine across Photo, Signature, and Document sections, including NSDL/UTI PAN & Exam Portal Presets, Exact Min-Max KB Guarantee (with safe JPEG padding and 300 DPI JFIF header injection), Photo+Signature Joint Combiner, A4/4x6 Printable Passport Sheet Generator, and GitHub JSON Preset Sync.",
-  "updatedAt": "2026-11-05T10:28:43.490244469Z",
+  "summary": "Revised Master Development Roadmap (Phases 0 to 10) incorporating all 9 audit corrections: workflow-specific PAN rules (Protean 200 DPI DSC vs UTIITSL physical vs unverified legacy), TFLite model metadata & mask-coverage vs probability confidence distinction, two-stage CameraX ViewPort + guide-rect mapping with null fallback, known-aspect-ratio document perspective rectification, strict separation of Phase 0 and Phase 1, PDF physical print sheets, Locker metadata & KeyInfo security level checks, 18+ AdMob/Play Console eligibility, and SHA-256 file audit provenance.",
+  "updatedAt": "2026-11-06T07:20:17.616806496Z",
   "requestFeedback": true,
   "userFacing": true
 }

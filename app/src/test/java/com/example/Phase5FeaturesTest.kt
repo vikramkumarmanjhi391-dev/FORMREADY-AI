@@ -583,5 +583,78 @@ class Phase5FeaturesTest {
         assertTrue(docBundle.pdfFile.exists())
         assertTrue(docBundle.jpgResult.fileSizeBytes <= 200 * 1024L)
     }
+
+    @Test
+    fun testPhase0HonestBackgroundWhitenessMeasurementAndDualDpiMetadata() = runBlocking {
+        // 1. Create a photo with a dark blue background (non-white)
+        val nonWhiteBgPhoto = createSampleBitmap(400, 500, Color.BLUE)
+        val whiteRequiredRule = DocumentRule(
+            id = "phase0_honest_bg_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 10,
+            maxKb = 60,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 200,
+            requiresWhiteBackground = true
+        )
+
+        // Process WITHOUT background removal -> measured hasWhiteBackground MUST be false (never echoed from rule)
+        val unfilteredResult = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = nonWhiteBgPhoto,
+            rule = whiteRequiredRule,
+            removeBackgroundToWhite = false,
+            customDpi = 200
+        )
+
+        assertFalse(
+            "ProcessedFileResult.hasWhiteBackground must be false when actual background is blue",
+            unfilteredResult.hasWhiteBackground
+        )
+        assertTrue(
+            "Validation messages must warn when background is not white",
+            unfilteredResult.validationMessages.any { it.contains("Background Warning", ignoreCase = true) }
+        )
+
+        // 2. Verify BOTH JFIF APP0 header AND EXIF XResolution/YResolution are written at 200 DPI
+        val outFile = File(unfilteredResult.processedFilePath)
+        val jfifDpi = com.example.processing.ImageProcessor.readJfifDpiHeader(outFile.readBytes())
+        val exifDpi = com.example.processing.ImageProcessor.readExifDpi(outFile)
+        assertEquals(200, jfifDpi)
+        assertEquals(200, exifDpi)
+
+        // 3. Process a light-background portrait with background whitening -> measured hasWhiteBackground MUST be true
+        val studioLightPhoto = createSampleBitmap(400, 500, Color.rgb(245, 245, 245))
+        val whitenedResult = com.example.processing.ImageProcessor.processImageForRule(
+            context = context,
+            originalBitmap = studioLightPhoto,
+            rule = whiteRequiredRule,
+            removeBackgroundToWhite = true,
+            customDpi = 300
+        )
+        assertTrue(
+            "ProcessedFileResult.hasWhiteBackground must be true when background pixels are pure white",
+            whitenedResult.hasWhiteBackground
+        )
+        val whitenedFile = File(whitenedResult.processedFilePath)
+        assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(whitenedFile.readBytes()))
+        assertEquals(300, com.example.processing.ImageProcessor.readExifDpi(whitenedFile))
+    }
+
+    @Test
+    fun testPhase0PdfTargetSizeVerificationHonesty() = runBlocking {
+        val samplePdf = PdfProcessor.createPdfFromBitmaps(
+            context = context,
+            bitmaps = listOf(createSampleBitmap(600, 800, Color.WHITE)),
+            outputFileName = "phase0_size_check.pdf"
+        )
+        assertTrue(samplePdf.exists())
+        // Should be well under 300 KB
+        assertTrue(PdfProcessor.isPdfWithinTargetKb(samplePdf, 300))
+        // Should be false for an impossible 0 KB target
+        assertFalse(PdfProcessor.isPdfWithinTargetKb(samplePdf, 0))
+    }
 }
 

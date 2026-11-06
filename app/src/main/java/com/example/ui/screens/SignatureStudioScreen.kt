@@ -605,6 +605,27 @@ fun SignatureStudioScreen(
 
                         Spacer(modifier = Modifier.height(8.dp))
 
+                        // 1-Tap Restore Original (Natural Ink, Gentle Threshold) Fallback Button
+                        OutlinedButton(
+                            onClick = {
+                                preserveInkColor = true
+                                contrastFactor = 1.0f
+                                inkThreshold = 245
+                                sourceBitmap?.let { bmp ->
+                                    triggerOneClickSignaturePrepare(bmp, currentMediaInput)
+                                    Toast.makeText(context, "Restored natural unfiltered ink strokes!", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("restore_original_signature_btn"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Restore Natural Ink (No Hard Filter)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
                         OutlinedButton(
                             onClick = {
                                 coroutineScope.launch(Dispatchers.IO) {
