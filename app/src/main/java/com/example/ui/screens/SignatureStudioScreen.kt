@@ -154,6 +154,8 @@ fun SignatureStudioScreen(
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
+    var showAdjustSheet by remember { mutableStateOf(false) }
+    var userPreviewAccepted by remember { mutableStateOf(true) }
 
     LaunchedEffect(initialRule) {
         if (initialRule != null) {
@@ -187,9 +189,9 @@ fun SignatureStudioScreen(
                 requiresWhiteBackground = true
             )
 
-            // When captured from the in-app camera's horizontal cutout window, auto-crop strictly to the cutout box first
+            // Use calibrated CameraViewportMapper sensor crop when captured from in-app camera
             val guideCrop = if (mediaInput?.isFromCamera == true) {
-                mediaInput.mode.guideCropRectNorm
+                mediaInput.mappedSensorCropRectNorm ?: mediaInput.mode.guideCropRectNorm
             } else null
 
             processedResult = OneClickPreparationCoordinator.autoPrepareSignature(
@@ -206,7 +208,8 @@ fun SignatureStudioScreen(
                 preserveInkColor = preserveInkColor,
                 enforceProportional = true,
                 cropRectNorm = guideCrop,
-                customDpi = customDpi
+                customDpi = customDpi,
+                userPreviewAccepted = userPreviewAccepted
             )
             isProcessing = false
         }
@@ -300,6 +303,32 @@ fun SignatureStudioScreen(
         }
     }
 
+    if (showAdjustSheet) {
+        com.example.ui.components.SignatureStudioAdjustBottomSheet(
+            customWidthPx = customWidthPx,
+            onWidthChange = { customWidthPx = it },
+            customHeightPx = customHeightPx,
+            onHeightChange = { customHeightPx = it },
+            targetMinKb = targetMinKb,
+            targetMaxKb = targetMaxKb,
+            onTargetMaxKbChange = { targetMaxKb = it },
+            customDpi = customDpi,
+            onDpiChange = { customDpi = it },
+            preserveInkColor = preserveInkColor,
+            onPreserveInkColorChange = { preserveInkColor = it },
+            autoCropBlankMargins = autoCropBlankMargins,
+            onToggleAutoCropMargins = { autoCropBlankMargins = it },
+            contrastFactor = contrastFactor,
+            onContrastFactorChange = { contrastFactor = it },
+            inkThreshold = inkThreshold,
+            onInkThresholdChange = { inkThreshold = it },
+            onApplyAndReprocess = {
+                sourceBitmap?.let { triggerOneClickSignaturePrepare(it, currentMediaInput) }
+            },
+            onDismiss = { showAdjustSheet = false }
+        )
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -309,17 +338,34 @@ fun SignatureStudioScreen(
         item {
             Spacer(modifier = Modifier.height(12.dp))
 
-            Text(
-                text = "1-Click Signature & Thumb Studio",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = "Camera cutout auto-crop, adaptive shadow whitening (#FFFFFF), Black/Blue ink toggle, and Exact Min-Max KB padding.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Signature & Thumb Studio",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "${customWidthPx}×${customHeightPx} px • $customDpi DPI • $targetMinKb–$targetMaxKb KB",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                OutlinedButton(
+                    onClick = { showAdjustSheet = true },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("open_sign_adjust_sheet_btn")
+                ) {
+                    Text("Adjust", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
 
             Spacer(modifier = Modifier.height(12.dp))
 

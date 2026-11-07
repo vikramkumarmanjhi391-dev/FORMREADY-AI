@@ -65,7 +65,9 @@ object OfficialDomainAllowlist {
         val daysSinceLastCheck: Long?,
         val isInternalReviewDue: Boolean,
         val effectiveStatus: VerificationStatus,
-        val provenanceSummary: String
+        val provenanceSummary: String,
+        val isOfficialDomain: Boolean = isOfficialDomainVerified,
+        val reviewNote: String? = if (isInternalReviewDue) provenanceSummary else null
     )
 
     fun extractHost(url: String): String {
@@ -132,8 +134,10 @@ object OfficialDomainAllowlist {
      */
     fun evaluatePortalProvenance(
         portal: PortalSpec,
-        referenceEpochMs: Long = System.currentTimeMillis()
+        referenceEpochMs: Long = System.currentTimeMillis(),
+        nowEpochMs: Long = referenceEpochMs
     ): PortalProvenanceReport {
+        val effectiveNowMs = if (nowEpochMs != referenceEpochMs) nowEpochMs else referenceEpochMs
         val host = extractHost(portal.officialUrl)
         val domainVerified = isVerifiedOfficialUrl(portal.officialUrl)
         val hasMetadata = portal.sourceDocumentTitle.isNotBlank() &&
@@ -141,8 +145,8 @@ object OfficialDomainAllowlist {
             portal.lastVerifiedDate.isNotBlank()
 
         val verifiedEpoch = parseVerifiedDateEpochMs(portal.lastVerifiedDate)
-        val daysElapsed = if (verifiedEpoch != null && referenceEpochMs >= verifiedEpoch) {
-            TimeUnit.MILLISECONDS.toDays(referenceEpochMs - verifiedEpoch)
+        val daysElapsed = if (verifiedEpoch != null && effectiveNowMs >= verifiedEpoch) {
+            TimeUnit.MILLISECONDS.toDays(effectiveNowMs - verifiedEpoch)
         } else {
             null
         }

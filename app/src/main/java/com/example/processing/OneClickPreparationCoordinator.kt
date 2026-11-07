@@ -59,9 +59,7 @@ object OneClickPreparationCoordinator {
         val visionResult = PortraitVisionProcessor.analyzeAndPreparePortrait(
             sourceBitmap = bitmap,
             rule = rule,
-            targetWidthPx = w,
-            targetHeightPx = h,
-            replaceBackgroundWithWhite = removeBackgroundToWhite || rule.requiresWhiteBackground,
+            applyWhiteBackground = removeBackgroundToWhite || rule.requiresWhiteBackground,
             manualCropRectNorm = effectiveCropRectNorm,
             faceEngine = faceEngine,
             segmentationEngine = segmentationEngine

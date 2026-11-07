@@ -366,26 +366,24 @@ fun MainScreen() {
             onDismissRequest = { showAppInfoDialog = false },
             title = {
                 Text(
-                    text = "About FormReady AI",
+                    text = "About & Privacy — FormReady AI",
                     fontWeight = FontWeight.Bold
                 )
             },
             text = {
                 Column {
                     Text(
-                        text = "Smart Document & Application Studio for Indian Recruitment & Competitive Examinations.",
+                        text = "On-Device Document & Application Preparation Suite",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.primary
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "• Built specifically for UPSC, SSC, BPSC, RRB Railways, IBPS Banking, NTA JEE/NEET, Bihar RTPS, Passport Seva, and state recruitment portals.\n" +
-                                "• Automatically enforces exact pixel dimensions, aspect ratios, file formats, and strict KB ranges.\n" +
-                                "• Smart signature blank-space trimmer and paper contrast whitening.\n" +
-                                "• Multi-page certificate PDF generator & compressor.\n" +
-                                "• Hardware AES-GCM Encrypted Document Vault with persistent Room storage.\n" +
-                                "• Custom folders and encrypted quick notes for seamless organization.",
+                        text = "• On-Device Image & Document Privacy: All user photos, signatures, thumb impressions, and documents are processed and stored locally on your device. User documents are never uploaded to Google or any external cloud server.\n" +
+                                "• Google ML Kit Terms of Service: Portrait face detection and foreground segmentation use bundled Google ML Kit components governed by the Google ML Kit Terms of Service (https://developers.google.com/ml-kit/terms). Per Google's documentation, the ML Kit SDK may contact Google servers periodically for service configuration, compatibility checks, and operational/performance telemetry.\n" +
+                                "• Open-Source Libraries: CameraX, Jetpack Compose, Room, Coroutines, Security-Crypto, OkHttp, and Moshi are used under the Apache License 2.0.\n" +
+                                "• Hardware AES-GCM Encrypted Document Vault with local Room database storage.",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

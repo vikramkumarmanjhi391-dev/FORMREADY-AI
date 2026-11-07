@@ -58,7 +58,18 @@ object PortraitVisionProcessor {
         val leftEyeNorm: PointF? = null,
         val rightEyeNorm: PointF? = null,
         val eulerZDegrees: Float = 0f
-    )
+    ) {
+        constructor(
+            boundingBox: RectF,
+            headEulerAngleZ: Float = 0f,
+            headEulerAngleY: Float = 0f
+        ) : this(
+            boundingBoxNorm = boundingBox,
+            leftEyeNorm = null,
+            rightEyeNorm = null,
+            eulerZDegrees = headEulerAngleZ
+        )
+    }
 
     data class SegmentationConfidenceMask(
         val width: Int,
@@ -66,11 +77,17 @@ object PortraitVisionProcessor {
         val confidences: FloatArray // 0.0f (background) .. 1.0f (foreground)
     )
 
-    interface FaceDetectionEngine {
+    fun RawSegmentationMask(
+        width: Int,
+        height: Int,
+        confidences: FloatArray
+    ): SegmentationConfidenceMask = SegmentationConfidenceMask(width, height, confidences)
+
+    fun interface FaceDetectionEngine {
         suspend fun detectFaces(bitmap: Bitmap): List<DetectedFaceInfo>
     }
 
-    interface SelfieSegmentationEngine {
+    fun interface SelfieSegmentationEngine {
         suspend fun segmentPortrait(bitmap: Bitmap): SegmentationConfidenceMask?
     }
 
@@ -122,7 +139,10 @@ object PortraitVisionProcessor {
         val backgroundMask: BooleanArray?,
         val framingProfile: PortraitFramingProfile,
         val diagnosticMessage: String
-    )
+    ) {
+        val preparedBitmap: Bitmap
+            get() = croppedPortraitBitmap
+    }
 
     @Volatile
     private var faceDetectorInitialized = false

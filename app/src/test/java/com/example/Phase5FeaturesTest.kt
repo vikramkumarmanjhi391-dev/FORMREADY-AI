@@ -1177,6 +1177,346 @@ class Phase5FeaturesTest {
         assertFalse("Caller photo must not be recycled by createPrintablePassportSheet", callerPhoto.isRecycled)
         assertTrue(File(sheetRes.processedFilePath).exists())
     }
+
+    @Test
+    fun testPhase1CameraViewportMapperFrontRearRotationsAndAspectRatios() {
+        val guideRect = android.graphics.RectF(0.20f, 0.15f, 0.80f, 0.85f)
+
+        // 1. Rear camera, 90° portrait rotation, 4:3 sensor (4000x3000 -> upright 3000x4000) on 20:9 screen (1080x2400)
+        val rearConfig = com.example.camera.CameraViewportMapper.ViewportMappingConfig(
+            rawSensorWidth = 4000,
+            rawSensorHeight = 3000,
+            rotationDegrees = 90,
+            previewWidth = 1080,
+            previewHeight = 2400,
+            isFrontCamera = false,
+            isSavedOutputMirrored = false
+        )
+        val visibleViewport = com.example.camera.CameraViewportMapper.computeVisibleSensorViewportPx(rearConfig)
+        // Upright sensor is 3000x4000 (aspect 0.75). Preview is 1080x2400 (aspect 0.45).
+        // Since sensor is wider than preview, FILL_CENTER keeps full height (4000) and crops width to 4000 * 0.45 = 1800
+        // centered at (3000 - 1800) / 2 = 600..2400
+        assertEquals(600f, visibleViewport.left, 2f)
+        assertEquals(2400f, visibleViewport.right, 2f)
+        assertEquals(0f, visibleViewport.top, 2f)
+        assertEquals(4000f, visibleViewport.bottom, 2f)
+
+        val rearSensorNorm = com.example.camera.CameraViewportMapper.mapPreviewRectToSensorNormalizedRect(
+            previewRectNorm = guideRect,
+            config = rearConfig
+        )
+        // Guide left = 0.20 of visible 1800px = 600 + 360 = 960 -> 960 / 3000 = 0.32
+        // Guide right = 0.80 of visible 1800px = 600 + 1440 = 2040 -> 2040 / 3000 = 0.68
+        assertEquals(0.32f, rearSensorNorm.left, 0.01f)
+        assertEquals(0.68f, rearSensorNorm.right, 0.01f)
+        assertEquals(0.15f, rearSensorNorm.top, 0.01f)
+        assertEquals(0.85f, rearSensorNorm.bottom, 0.01f)
+
+        // 2. Front camera with horizontal preview mirroring vs asymmetrical guide rect
+        val asymGuide = android.graphics.RectF(0.10f, 0.20f, 0.40f, 0.70f)
+        val frontConfig = rearConfig.copy(isFrontCamera = true, isSavedOutputMirrored = false)
+        val frontSensorNorm = com.example.camera.CameraViewportMapper.mapPreviewRectToSensorNormalizedRect(
+            previewRectNorm = asymGuide,
+            config = frontConfig
+        )
+        // Mirrored horizontally inside visible [600..2400]: [0.60..0.90] of 1800px -> [1680..2220] / 3000 = [0.56..0.74]
+        assertEquals(0.56f, frontSensorNorm.left, 0.01f)
+        assertEquals(0.74f, frontSensorNorm.right, 0.01f)
+
+        // 3. Test all 4 rotations (0°, 90°, 180°, 270°) raw sensor coordinate mapping
+        for (rot in listOf(0, 90, 180, 270)) {
+            val rawRect = com.example.camera.CameraViewportMapper.mapUprightNormalizedRectToRawSensorRect(
+                uprightRectNorm = rearSensorNorm,
+                rotationDegrees = rot
+            )
+            assertTrue("Raw rect must be valid for rotation $rot", rawRect.left < rawRect.right && rawRect.top < rawRect.bottom)
+            assertTrue(rawRect.left >= 0f && rawRect.right <= 1f && rawRect.top >= 0f && rawRect.bottom <= 1f)
+        }
+    }
+
+    @Test
+    fun testPhase1OfficialDomainAllowlistAndNonDestructive180DayReview() {
+        val officialUpsc = com.example.data.portal.PortalDatabase.OFFICIAL_PORTALS.first { it.id == "upsc_cse" }
+        val upscEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
+            portal = officialUpsc,
+            nowEpochMs = com.example.data.portal.OfficialDomainAllowlist.parseVerifiedDateEpochMs("2025-03-01")!!
+        )
+        assertTrue(upscEval.isOfficialDomain)
+        assertFalse(upscEval.isInternalReviewDue)
+        assertEquals(com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED, upscEval.effectiveStatus)
+
+        // 180-day threshold check: 250 days after lastVerifiedDate -> triggers internal review note ONLY,
+        // preserving OFFICIALLY_VERIFIED status and keeping all DocumentRule specs intact!
+        val futureEpoch = com.example.data.portal.OfficialDomainAllowlist.parseVerifiedDateEpochMs("2025-11-15")!!
+        val reviewDueEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
+            portal = officialUpsc,
+            nowEpochMs = futureEpoch
+        )
+        assertTrue("More than 180 days since check should flag internal review due", reviewDueEval.isInternalReviewDue)
+        assertNotNull(reviewDueEval.reviewNote)
+        assertEquals(
+            "180-day internal review threshold must NOT invalidate an official portal's verified status",
+            com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED,
+            reviewDueEval.effectiveStatus
+        )
+        assertTrue(officialUpsc.documents.isNotEmpty())
+
+        // Non-official https:// domain must NEVER be granted OFFICIALLY_VERIFIED
+        val fakeDomainPortal = officialUpsc.copy(
+            id = "fake_blog_portal",
+            officialUrl = "https://exam-tricks-blog.example.com/upsc-rules",
+            verificationStatus = com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED
+        )
+        val fakeEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(fakeDomainPortal)
+        assertFalse(fakeEval.isOfficialDomain)
+        assertEquals(
+            "Unverified third-party domain must be downgraded from OFFICIALLY_VERIFIED",
+            com.example.data.model.VerificationStatus.UNVERIFIED_RULE,
+            fakeEval.effectiveStatus
+        )
+    }
+
+    @Test
+    fun testPhase2PortraitVisionFramingAnd6PartBackgroundVerification() = runBlocking {
+        val portraitBmp = createTexturedSubjectBitmap(400, 500, Color.rgb(210, 215, 225))
+        val strictWhiteRule = DocumentRule(
+            id = "phase2_strict_white_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 5,
+            maxKb = 100,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            minHeadHeightRatio = 0.55f,
+            maxHeadHeightRatio = 0.68f,
+            topHeadroomRatio = 0.11f
+        )
+
+        val mockFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine { _ ->
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBox = android.graphics.RectF(
+                        0.28f,
+                        0.18f,
+                        0.72f,
+                        0.66f
+                    ),
+                    headEulerAngleZ = 2.0f,
+                    headEulerAngleY = 1.0f
+                )
+            )
+        }
+
+        // Case 1: High-confidence segmentation mask (core subject 0.96, background 0.02, very narrow transition edge)
+        val highConfidenceSegEngine = com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { bmp ->
+            val w = bmp.width
+            val h = bmp.height
+            val mask = FloatArray(w * h) { idx ->
+                val x = idx % w
+                val y = idx / w
+                val inSubject = x in (w * 0.22).toInt()..(w * 0.78).toInt() &&
+                    y in (h * 0.16).toInt()..(h * 0.95).toInt()
+                if (inSubject) 0.96f else 0.02f
+            }
+            com.example.processing.PortraitVisionProcessor.RawSegmentationMask(w, h, mask)
+        }
+
+        // 1A. High confidence + userPreviewAccepted = true -> verifiedBackgroundCompliance = true & SUCCESS_PREPARED
+        val acceptedResult = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = strictWhiteRule,
+            preDecodedBitmap = portraitBmp,
+            removeBackgroundToWhite = true,
+            userPreviewAccepted = true,
+            faceEngine = mockFaceEngine,
+            segmentationEngine = highConfidenceSegEngine
+        )
+        assertNotNull(acceptedResult)
+        assertTrue(acceptedResult!!.segmentationExecuted)
+        assertTrue(acceptedResult.backgroundReplacementApplied)
+        assertTrue(acceptedResult.outputBackgroundPixelChecksPassed)
+        assertTrue(acceptedResult.subjectMaskConfidence >= 0.80f)
+        assertTrue(acceptedResult.edgeUncertaintyRatio <= 0.18f)
+        assertTrue(acceptedResult.userPreviewAccepted)
+        assertTrue(acceptedResult.verifiedBackgroundCompliance)
+        assertTrue(acceptedResult.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, acceptedResult.status)
+
+        // 1B. High confidence + userPreviewAccepted = false -> verifiedBackgroundCompliance = false & BACKGROUND_UNVERIFIED
+        val unacceptedResult = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = strictWhiteRule,
+            preDecodedBitmap = portraitBmp,
+            removeBackgroundToWhite = true,
+            userPreviewAccepted = false,
+            faceEngine = mockFaceEngine,
+            segmentationEngine = highConfidenceSegEngine
+        )
+        assertNotNull(unacceptedResult)
+        assertTrue(unacceptedResult!!.segmentationExecuted)
+        assertFalse(unacceptedResult.userPreviewAccepted)
+        assertFalse("Unaccepted preview must NOT set verifiedBackgroundCompliance = true", unacceptedResult.verifiedBackgroundCompliance)
+        assertFalse(unacceptedResult.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, unacceptedResult.status)
+        assertEquals("PREVIEW_NOT_ACCEPTED", unacceptedResult.backgroundVerificationState)
+
+        // Case 2: Ambiguous boundary segmentation mask (large fraction of pixels in 0.20..0.80 uncertainty band)
+        val uncertainEdgeSegEngine = com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { bmp ->
+            val w = bmp.width
+            val h = bmp.height
+            val mask = FloatArray(w * h) { idx ->
+                val x = idx % w
+                val y = idx / w
+                when {
+                    x < w * 0.18 || x > w * 0.82 || y < h * 0.14 -> 0.03f // background
+                    x in (w * 0.35).toInt()..(w * 0.65).toInt() && y in (h * 0.30).toInt()..(h * 0.80).toInt() -> 0.92f // core
+                    else -> 0.50f // wide uncertain boundary halo (> 18% of subject)
+                }
+            }
+            com.example.processing.PortraitVisionProcessor.RawSegmentationMask(w, h, mask)
+        }
+
+        val uncertainResult = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = strictWhiteRule,
+            preDecodedBitmap = portraitBmp,
+            removeBackgroundToWhite = true,
+            userPreviewAccepted = true,
+            faceEngine = mockFaceEngine,
+            segmentationEngine = uncertainEdgeSegEngine
+        )
+        assertNotNull(uncertainResult)
+        assertTrue(uncertainResult!!.edgeUncertaintyRatio > 0.18f)
+        assertFalse(
+            "High edge uncertainty must NOT set verifiedBackgroundCompliance = true",
+            uncertainResult.verifiedBackgroundCompliance
+        )
+        assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, uncertainResult.status)
+        assertEquals("LOW_MASK_CONFIDENCE", uncertainResult.backgroundVerificationState)
+    }
+
+    @Test
+    fun testPhase3ASignatureSauvolaAdaptiveShadowRemovalAndFallback() {
+        // 1. Create a synthetic signature image with a strong illumination shadow gradient across paper
+        // and blue pen strokes in the center
+        val width = 320
+        val height = 140
+        val shadowedSigBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                // Paper luminance drops from 235 on the left to 145 on the right (heavy phone shadow)
+                val paperLum = (235 - (x.toFloat() / width.toFloat()) * 90f).toInt().coerceIn(120, 245)
+                val isStroke = (y in 52..62 && x in 45..270 && ((x + y) % 7 != 0)) ||
+                    (y in 70..76 && x in 80..230)
+                if (isStroke) {
+                    // Blue ballpoint ink darker than local paper
+                    val inkR = (paperLum * 0.18f).toInt()
+                    val inkG = (paperLum * 0.25f).toInt()
+                    val inkB = (paperLum * 0.65f).toInt()
+                    shadowedSigBmp.setPixel(x, y, Color.rgb(inkR, inkG, inkB))
+                } else {
+                    shadowedSigBmp.setPixel(x, y, Color.rgb(paperLum, paperLum, paperLum))
+                }
+            }
+        }
+
+        val sauvolaRes = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            src = shadowedSigBmp,
+            preserveInkColor = true,
+            trimToInkBounds = true
+        )
+        assertFalse("Valid signature under shadow gradient must not trigger fallback", sauvolaRes.usedGentleFallback)
+        assertTrue("Ink pixel ratio should be within plausible signature bounds", sauvolaRes.inkPixelRatio in 0.005f..0.35f)
+        assertTrue("Cropped width should trim outer blank margins", sauvolaRes.cleanedBitmap.width < width)
+        assertTrue("Cropped height should trim outer blank margins", sauvolaRes.cleanedBitmap.height < height)
+
+        // Verify background pixels in cleanedBitmap are pure white (#FFFFFF)
+        val whiteness = com.example.processing.ImageProcessor.measureBackgroundWhiteness(
+            bitmap = sauvolaRes.cleanedBitmap,
+            isSignatureOrDocument = true,
+            backgroundMask = sauvolaRes.backgroundMask
+        )
+        assertTrue("Sauvola background must be verified pure white", whiteness.verifiedBackgroundCompliance)
+        assertTrue(whiteness.exactWhitePixelRatio >= 0.95f)
+
+        // 2. Blank paper image -> triggers gentle fallback safely
+        val blankBmp = createSampleBitmap(200, 100, Color.rgb(240, 240, 240))
+        val fallbackRes = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            src = blankBmp,
+            preserveInkColor = true,
+            trimToInkBounds = true
+        )
+        assertTrue("Blank paper with 0 ink strokes must trigger gentle fallback", fallbackRes.usedGentleFallback)
+    }
+
+    @Test
+    fun testPhase3BDocument4CornerDetectionAndHomographyPerspectiveWarp() {
+        val w = 400
+        val h = 500
+        val docSceneBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+        // Angled white document quadrilateral on a dark desk background
+        val trueTl = android.graphics.PointF(0.16f * w, 0.14f * h)
+        val trueTr = android.graphics.PointF(0.86f * w, 0.18f * h)
+        val trueBr = android.graphics.PointF(0.82f * w, 0.86f * h)
+        val trueBl = android.graphics.PointF(0.12f * w, 0.82f * h)
+        val quadVerts = arrayOf(trueTl, trueTr, trueBr, trueBl)
+
+        val pixels = IntArray(w * h)
+        val deskColor = Color.rgb(35, 38, 45)
+        val paperColor = Color.rgb(248, 248, 248)
+        for (y in 0 until h) {
+            val py = y.toFloat()
+            for (x in 0 until w) {
+                val px = x.toFloat()
+                var inside = true
+                for (i in 0 until 4) {
+                    val a = quadVerts[i]
+                    val b = quadVerts[(i + 1) % 4]
+                    val cross = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x)
+                    if (cross < 0f) {
+                        inside = false
+                        break
+                    }
+                }
+                pixels[y * w + x] = if (inside) paperColor else deskColor
+            }
+        }
+        docSceneBmp.setPixels(pixels, 0, w, 0, 0, w, h)
+
+        val detection = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(docSceneBmp)
+        assertEquals(4, detection.cornersNorm.size)
+        assertTrue("Clean high-contrast angled document should achieve confidence >= 0.75 (was ${detection.confidence})", detection.confidence >= 0.75f)
+        assertTrue(detection.autoWarpEligible)
+
+        // Verify detected corners are close to the true quadrilateral corners
+        assertEquals(0.16f, detection.cornersNorm[0].x, 0.06f)
+        assertEquals(0.14f, detection.cornersNorm[0].y, 0.06f)
+        assertEquals(0.86f, detection.cornersNorm[1].x, 0.06f)
+        assertEquals(0.18f, detection.cornersNorm[1].y, 0.06f)
+
+        // Warp document perspective and verify rectified output is bright document content
+        val warped = com.example.processing.DocumentCornerProcessor.warpDocumentPerspective(
+            src = docSceneBmp,
+            cornersNorm = detection.cornersNorm,
+            targetWidthPx = 300,
+            targetHeightPx = 400
+        )
+        assertEquals(300, warped.width)
+        assertEquals(400, warped.height)
+        val centerColor = warped.getPixel(150, 200)
+        assertTrue("Center of rectified document must be bright white paper", Color.red(centerColor) >= 235)
+
+        // Uniform low-contrast image -> confidence < 0.75f (not auto-warp eligible)
+        val uniformBmp = createSampleBitmap(300, 400, Color.rgb(180, 180, 180))
+        val lowConfDetection = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(uniformBmp)
+        assertFalse("Uniform image without document edges must not be autoWarpEligible", lowConfDetection.autoWarpEligible)
+    }
 }
 
 

@@ -99,17 +99,59 @@ fun PortalStudioScreen(
     onNavigateToSign: (DocumentRule?) -> Unit
 ) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
 
     var searchQuery by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("All") }
     val categories = listOf("All", "Civil Services", "Recruitment", "Banking", "Railways", "Entrance", "RTPS / Services", "Identity")
 
-    var selectedPortalForPrep by remember { mutableStateOf<PortalSpec?>(null) }
+    var selectedPortalForDetail by remember { mutableStateOf<PortalSpec?>(null) }
+    var selectedRuleForPrepare by remember { mutableStateOf<DocumentRule?>(null) }
+
+    val preparedResultsByPortal = remember { mutableStateMapOf<String, MutableMap<String, ProcessedFileResult>>() }
+    var candidateName by remember { mutableStateOf("") }
+    var dateOfPhoto by remember {
+        mutableStateOf(java.text.SimpleDateFormat("dd-MM-yyyy", Locale.US).format(java.util.Date()))
+    }
+
     var showExtractorDialog by remember { mutableStateOf(false) }
     var showCustomPortalDialog by remember { mutableStateOf(false) }
 
-    val allPortals = remember { PortalDatabase.getAllPortals() }
+    // 1. Full-screen Per-Document Prepare Screen
+    if (selectedPortalForDetail != null && selectedRuleForPrepare != null) {
+        val activePortal = selectedPortalForDetail!!
+        val activeRule = selectedRuleForPrepare!!
+        PortalDocumentPrepareScreen(
+            portal = activePortal,
+            rule = activeRule,
+            initialCandidateName = candidateName,
+            initialDateOfPhoto = dateOfPhoto,
+            onDocumentPrepared = { result ->
+                val portalMap = preparedResultsByPortal.getOrPut(activePortal.id) { mutableStateMapOf() }
+                portalMap[activeRule.id] = result
+            },
+            onBack = { selectedRuleForPrepare = null }
+        )
+        return
+    }
+
+    // 2. Full-screen Portal Detail Screen
+    if (selectedPortalForDetail != null) {
+        val activePortal = selectedPortalForDetail!!
+        val portalResults = preparedResultsByPortal[activePortal.id] ?: emptyMap()
+        PortalDetailScreen(
+            portal = activePortal,
+            preparedResults = portalResults,
+            candidateName = candidateName,
+            onCandidateNameChange = { candidateName = it },
+            dateOfPhoto = dateOfPhoto,
+            onDateOfPhotoChange = { dateOfPhoto = it },
+            onSelectRuleToPrepare = { rule -> selectedRuleForPrepare = rule },
+            onBack = { selectedPortalForDetail = null }
+        )
+        return
+    }
+
+    val allPortals = remember(showExtractorDialog, showCustomPortalDialog) { PortalDatabase.getAllPortals() }
     val filteredPortals = allPortals.filter { portal ->
         val matchesCategory = selectedCategory == "All" || portal.category.equals(selectedCategory, ignoreCase = true)
         val matchesQuery = searchQuery.isBlank() ||
@@ -127,98 +169,82 @@ fun PortalStudioScreen(
             .testTag("portal_studio_screen")
     ) {
         item {
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            // Hero Header Card
-            Card(
+            // Clean Header Row with Title & Compact Actions
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.primary
-                )
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.padding(18.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Surface(
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.secondaryContainer,
-                            modifier = Modifier.size(38.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = Icons.Default.AutoAwesome,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Column {
-                            Text(
-                                text = "Smart Portal Requirement Engine",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimary
-                            )
-                            Text(
-                                text = "Auto-extract & prepare verified documents for any exam",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.85f)
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                            onClick = { showExtractorDialog = true },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.secondary
-                            ),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.weight(1f).testTag("ai_extractor_btn")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.AutoAwesome,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("AI Rule Extractor", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-
-                        OutlinedButton(
-                            onClick = { showCustomPortalDialog = true },
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                contentColor = MaterialTheme.colorScheme.onPrimary
-                            ),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.6f)),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.testTag("add_custom_portal_btn")
-                        ) {
-                            Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Add Portal", fontSize = 12.sp)
-                        }
-                    }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Examination & Service Portals",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Select a portal to view official rules and prepare documents",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
-            // Search Bar
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { showExtractorDialog = true },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("ai_extractor_btn")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Rule Extractor", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                }
+
+                OutlinedButton(
+                    onClick = { showCustomPortalDialog = true },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("add_custom_portal_btn")
+                ) {
+                    Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Add Custom Portal", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Compact Single-Line Search Bar
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("search_portal_input"),
-                placeholder = { Text("Search UPSC, SSC, BPSC, RRB, RTPS, Banking...") },
+                placeholder = {
+                    Text(
+                        text = "Search UPSC, SSC, BPSC, RRB, Banking...",
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                },
                 leadingIcon = {
                     Icon(imageVector = Icons.Default.Search, contentDescription = "Search")
                 },
@@ -233,9 +259,9 @@ fun PortalStudioScreen(
                 shape = RoundedCornerShape(14.dp)
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
-            // Category Chips
+            // Non-Truncated Category Filter Chips
             LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
@@ -244,30 +270,38 @@ fun PortalStudioScreen(
                     FilterChip(
                         selected = selectedCategory == category,
                         onClick = { selectedCategory = category },
-                        label = { Text(category, fontSize = 12.sp) },
-                        shape = RoundedCornerShape(20.dp)
+                        label = {
+                            Text(
+                                text = category,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        },
+                        shape = RoundedCornerShape(20.dp),
+                        modifier = Modifier.testTag("portal_category_chip_${category.lowercase().replace(" ", "_")}")
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             Text(
-                text = "Available Examination & Service Portals (${filteredPortals.size})",
-                style = MaterialTheme.typography.titleSmall,
+                text = "Portals (${filteredPortals.size})",
+                style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
         }
 
-        items(filteredPortals) { portal ->
+        items(filteredPortals, key = { it.id }) { portal ->
             PortalCard(
                 portal = portal,
                 isSelected = false,
-                onClick = { selectedPortalForPrep = portal },
-                onPrepareClick = { selectedPortalForPrep = portal }
+                onClick = { selectedPortalForDetail = portal },
+                onPrepareClick = { selectedPortalForDetail = portal }
             )
         }
 
@@ -276,24 +310,14 @@ fun PortalStudioScreen(
         }
     }
 
-    // Modal: One-Click Application Preparation
-    selectedPortalForPrep?.let { portal ->
-        OneClickPreparationDialog(
-            portal = portal,
-            onDismiss = { selectedPortalForPrep = null },
-            onNavigateToPhoto = onNavigateToPhoto,
-            onNavigateToSign = onNavigateToSign
-        )
-    }
-
-    // Dialog: AI Rule Extractor
+    // Dialog: Rule Extractor
     if (showExtractorDialog) {
         RuleExtractorDialog(
             onDismiss = { showExtractorDialog = false },
             onRulesExtracted = { newPortal ->
                 PortalDatabase.addCustomPortal(newPortal)
                 showExtractorDialog = false
-                selectedPortalForPrep = newPortal
+                selectedPortalForDetail = newPortal
                 Toast.makeText(context, "Extracted rules for ${newPortal.examOrServiceName}!", Toast.LENGTH_SHORT).show()
             }
         )
@@ -306,7 +330,7 @@ fun PortalStudioScreen(
             onAddPortal = { portal ->
                 PortalDatabase.addCustomPortal(portal)
                 showCustomPortalDialog = false
-                selectedPortalForPrep = portal
+                selectedPortalForDetail = portal
             }
         )
     }

@@ -184,6 +184,8 @@ fun PhotoStudioScreen(
     var saveStatusMessage by remember { mutableStateOf<String?>(null) }
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
+    var showAdjustSheet by remember { mutableStateOf(false) }
+    var userPreviewAccepted by remember { mutableStateOf(true) }
 
     // Apply initialRule if navigated from Portals tab
     LaunchedEffect(initialRule) {
@@ -221,9 +223,9 @@ fun PhotoStudioScreen(
                 colorMode = colorMode
             )
 
-            // If captured from in-app camera, crop to passport guide frame first if needed
+            // Use calibrated CameraViewportMapper sensor crop when captured from in-app camera
             val cropRect = if (mediaInput?.isFromCamera == true) {
-                CameraCaptureMode.PASSPORT_PHOTO.guideCropRectNorm
+                mediaInput.mappedSensorCropRectNorm ?: CameraCaptureMode.PASSPORT_PHOTO.guideCropRectNorm
             } else null
 
             processedResult = OneClickPreparationCoordinator.autoPreparePhoto(
@@ -239,7 +241,8 @@ fun PhotoStudioScreen(
                 enforceProportional = lockAspectRatio,
                 cropRectNorm = cropRect,
                 removeBackgroundToWhite = autoWhiteBackground,
-                customDpi = customDpi
+                customDpi = customDpi,
+                userPreviewAccepted = userPreviewAccepted
             )
             isProcessing = false
         }
@@ -358,6 +361,46 @@ fun PhotoStudioScreen(
         }
     }
 
+    if (showAdjustSheet) {
+        com.example.ui.components.PhotoStudioAdjustBottomSheet(
+            customWidthPx = customWidthPx,
+            onWidthChange = { customWidthPx = it },
+            customHeightPx = customHeightPx,
+            onHeightChange = { customHeightPx = it },
+            lockAspectRatio = lockAspectRatio,
+            onToggleLockAspect = { lockAspectRatio = !lockAspectRatio },
+            targetMinKb = targetMinKb,
+            targetMaxKb = targetMaxKb,
+            onTargetMaxKbChange = { targetMaxKb = it },
+            customDpi = customDpi,
+            onDpiChange = { customDpi = it },
+            selectedFormat = selectedFormat,
+            onFormatChange = { selectedFormat = it },
+            autoWhiteBackground = autoWhiteBackground,
+            onToggleWhiteBackground = { autoWhiteBackground = it },
+            addNameDateStrip = addNameDateStrip,
+            onToggleNameDateStrip = { addNameDateStrip = it },
+            candidateName = candidateName,
+            onCandidateNameChange = { candidateName = it },
+            dateOfPhoto = dateOfPhoto,
+            onDateOfPhotoChange = { dateOfPhoto = it },
+            showFaceGuideOverlay = showFaceGuideOverlay,
+            onToggleFaceGuide = { showFaceGuideOverlay = it },
+            onCreateJointPhotoSign = if (sourceBitmap != null) {
+                {
+                    showAdjustSheet = false
+                    jointSignaturePickerLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                }
+            } else null,
+            onApplyAndReprocess = {
+                sourceBitmap?.let { triggerOneClickAutoPrepare(it, currentMediaInput) }
+            },
+            onDismiss = { showAdjustSheet = false }
+        )
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -367,17 +410,34 @@ fun PhotoStudioScreen(
         item {
             Spacer(modifier = Modifier.height(12.dp))
 
-            Text(
-                text = "1-Click Passport & Portal Photo Studio",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = "100% On-Device AI: Auto face-crop, pure #FFFFFF white background, Name & Date strip, 300 DPI & exact KB guarantee.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Passport & Portal Photo Studio",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "${customWidthPx}×${customHeightPx} px • $customDpi DPI • $targetMinKb–$targetMaxKb KB",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                OutlinedButton(
+                    onClick = { showAdjustSheet = true },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("open_photo_adjust_sheet_btn")
+                ) {
+                    Text("Adjust", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
 
             Spacer(modifier = Modifier.height(12.dp))
 

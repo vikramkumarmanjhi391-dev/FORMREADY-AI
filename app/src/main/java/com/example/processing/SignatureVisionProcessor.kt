@@ -26,6 +26,25 @@ object SignatureVisionProcessor {
         val backgroundMask: BooleanArray,
         val usedAdaptiveSauvola: Boolean,
         val fallbackReason: String? = null
+    ) {
+        val cleanedBitmap: Bitmap
+            get() = processedBitmap
+        val usedGentleFallback: Boolean
+            get() = !usedAdaptiveSauvola
+    }
+
+    fun extractSignatureOrThumb(
+        src: Bitmap,
+        preserveInkColor: Boolean = true,
+        contrastBoost: Float = 1.25f,
+        sauvolaK: Float = 0.18f,
+        trimToInkBounds: Boolean = true
+    ): SignatureExtractionResult = extractSignatureOrThumb(
+        sourceBitmap = src,
+        preserveInkColor = preserveInkColor,
+        trimMargins = trimToInkBounds,
+        sauvolaK = sauvolaK,
+        contrastBoost = contrastBoost
     )
 
     /**

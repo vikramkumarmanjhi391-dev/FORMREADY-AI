@@ -39,6 +39,12 @@ object DocumentCornerProcessor {
     ) {
         fun toPointsList(): List<PointF> = listOf(topLeft, topRight, bottomRight, bottomLeft)
 
+        val cornersNorm: List<PointF>
+            get() = toPointsList()
+
+        val autoWarpEligible: Boolean
+            get() = !requiresUserConfirmation
+
         companion object {
             fun defaultInsetFrame(marginNorm: Float = 0.07f): DocumentQuadNorm {
                 val m = marginNorm.coerceIn(0.02f, 0.25f)
@@ -289,6 +295,29 @@ object DocumentCornerProcessor {
         }
         val edgeRatio = if (totalSamples > 0) edgeHits.toFloat() / totalSamples.toFloat() else 0f
         return (geometryScore * 0.45f + edgeRatio * 0.55f).coerceIn(0f, 1f)
+    }
+
+    fun warpDocumentPerspective(
+        src: Bitmap,
+        cornersNorm: List<PointF>,
+        targetWidthPx: Int? = null,
+        targetHeightPx: Int? = null
+    ): Bitmap {
+        if (cornersNorm.size < 4) return src
+        val quad = DocumentQuadNorm(
+            topLeft = cornersNorm[0],
+            topRight = cornersNorm[1],
+            bottomRight = cornersNorm[2],
+            bottomLeft = cornersNorm[3],
+            confidence = 1f,
+            requiresUserConfirmation = false
+        )
+        return warpDocumentPerspective(
+            sourceBitmap = src,
+            quadNorm = quad,
+            targetWidthPx = targetWidthPx,
+            targetHeightPx = targetHeightPx
+        )
     }
 
     /**

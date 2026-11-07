@@ -12,6 +12,8 @@ import com.example.data.model.DocumentType
 sealed class CaptureIntent {
 
     abstract val initialMode: CameraCaptureMode
+    val captureMode: CameraCaptureMode
+        get() = initialMode
     abstract val showTaskSelector: Boolean
     abstract val targetAspectRatio: Float?
     abstract val requiresWhiteBackground: Boolean
