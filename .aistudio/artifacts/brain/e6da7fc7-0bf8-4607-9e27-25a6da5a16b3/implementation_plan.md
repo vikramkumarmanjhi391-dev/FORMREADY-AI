@@ -1,343 +1,256 @@
-# FORMREADY AI — Complete Workflow, Camera Intelligence & Premium UI/UX Re-Architecture Plan (Revised)
+# FORMREADY AI — Complete Workflow, Camera Intelligence & Premium UI/UX Re-Architecture Plan (Final Corrected Revision)
 
-Transform FORMREADY AI into a genuinely intelligent, privacy-first, on-device government application document preparation suite with task-aware camera capture, on-device portrait face/segmentation processing with honest confidence semantics, separate Sauvola signature and 4-corner document vision pipelines, a dedicated full-screen Portal Preparation workflow, and a clean Material 3 UI designed for reliable operation on a Motorola Moto G60.
+**Plan Status**: `PENDING FINAL USER REVIEW & APPROVAL` (Not Automatically Approved)
 
----
-
-## User Review & Confirmed Decisions (Including Correction Round Updates)
-
-> [!IMPORTANT]
-> This revised plan incorporates all 9 mandatory corrections from the architecture review while preserving zero code modifications during Plan Mode.
-
-- **Confirmed Decision 1 — On-Device Face & Portrait Segmentation Engine**: Use bundled **Google ML Kit Face Detection** (`com.google.mlkit:face-detection`) and **Google ML Kit Selfie Segmentation** (`com.google.mlkit:segmentation-selfie`) for local image processing, governed by explicit confidence/uncertainty semantics, accurate Google ML Kit Terms of Service disclosures, and before/after APK/AAB size measurements.
-- **Confirmed Decision 2 — Portal Preparation Workflow Structure**: Replace the cramped `OneClickPreparationDialog` modal with a **Full-Screen Portal Detail & Per-Document Preparation Workflow** (`Portals List → Portal Detail Screen → Per-Document Prepare & Verify Screen`).
-- **Confirmed Decision 3 — Photo & Signature Studio Controls Layout**: Use a **Clean Preview + Primary Action Layout with an Expandable `Adjust` Modal Bottom Sheet** for manual overrides (dimensions, DPI, lighting, ink threshold, framing, name/date strip).
+Transform FORMREADY AI into an on-device government application document preparation suite with calibrated camera viewport mapping, replaceable portrait face-detection and segmentation interfaces backed initially by bundled Google ML Kit, separate Sauvola signature and 4-corner document vision pipelines, a full-screen Portal Preparation workflow, and a clean Material 3 Studio experience with honest verification semantics.
 
 ---
 
-## 1. Baseline Inspection & Existing Feature Audit (5-Tier Classification)
+## A. Correction Audit: Previous Incorrect Claims vs. Corrected Replacements
 
-> [!NOTE]
-> **Baseline Verification Requirement**: Never assume a fixed test count without executing the test suite on the current branch state. Before any Phase 1 code change begins, the build gate must inspect the active commit (`git rev-parse HEAD`), run `gradle :app:testDebugUnitTest :app:assembleDebug`, and record the exact baseline test count and APK size in bytes.
+| # | Area | Previous Incorrect Claim / Assumption | Corrected Technical Replacement in This Plan |
+| :--- | :--- | :--- | :--- |
+| **1** | **ML Kit Dependency & APK Size Analysis** | Claimed Face Detection was ~2.4 MB per ABI, Selfie Segmentation was ~0.6 MB, and total bundled impact was ~3 MB; conflated SDK size, download size estimate, and APK/AAB sizes. | Uses Google's official Android ML Kit documentation estimates for bundled model download-size impact (**~6.9 MB** for `com.google.mlkit:face-detection`, **~4.5 MB** for `com.google.mlkit:segmentation-selfie`, **~11.4 MB** combined indicative download impact). Explicitly separates SDK wrapper size, bundled model download-size impact, Debug APK size, Release APK/AAB size, and per-ABI split size, marking all unmeasured build outputs as **Pending Actual Build Measurement**. |
+| **2** | **Motorola Moto G60 Performance Claims** | Presented fixed millisecond latency numbers (e.g., `< 200 ms`, `< 1.2 s`) as expected Moto G60 performance without hardware measurements. | Removes all unmeasured latency claims. Defines a physical Motorola Moto G60 benchmark protocol measuring cold/warm model initialization, face detection, single-image segmentation, end-to-end preparation, peak Java/native RAM, 108 MP / 32 MP large-image handling, and 15-run repeated thermal stability, requiring actual **median** and **p95** device measurements. |
+| **3** | **Background Verification Semantics** | Treated the existence of a segmentation mask plus white background replacement as sufficient to mark `verifiedBackgroundCompliance = true`. | Separates 6 distinct stages: (1) model inference execution, (2) core subject mask confidence, (3) boundary/edge uncertainty ratio in `(0.20..0.80)`, (4) white background replacement execution, (5) post-save decoded disk pixel validation, and (6) explicit user preview acceptance. Marks uncertain edges or unaccepted previews as `BACKGROUND_UNVERIFIED` with an honest warning and manual correction tools. |
+| **4** | **Licensing & Privacy / Telemetry** | Described the ML Kit SDK/models under Apache 2.0 and claimed zero network communication with Google servers. | Documents **Google ML Kit Terms of Service** (`https://developers.google.com/ml-kit/terms`) separately from Apache 2.0 open-source dependencies. Preserves 100% local on-device image/document processing with **no cloud upload of user photos or documents**, while accurately disclosing that the ML Kit SDK may contact Google servers for service configuration, compatibility checks, and operational/performance telemetry. |
+| **5** | **Portrait Face Crop Rules & Identity** | Treated `50%–70%` head-height and `8%–14%` top headroom as universal government portal rules, and claimed literal pixel-perfect facial preservation after resizing/compression. | Applies portal-specific head/headroom ratios **only** when verified from an official portal notification (`minHeadHeightRatio`, `maxHeadHeightRatio`, `topHeadroomRatio` on `DocumentRule`). Otherwise uses configurable framing defaults (`PortraitFramingProfile.DEFAULT_BALANCED`) with interactive manual crop controls. Preserves genuine facial identity (zero beautification, smoothing, or generative warping) without claiming literal pixel-for-pixel identity after resampling and JPEG encoding. |
+| **6** | **Portal Verification Governance (180-Day Rule)** | Treated 180 days since `lastVerifiedDate` as an automatic expiry or invalidation of a portal's official requirements. | Treats the 180-day threshold strictly as a **non-destructive internal review trigger** (`isInternalReviewDue = true`). Validates official provenance using an auditable domain allowlist, notification title/number, recruitment cycle, source publication/revision date, last checked date, and rule conflict checks. Older check dates trigger a review reminder without invalidating or blocking the portal's `DocumentRule` specifications. |
+| **7** | **Phase 3 Monolithic Scope** | Combined Signature/Thumb Sauvola binarization and Document 4-corner homography into a single Phase 3. | Splits into two independently testable phases: **Phase 3A** (Signature & Thumb — integral-image Sauvola adaptive thresholding, blue/black ink chroma preservation, connected-stroke bounding box) and **Phase 3B** (Documents & IDs — Sobel gradient 4-corner detection, quadrilateral confidence scoring, interactive 4-corner drag overlay, and 3×3 homography perspective warp). |
+| **8** | **Repository Baseline & Test Count Verification** | Relied on a previously written commit SHA and assumed 58 passing tests without re-inspecting the active container environment. | Re-inspected the actual workspace directly: verified that `.git` metadata is not mounted in the container (`fatal: not a git repository`), counted the exact `@Test` annotations across all 8 test classes on disk (**58 `@Test` methods total**), and preserved all Phase 0.1 fixes (strict `minKb > maxKb` conflict detection, no fake JPEG COM padding, dual JFIF+EXIF vs. PNG `pHYs` DPI verification, PDF geometry preservation, and safe `Bitmap` ownership). |
+| **9** | **Approved Product & UX Direction** | Risk of unnecessary scope drift during corrections. | Retains all approved architectural and UX decisions: bundled ML Kit Face Detection & Selfie Segmentation behind replaceable engine interfaces, full-screen `Portal Detail` and `Per-Document Prepare` screens, clean Photo/Signature Studio preview with `Adjust` modal bottom sheet, task-aware `CaptureIntent`, separate Photo/Signature/Thumb/Document pipelines, and offline-first local document processing. |
 
-Each relevant capability in the current source tree has been audited and classified as:
-1. **Fully implemented and tested**
-2. **Partially implemented**
-3. **Implemented using a fixed heuristic rather than real detection**
-4. **Not implemented**
-5. **Implemented but not reliably validated**
+---
 
-| Feature Area | Classification | Actual Code Reality & Reusable Components |
+## B. Complete Revised Architecture and Data Flow
+
+### B.1 System Architecture Diagram
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                        USER ENTRY POINTS & WORKFLOWS                           │
+│                                                                                │
+│  ┌───────────────────────┐  ┌──────────────────────┐  ┌─────────────────────┐  │
+│  │    Portals Workflow   │  │  Photo / Sign Studio │  │  Universal Camera   │  │
+│  │  Compact Portals List │  │  Clean Large Preview │  │  CaptureIntent      │  │
+│  │          │            │  │   + Primary Action   │  │   ├─ ForPortalRule  │  │
+│  │          ▼            │  │   + Preview Confirm  │  │   ├─ ForStudio      │  │
+│  │  Portal Detail Screen │  │   + Adjust Modal     │  │   └─ Generic (4-Tab │  │
+│  │          │            │  │     Bottom Sheet     │  │      Task Selector) │  │
+│  │          ▼            │  │                      │  │                     │  │
+│  │  Per-Document Prepare │  │                      │  │                     │  │
+│  └──────────┬────────────┘  └──────────┬───────────┘  └──────────┬──────────┘  │
+└─────────────┼──────────────────────────┼─────────────────────────┼─────────────┘
+              │                          │                         │
+              ▼                          ▼                         ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│              UNIFIED MEDIA INPUT & CAMERA VIEWPORT MAPPER                      │
+│  • Magic-Byte Validation + Bounded Decode (inSampleSize) + EXIF 8-Orientation  │
+│  • CameraViewportMapper: PreviewView (FILL_CENTER) ↔ Sensor Aspect Ratio       │
+│    + Display Rotation (0°/90°/180°/270°) + Front-Camera Horizontal Mirroring   │
+└────────────────────────────────────────┬───────────────────────────────────────┘
+                                         │
+                                         ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                ON-DEVICE INTELLIGENT VISION & ROUTING ENGINE                   │
+│                                                                                │
+│  ┌──────────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐  │
+│  │  Portrait Pipeline (P2)  │ │ Signature/Thumb(3A) │ │ Document / ID (3B)  │  │
+│  │ • FaceDetectionEngine    │ │ • Integral-Image    │ │ • Sobel Gradient +  │  │
+│  │   (ML Kit Bundled Impl)  │ │   Sauvola Adaptive  │ │   4-Corner Quad     │  │
+│  │ • Portal Rule Framing or │ │   Thresholding      │ │   Confidence Score  │  │
+│  │   Configurable Default   │ │ • 3×3 Despeckle +   │ │ • Interactive 4-Pt  │  │
+│  │   + Manual Crop Override │ │   Connected-Stroke  │ │   Corner Handles    │  │
+│  │ • SelfieSegmentationEng. │ │   Bounding Box Crop │ │   (when conf < 0.75 │  │
+│  │   + Alpha Edge Feather   │ │ • Blue/Black Ink    │ │   or user-invoked)  │  │
+│  │ • 6-Part Confidence &    │ │   Chroma Preserved  │ │ • 3×3 Homography    │  │
+│  │   Edge Uncertainty Audit │ │ • Gentle Fallback   │ │   Bilinear Warp     │  │
+│  └────────────┬─────────────┘ └──────────┬──────────┘ └──────────┬──────────┘  │
+└───────────────┼──────────────────────────┼───────────────────────┼─────────────┘
+                │                          │                       │
+                ▼                          ▼                       ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│            PHASE 0.1 DETERMINISTIC RULE ENFORCER & DISK VERIFIER               │
+│  • Exact / Bounded Pixel Resize • Candidate Name & DOP Strip                   │
+│  • Stepped JPEG Quality Search (Zero Fake Metadata Padding; Honest MinKB Check)│
+│  • Post-Save Disk Verification: Byte Size, Decoded Width×Height, Dual JFIF     │
+│    APP0 + EXIF DPI (or PNG pHYs), 6-Part Background Compliance, PDF Geometry   │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B.2 End-to-End Data Flow Across All Pipelines
+1. **Task-Aware Capture & Media Ingestion**:
+   - Every camera launch receives a typed `CaptureIntent` (`ForPortalRule(portalId, portalName, rule)`, `ForStudio(mode, targetAspectRatio)`, or `Generic(initialMode)`).
+   - On capture, `ImageProcessor.decodeBitmapFromUri` normalizes EXIF orientation into upright sensor coordinates, and `CameraViewportMapper.mapPreviewRectToSensorNormalizedRect()` converts the visible on-screen guide frame (`PreviewView.ScaleType.FILL_CENTER`) into exact upright sensor coordinates, reversing front-camera preview mirroring when `lensFacing == LENS_FACING_FRONT`.
+2. **Portrait Pipeline (Phase 2 — Replaceable Interfaces + 6-Part Background Verification)**:
+   - `FaceDetectionEngine` (backed by bundled ML Kit Face Detection in production and deterministic fakes in JVM unit tests) detects faces, Euler tilt angles, and bounding boxes.
+   - If the active `DocumentRule` defines verified official `minHeadHeightRatio` / `maxHeadHeightRatio` / `topHeadroomRatio`, those bounds govern the portrait crop; otherwise `PortraitFramingProfile.DEFAULT_BALANCED` computes an initial head-and-shoulders crop that the user can manually adjust.
+   - `SelfieSegmentationEngine` (backed by bundled ML Kit Selfie Segmentation) produces a per-pixel foreground probability map $p(x,y) \in [0, 1]$.
+   - Background compliance is evaluated across **6 explicit conditions**:
+     1. `segmentationExecuted`: Model inference succeeded and returned a valid confidence grid matching image dimensions.
+     2. `subjectMaskConfidence`: Core foreground confidence mean $\ge 0.80$ and foreground area ratio within $12\%..82\%$ of frame.
+     3. `edgeUncertaintyRatio`: Fraction of transition-band pixels $p(x,y) \in (0.20, 0.80)$ relative to foreground pixels is $\le 0.18$.
+     4. `backgroundReplacementApplied`: Confident background ($p < 0.20$) set to `#FFFFFF` and boundary band ($0.20 \le p \le 0.80$) smoothly alpha-composited over `#FFFFFF`.
+     5. `outputBackgroundPixelChecksPassed`: Post-save decoded image on disk has $\ge 85\%$ near-white pixels ($\text{R,G,B} \ge 240$, chroma diff $\le 15$) and mean luminance $\ge 242$ across the segmented background mask.
+     6. `userPreviewAccepted`: The user has inspected and accepted the processed preview in the UI.
+   - Only when **all 6 conditions** pass does `verifiedBackgroundCompliance` become `true`. If `edgeUncertaintyRatio > 0.18` or `userPreviewAccepted == false`, the result stays in `PreparationStatus.BACKGROUND_UNVERIFIED` with an honest warning and one-tap options to adjust crop or keep the original background.
+3. **Signature & Thumb Pipeline (Phase 3A)**:
+   - `SignatureVisionProcessor` computes 64-bit integral images ($S$ and $S_{sq}$) to run local Sauvola adaptive thresholding ($T(x,y) = \mu(x,y) \cdot [1 + k \cdot (\frac{\sigma(x,y)}{R} - 1)]$), eliminating uneven paper shadows while preserving blue or black ink chroma.
+   - Isolated 1–2 px dust specks are filtered via 3×3 neighborhood density checks before computing the connected-stroke bounding box with configurable breathing margins.
+   - If detected ink coverage falls outside plausible bounds ($< 0.15\%$ or $> 45\%$), the processor falls back to gentle contrast normalization and marks `usedGentleFallback = true`.
+4. **Document & ID Card Pipeline (Phase 3B)**:
+   - `DocumentCornerProcessor` computes Sobel gradients and local contrast to locate the 4 outer corners of an angled document or ID card (`TL, TR, BR, BL`) and scores quadrilateral confidence ($0.0..1.0$) using area coverage, convexity, aspect plausibility, and edge gradient strength.
+   - If confidence $\ge 0.75$, perspective rectification runs automatically via an 8-DOF homography solver (`solveHomography` + bilinear inverse mapping); if confidence $< 0.75$ or the user taps **Adjust Corners**, `InteractiveCornerCropOverlay` lets the user drag the 4 corner handles before warping and generating the compliant JPG and PDF.
+
+---
+
+## C. Corrected Dependency, License, APK-Size and Performance Analysis
+
+### C.1 Dependency & Artifact Size Breakdown (Official Documentation vs. Build Measurements)
+
+| Metric / Artifact Category | `com.google.mlkit:face-detection:16.1.7` | `com.google.mlkit:segmentation-selfie:16.0.0-beta6` | Combined / Total Impact | Source / Verification Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **SDK Dependency Wrapper Size (AAR classes/manifests excluding native `.so` & model assets)** | Pending build inspection | Pending build inspection | Pending build inspection | Must be inspected from resolved Gradle AAR contents during build verification. |
+| **Bundled Model Download-Size Impact (Official Google Docs Estimate)** | **~6.9 MB** (statically linked bundled model) | **~4.5 MB** (statically linked bundled model) | **~11.4 MB** indicative download-size increase | Official Google ML Kit Android Documentation ([Face Detection Android](https://developers.google.com/ml-kit/vision/face-detection/android), [Selfie Segmentation Android](https://developers.google.com/ml-kit/vision/selfie-segmentation/android)). Documentation estimate only, not a guaranteed final APK/AAB byte delta. |
+| **Baseline Debug APK Size (Before ML Kit)** | N/A | N/A | **`26,495,618` bytes (~26.50 MB)** | Measured on the Phase 0.1 baseline `app-debug.apk` prior to adding ML Kit dependencies. |
+| **Post-ML Kit Debug APK Size (`app-debug.apk`)** | Included | Included | **Pending actual build measurement** | Must be measured via `ls -l app/build/outputs/apk/debug/app-debug.apk` after `gradle :app:assembleDebug`. |
+| **Release APK / App Bundle Size (`app-release.aab` / `.apk`)** | Included | Included | **Pending actual build measurement** | Must be measured via `gradle :app:bundleRelease` / `:app:assembleRelease`. |
+| **Per-ABI Split Size (`arm64-v8a`, `armeabi-v7a`, `x86_64`)** | Unknown until split build | Unknown until split build | **Pending actual ABI split measurement** | No per-ABI size reduction is claimed without empirical output from APK splits or `bundletool`. |
+
+### C.2 Licensing, Terms of Service & Privacy / Telemetry Analysis
+
+| Component / Module | License / Governing Terms | Network / Telemetry Behaviour & User Data Privacy |
 | :--- | :--- | :--- |
-| **CameraX Lifecycle & `getCameraProvider()`** | **1. Fully implemented and tested** | `UniversalCameraController` uses `suspendCancellableCoroutine`, safe lens fallback, flash hardware detection, tap-to-focus metering, and temporary file cleanup. Reuse directly. |
-| **Unified Media Input & EXIF Orientation** | **1. Fully implemented and tested** | `UnifiedMediaInput` + `ImageProcessor.decodeBitmapFromUri` / `decodeBitmapWithExif` validate magic bytes, apply `inSampleSize` bounds protection, and normalize all 8 EXIF orientations. Reuse directly. |
-| **Post-Save Disk Compliance, DPI & Min/Max KB Verification** | **1. Fully implemented and tested** | `ImageProcessor.processImageForRule` verifies actual saved file bytes, dimensions, JFIF APP0 + EXIF DPI, PNG `pHYs` limitations, and `minKb > maxKb` conflicts without fake JPEG COM padding, while recycling intermediate bitmaps safely. Reuse directly. |
-| **Encrypted Document Locker & Room Vault** | **1. Fully implemented and tested** | AES-GCM hardware-backed encryption, custom folders, search, and Vault Notes. Keep untouched. |
-| **Multi-Page PDF Creation & Geometry-Preserving Compression** | **1. Fully implemented and tested** | `PdfProcessor` preserves per-page point dimensions and aspect ratios across compression steps and cleans up intermediate candidate files. Reuse directly. |
-| **Camera Preview-to-Image Coordinate Mapping** | **3. Fixed heuristic** | `CameraCaptureMode.guideCropRectNorm` crops the full sensor image using hardcoded normalized percentages (`RectF(0.14f, 0.14f, 0.86f, 0.84f)`) without accounting for `PreviewView.ScaleType.FILL_CENTER`, sensor vs. display aspect-ratio differences, 0°/90°/180°/270° rotation, or front-camera horizontal mirroring. |
-| **Camera Task Understanding (`CaptureIntent`)** | **2. Partially implemented** | `UniversalCameraScreen` accepts a `CameraCaptureMode` enum, but lacks a contextual `CaptureIntent` carrying portal `DocumentRule` parameters or a minimal task selector when opened generically. |
-| **Portrait Face Detection & Auto-Framing** | **4. Not implemented** | No face detector is integrated; portrait cropping uses center-aspect cropping or fixed `guideCropRectNorm`. |
-| **Portrait White Background Replacement & Verification** | **3. Fixed heuristic** | `applyAutoWhiteBackgroundAndFaceEnhance()` samples an 8% top/side border colour and whitens pixels outside a hardcoded head/shoulder ellipse. It is not real segmentation, and Phase 0.1 marks unmasked outputs as `BACKGROUND_UNVERIFIED`. |
-| **Signature & Thumb Content Extraction** | **3. Fixed heuristic** | `adjustSignatureLighting()` and `cropBlankMargins()` use a single global luminance threshold (`inkThreshold = 180`), which fails under uneven paper shadows where local adaptive Sauvola thresholding + connected-stroke bounds are needed. |
-| **Document 4-Corner Detection & Perspective Warp** | **4. Not implemented** | `applyMagicDocFilter()` adjusts contrast/whiteness, but angled documents and ID cards have no 4-corner quadrilateral detection, confidence scoring, interactive corner handles, or homography perspective correction. |
-| **Image Skew / 90° Rotation Content Detection** | **3. Fixed heuristic** | `QualityInspector.inspectImageQuality()` guesses document type solely from width/height aspect ratio and cannot detect sideways/upside-down faces or skewed document edges. |
-| **Portal-Specific Preparation Workflow** | **2. Partially implemented** | `PortalStudioScreen` opens `OneClickPreparationDialog` (a cramped `AlertDialog` that only launches the gallery picker, calls `ImageProcessor.processImageForRule` directly without document-specific camera/crop/segmentation pipelines, and lacks per-document preview). |
-| **Portal Data Trust & Staleness Governance** | **5. Implemented but not reliably validated** | `VerificationStatus` exists, and PAN presets were downgraded in Phase 0, but `PortalSpec` lacks an auditable official-domain allowlist, notification number/cycle fields, and a non-destructive review-due policy. |
-| **Portals List & Studio UI Minimalism** | **2. Partially implemented** | `PortalCard` is overcrowded with repeated document KB chips, source text, and verification dates; `PhotoStudioScreen` and `SignatureStudioScreen` permanently display every slider, dimension input, and promotional banner. |
+| **Google ML Kit Face Detection (`com.google.mlkit:face-detection`) & Selfie Segmentation (`com.google.mlkit:segmentation-selfie`)** | **Google ML Kit Terms of Service** (`https://developers.google.com/ml-kit/terms` and Google APIs Terms of Service). **Not** licensed as a whole under Apache 2.0. | **User Media Privacy**: All face detection and portrait segmentation inference executes locally on the device; user photos, signatures, and documents are **never** uploaded to Google servers.<br>**SDK Telemetry & Configuration**: Per Google's ML Kit documentation and Terms of Service, the ML Kit SDK may contact Google servers periodically to report operational/performance metrics (such as API call latency, model version, and device/app metadata) and to receive service configuration or compatibility updates. |
+| **AndroidX CameraX, Jetpack Compose, Room, Lifecycle, Coroutines, Security-Crypto, OkHttp, Moshi** | **Apache License 2.0** | Open-source libraries executing locally on device. OkHttp is used only when the user explicitly triggers a preset sync from the configured public JSON endpoint. |
+| **In-House Sauvola Binarization (`SignatureVisionProcessor`) & 4-Corner Homography (`DocumentCornerProcessor`)** | **Project First-Party Kotlin Source** | Pure on-device CPU math using standard `android.graphics.Bitmap` arrays; zero external libraries, zero network calls, and zero telemetry. |
 
----
-
-## 2. Corrected Dependency, Model Size, Licensing & Privacy Analysis
-
-### 2.1 Official ML Kit Model Size Estimates & Empirical Build Measurement
-Per Google's official ML Kit Android documentation, the indicative download/bundle size impacts for the bundled vision libraries are:
-- **Bundled ML Kit Face Detection** (`com.google.mlkit:face-detection:16.1.7`): **~6.9 MB** indicative model/native size impact.
-- **ML Kit Selfie Segmentation** (`com.google.mlkit:segmentation-selfie:16.0.0-beta6`): **~4.5 MB** indicative model/native size impact.
-- **Combined Indicative Download-Size Impact**: **~11.4 MB** (documentation estimate, not a guaranteed final APK or AAB size).
+### C.3 Physical Motorola Moto G60 Benchmark Plan (Zero Unmeasured Claims)
 
 > [!WARNING]
-> **No Unverified Size Claims**: We do **not** claim per-ABI size reductions or exact final binary sizes prior to building. During Phase 2, we will record the exact byte size of `app-debug.apk` (and release AAB/APK outputs) **before** and **after** adding the dependencies using `gradle :app:assembleDebug` and report the measured delta.
+> All latency and memory figures remain **unmeasured** until executed on a physical **Motorola Moto G60** (Qualcomm Snapdragon 732G, 6 GB RAM, Android 12, 108 MP rear sensor / 32 MP front sensor). No fixed latency numbers are claimed in advance.
 
-### 2.2 Separate Licensing & Privacy / Telemetry Governance
+`VisionBenchmarkRecorder` will instrument and record actual on-device measurements across $N = 20$ runs per stage on a physical Motorola Moto G60, reporting **min**, **median (p50)**, **p95**, **max**, and **heap delta**:
 
-| Component / Dependency | Governing License / Terms | Image Privacy & Network Telemetry Behaviour |
+| Benchmark Stage | What Is Measured on Physical Motorola Moto G60 | Required Metrics to Report |
 | :--- | :--- | :--- |
-| **Google ML Kit Face Detection & Selfie Segmentation SDKs** | **Google ML Kit Terms of Service** (`https://developers.google.com/ml-kit/terms`) — **NOT** labeled as wholly Apache 2.0 | All portrait face detection and foreground segmentation inference runs locally on the device CPU/GPU; **user photos and documents are never uploaded to Google or any cloud server**. However, per Google ML Kit Terms of Service, the ML Kit SDK may contact Google servers periodically for service configuration, compatibility checks, and operational/performance metrics. |
-| **AndroidX CameraX, Compose, Room, Lifecycle, Coroutines, OkHttp, Moshi** | **Apache License 2.0** | Standard open-source libraries; no external network calls except user-initiated GitHub JSON preset sync. |
-| **In-House Sauvola Signature Binarization & 4-Corner Homography Engine** | **Project Source (Kotlin)** | 100% offline deterministic array math; zero external dependencies, zero network activity, 0 KB model bloat. |
-
-- **User-Facing Privacy & Terms Disclosure**: Update the in-app **About & Privacy** dialog (`MainScreen.kt`) to state clearly:
-  1. All user photos, signatures, thumb impressions, and documents are processed and stored locally on the device and are never transmitted to any external server.
-  2. Portrait detection and background segmentation use on-device Google ML Kit components governed by the Google ML Kit Terms of Service, which may exchange diagnostic/usage metrics and configuration metadata with Google services.
-
----
-
-## 3. Motorola Moto G60 Physical Benchmark Protocol
-
-All processing latency and memory targets remain **unverified estimates** until measured on physical Motorola Moto G60 hardware (Snapdragon 732G, 6 GB RAM, Android 12, 108 MP rear / 32 MP front camera). We will implement an on-device diagnostic benchmark logger (`VisionBenchmarkRecorder`) that records and exports structured timing and memory telemetry for physical Moto G60 verification:
-
-1. **Cold vs. Warm Model Initialization**:
-   - Measure `FaceDetection.getClient()` and `Segmentation.getClient()` first-call initialization (`coldInitMs`) vs. subsequent invocations (`warmInitMs`).
-2. **Per-Stage Vision Latency (`median` and `p95` over $N = 20$ runs)**:
-   - Face detection latency (`faceDetectMs`).
-   - Single-image selfie segmentation + alpha feathering latency (`segmentationMs`).
-   - Sauvola integral-image signature thresholding + connected-component bounds latency (`sauvolaMs`).
-   - Document 4-corner detection + 3×3 homography bilinear warp latency (`docCornerWarpMs`).
-3. **Total End-to-End Preparation Time (`median` and `p95`)**:
-   - Wall-clock duration from `UnifiedMediaInput` decode → vision pipeline → rule resize/strip → stepped JPEG compression → post-save disk readback verification.
-4. **Peak Memory & Large-Image (108 MP / 32 MP) OOM Resilience**:
-   - Record Java heap delta (`Runtime.getRuntime().totalMemory() - freeMemory()`) and native heap allocation (`Debug.getNativeHeapAllocatedSize()`) before, at peak, and after bitmap recycling when decoding full-resolution Moto G60 108 MP (`12000×9000`) and 32 MP (`6528×4896`) captures.
-5. **Sustained Thermal / Sequential Stress Test**:
-   - Run 15 consecutive portrait + signature + document preparations back-to-back and compare Run 1–5 median latency against Run 11–15 median latency to detect thermal throttling or memory leaks.
+| **1. Model Initialization** | First-call client creation & native graph load (`coldInitMs`) vs. subsequent warm reuse (`warmInitMs`) for `FaceDetection` and `Segmentation`. | Cold ms, Warm median ms, Warm p95 ms |
+| **2. Face Detection** | `FaceDetectionEngine.detectFaces()` on a bounded `1024 px` portrait bitmap. | Median ms, p95 ms, max ms, Java/Native heap KB |
+| **3. Single-Image Segmentation** | `SelfieSegmentationEngine.segment()` + 6-part confidence/uncertainty audit + alpha compositing onto `#FFFFFF`. | Median ms, p95 ms, max ms, Java/Native heap KB |
+| **4. End-to-End Image Preparation** | Complete pipeline from `UnifiedMediaInput` decode → vision stage → rule resize/strip → stepped JPEG quality search → post-save disk verification (`ImageProcessor.processImageForRule`). | Median ms, p95 ms, max ms per document type (Photo, Signature, Thumb, Document) |
+| **5. Peak RAM Usage** | Peak Java heap (`Runtime.totalMemory() - freeMemory()`) and native heap (`Debug.getNativeHeapAllocatedSize()`) before, during, and after bitmap recycling. | Peak Java MB, Peak Native MB, Post-GC residual delta MB |
+| **6. Large-Image Handling (108 MP & 32 MP)** | Ingestion of native Moto G60 108 MP rear (`12000×9000`) and 32 MP front (`6528×4896`) JPEGs through `inSampleSize` downsampling without `OutOfMemoryError`. | Decode ms, `inSampleSize` factor chosen, Peak RAM MB, 0 OOM crashes |
+| **7. Repeated Processing & Thermal Behaviour** | 15 consecutive back-to-back preparations (5 Portrait + 5 Signature + 5 Document) on battery power. | Batch 1–5 median/p95 ms vs. Batch 11–15 median/p95 ms, memory leak check |
 
 ---
 
-## 4. Corrected Background Verification & Portrait Framing Design
+## D. Complete Revised Implementation Phases
 
-### 4.1 Probabilistic Segmentation vs. Verified Background Compliance
-A segmentation mask from ML Kit Selfie Segmentation is a **probabilistic foreground-confidence map** (`FloatBuffer` in `0.0f..1.0f`), **not** infallible proof that hair, ears, shoulders, or clothing boundaries were segmented without artifacts.
+### Phase 0: Baseline Inspection & Verification Gate
+- **Scope**:
+  - Verify current workspace test suite and baseline APK status before building.
+  - Ensure all Phase 0.1 compliance fixes remain intact (`minKb > maxKb` conflict detection, no fake JPEG COM padding, dual JFIF+EXIF vs. PNG `pHYs` DPI verification, PDF page geometry preservation, and safe `Bitmap` ownership).
 
-We explicitly separate five distinct signals in `BackgroundVerificationReport` and `ProcessedFileResult`:
+### Phase 1: Calibrated Camera Viewport Mapping, `CaptureIntent` & Portal Provenance Governance
+- **Scope**:
+  - Introduce `CaptureIntent` (`ForPortalRule`, `ForStudio`, `Generic`) so `UniversalCameraScreen` adapts its guide overlay and aspect ratio to the exact portal `DocumentRule` or shows a 4-mode task selector (`Photo`, `Signature`, `Thumb`, `Document`) when opened generically.
+  - Implement `CameraViewportMapper` to convert normalized guide-frame coordinates from `PreviewView` (`ScaleType.FILL_CENTER`) into upright sensor coordinates across `0°/90°/180°/270°` rotations, `4:3` / `16:9` / `20:9` sensor-to-screen ratios, and front-camera horizontal mirroring.
+  - Implement `OfficialDomainAllowlist` and update `PortalSpec` with `notificationNumber`, `recruitmentCycle`, and `sourceRevisionDate`. Enforce the non-destructive 180-day `isInternalReviewDue` reminder policy.
+  - Update the About & Privacy dialog (`MainScreen.kt`) with accurate Google ML Kit Terms of Service and local-processing/telemetry disclosures.
+- **Fallback Behaviour**:
+  - If preview viewport dimensions are unavailable (`0×0`), `CameraViewportMapper` falls back gracefully to the upright normalized guide rectangle without crashing.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                 5-SIGNAL BACKGROUND VERIFICATION PIPELINE                    │
-│                                                                              │
-│  1. segmentationExecuted: Boolean                                            │
-│     └─ Did ML Kit Selfie Segmenter run and return a valid confidence map?    │
-│                                                                              │
-│  2. subjectMaskConfidence & edgeUncertaintyRatio                             │
-│     ├─ Foreground area ratio within plausible portrait bounds (12%..82%)     │
-│     ├─ Mean foreground confidence >= 0.82f on core subject                   │
-│     └─ Edge uncertainty ratio = pixels in (0.20f..0.80f) / subject pixels    │
-│        (Must be <= 0.18f; high ratio flags halo/boundary ambiguity)          │
-│                                                                              │
-│  3. backgroundReplacementApplied: Boolean                                    │
-│     └─ Background pixels (< 0.20f) set to #FFFFFF; transition band           │
-│        (0.20f..0.80f) smoothly alpha-composited onto #FFFFFF;                │
-│        core subject (>= 0.80f) untouched.                                    │
-│                                                                              │
-│  4. outputBackgroundPixelChecksPassed: Boolean                               │
-│     └─ Post-save decoded JPEG/PNG non-subject region (mask < 0.20f)          │
-│        verified on disk: nearWhiteRatio >= 0.92f and meanLuminance >= 248.   │
-│                                                                              │
-│  5. userPreviewAccepted: Boolean                                             │
-│     └─ Did the user review the segmented output preview (or accept it        │
-│        without flagging boundary issues)?                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+### Phase 2: On-Device Portrait Vision (ML Kit Face Detection + Selfie Segmentation + 6-Part Verification)
+- **Scope**:
+  - Add `com.google.mlkit:face-detection:16.1.7` and `com.google.mlkit:segmentation-selfie:16.0.0-beta6` behind replaceable `FaceDetectionEngine` and `SelfieSegmentationEngine` interfaces in `PortraitVisionProcessor`.
+  - Implement portal-specific face framing (when `minHeadHeightRatio` / `maxHeadHeightRatio` / `topHeadroomRatio` are defined on `DocumentRule`) and configurable default framing (`PortraitFramingProfile.DEFAULT_BALANCED`) with manual crop override.
+  - Implement the 6-part background verification pipeline in `PortraitVisionProcessor` and `ImageProcessor.processImageForRule`, plus `VisionBenchmarkRecorder`.
+- **Fallback Behaviour**:
+  - If face detection finds 0 faces or multiple faces, or if `edgeUncertaintyRatio > 0.18f`, the pipeline preserves a safe aspect-ratio crop, keeps `verifiedBackgroundCompliance = false` (`PreparationStatus.BACKGROUND_UNVERIFIED`), displays a specific human-readable warning, and offers one-tap **Manual Crop** or **Keep Original Background**.
 
-- **When `verifiedBackgroundCompliance` Is `true`**:
-  - Requires **all** of: `segmentationExecuted == true`, `maskConfidencePassed == true` (plausible foreground area, high confidence, `edgeUncertaintyRatio <= 0.18f`), `outputBackgroundPixelChecksPassed == true` on the saved file on disk, **and** `userPreviewAccepted == true`.
-- **When Segmentation Confidence Is Low or Ambiguous (`edgeUncertaintyRatio > 0.18f` or implausible foreground coverage)**:
-  - `verifiedBackgroundCompliance` remains `false`, status is set to `PreparationStatus.BACKGROUND_UNVERIFIED` with a specific message (`"Background segmented with boundary uncertainty — please inspect hair/shoulder edges or adjust crop"`), and the UI offers one-tap **Manual Crop Adjustment** or **Keep Original Background**.
+### Phase 3A: Signature & Thumb Impression Vision (Sauvola Adaptive Thresholding & Ink Bounds)
+- **Scope**:
+  - Implement `SignatureVisionProcessor` in its own dedicated module for `SIGNATURE_ENGLISH`, `SIGNATURE_HINDI`, `THUMB_IMPRESSION_LEFT`, and `THUMB_IMPRESSION_RIGHT`.
+  - Use integral-image Sauvola adaptive thresholding to turn uneven shadowed paper into pure `#FFFFFF` while preserving blue or black pen ink chroma and extracting the connected-stroke bounding box with safe padding.
+- **Fallback Behaviour**:
+  - If detected ink pixel coverage is $< 0.15\%$ (blank/faint page) or $> 45\%$ (dark/underexposed frame), automatically fall back to gentle contrast normalization (`usedGentleFallback = true`), set `maskConfidencePassed = false`, and surface the **Gentle Ink Processing** toggle.
 
-### 4.2 Adjustable Portrait Framing Defaults (No Fake Universal Rules)
-- **Portal-Specific vs. Default Framing**:
-  - `DocumentRule` adds optional `minHeadHeightRatio: Float? = null`, `maxHeadHeightRatio: Float? = null`, and `topHeadroomRatio: Float? = null`. These fields are populated **only** when an official portal notification explicitly specifies head-size percentages (e.g., Passport Seva / ICAO guidelines).
-  - For portals that only specify pixel dimensions and aspect ratio (e.g., SSC, UPSC, BPSC), face-based auto-crop uses an **adjustable framing default** (`PortraitFramingProfile.DEFAULT_BALANCED`: target head height ~`0.58f`, top headroom ~`0.12f`) and always lets the user tweak the crop box interactively before saving.
-- **Facial Identity Preservation**:
-  - The app performs **zero** facial beautification, skin smoothing, landmark warping, or generative alteration.
-  - Because cropping, bilinear scaling to target pixel dimensions (e.g., `200×230 px`), and JPEG compression mathematically resample pixels, we state accurately that **genuine facial identity and features are preserved without alteration**, without claiming literal pixel-for-pixel identity after resampling/encoding.
-
----
-
-## 5. Proposed Architecture & End-to-End Workflows
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                        USER ENTRY POINTS & WORKFLOWS                         │
-│                                                                              │
-│  ┌─────────────────────┐  ┌──────────────────────┐  ┌─────────────────────┐  │
-│  │   Portals Workflow  │  │  Photo / Sign Studio │  │  Universal Camera   │  │
-│  │  Portals List       │  │  Clean Preview       │  │  CaptureIntent      │  │
-│  │   ↓                 │  │   + Primary Action   │  │   ├─ ForPortalRule  │  │
-│  │  Portal Detail      │  │   + Adjust Sheet     │  │   ├─ ForStudio      │  │
-│  │   ↓                 │  │                      │  │   └─ Generic Picker │  │
-│  │  Per-Doc Prepare    │  │                      │  │                     │  │
-│  └──────────┬──────────┘  └──────────┬───────────┘  └──────────┬──────────┘  │
-└─────────────┼────────────────────────┼─────────────────────────┼─────────────┘
-              │                        │                         │
-              ▼                        ▼                         ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│              UNIFIED MEDIA INPUT & CAMERA VIEWPORT MAPPER                    │
-│  • Magic-Byte + Bounded Decode + EXIF 8-Orientation Normalization            │
-│  • PreviewView (FILL_CENTER) ↔ Sensor (4:3 / 16:9) + Rotation (0/90/180/270) │
-│    + Front-Camera Mirroring Coordinate Transformation                        │
-└──────────────────────────────────────┬───────────────────────────────────────┘
-                                       │
-                                       ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                ON-DEVICE INTELLIGENT VISION & ROUTING ENGINE                 │
-│                                                                              │
-│  ┌────────────────────────┐ ┌──────────────────────┐ ┌────────────────────┐  │
-│  │   Portrait Pipeline    │ │  Signature / Thumb   │ │ Document / ID Card │  │
-│  │         (Phase 2)      │ │     Pipeline (3A)    │ │    Pipeline (3B)   │  │
-│  │ • ML Kit Face Detector │ │ • Integral-Image     │ │ • Sobel Gradient + │  │
-│  │ • Adjustable Framing   │ │   Sauvola Adaptive   │ │   4-Corner Quad    │  │
-│  │   + Manual Crop UI     │ │   Binarization       │ │   Confidence Score │  │
-│  │ • ML Kit Selfie Mask   │ │ • Connected-Stroke   │ │ • Interactive 4-Pt │  │
-│  │   + 5-Signal Confidence│ │   Bounding Box Crop  │ │   Corner Review UI │  │
-│  │   & Preview Acceptance │ │ • Blue/Black Ink     │ │ • 3×3 Homography   │  │
-│  │                        │ │   Chroma Preservation│ │   Perspective Warp │  │
-│  └───────────┬────────────┘ └──────────┬───────────┘ └─────────┬──────────┘  │
-└──────────────┼─────────────────────────┼───────────────────────┼─────────────┘
-               │                         │                       │
-               ▼                         ▼                       ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│            DETERMINISTIC RULE ENFORCER & POST-SAVE DISK VERIFIER             │
-│  • Exact / Bounded Resize • Name & Date Strip • Stepped Quality Search       │
-│  • Dual JFIF APP0 + EXIF DPI • 5-Signal Background Audit • PDF Geometry      │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 6. Portal Data Trust & Official Domain Governance
-
-1. **Auditable `OfficialDomainAllowlist`**:
-   - An `https://` URL alone is never treated as proof of an official source.
-   - `PortalVerificationValidator` checks `officialUrl` hostnames against an explicit allowlist of verified government and statutory agency domains (`upsconline.nic.in`, `upsc.gov.in`, `ssc.gov.in`, `onlinebpsc.bihar.gov.in`, `bpsc.bih.nic.in`, `rrbapply.gov.in`, `indianrailways.gov.in`, `ibps.in`, `sbi.co.in`, `ctet.nic.in`, `nta.ac.in`, `jeemain.nta.nic.in`, `neet.nta.nic.in`, `serviceonline.bihar.gov.in`, `passportindia.gov.in`, `tin.tin.proteantech.in`, `pan.utiitsl.com`, `uppbpb.gov.in`, `csbc.bih.nic.in`) and validates `.gov.in` / `.nic.in` ownership.
-2. **Extended Provenance Metadata on `PortalSpec`**:
-   - Store `notificationNumber: String? = null`, `recruitmentCycle: String = year`, `sourceDocumentTitle: String`, `officialUrl: String`, `sourceRevisionDate: String? = null`, and `lastVerifiedDate: String`.
-   - A portal can display the green `OFFICIALLY_VERIFIED` badge **only** when its domain is in `OfficialDomainAllowlist`, `sourceDocumentTitle` and `lastVerifiedDate` are non-blank, and `verificationStatus == VerificationStatus.OFFICIALLY_VERIFIED`.
-3. **Non-Destructive 180-Day Internal Review Policy**:
-   - The 180-day check on `lastVerifiedDate` is strictly an **internal maintenance review signal** (`isReviewDue: Boolean`), **never** a claim that government rules automatically expire after 180 days.
-   - If `lastVerifiedDate` is older than 180 days, the UI displays a subtle `"Verify Latest Notification"` reminder note in Portal Detail while **preserving all actual `DocumentRule` dimensions, DPI, and KB limits intact** so the user's document preparation is never blocked or altered.
-
----
-
-## 7. Ordered Implementation Phases & Exact Files to Modify
-
-### Phase 0 (Pre-Execution Gate): Baseline Branch & Test Suite Verification
-- **Tasks**:
-  - Inspect git status and current commit hash (`git rev-parse HEAD`).
-  - Run `gradle :app:testDebugUnitTest :app:assembleDebug` and record the exact passing test count and baseline `app-debug.apk` byte size before touching any file.
-
-### Phase 1: Camera Coordinate Mapping, `CaptureIntent` & Portal Provenance Governance
-- **New Files**:
-  - `app/src/main/java/com/example/camera/CaptureIntent.kt`
-  - `app/src/main/java/com/example/camera/CameraViewportMapper.kt`
-  - `app/src/main/java/com/example/data/portal/OfficialDomainAllowlist.kt`
-- **Modified Files**:
-  - `app/src/main/java/com/example/camera/UniversalCameraScreen.kt`
-  - `app/src/main/java/com/example/camera/UniversalCameraController.kt`
-  - `app/src/main/java/com/example/data/model/DocumentModels.kt`
-  - `app/src/main/java/com/example/data/portal/PortalDatabase.kt`
-  - `app/src/main/java/com/example/ui/MainScreen.kt` (Privacy & ML Kit Terms disclosure in About dialog)
-- **Completion Criteria**:
-  - `CameraViewportMapper` accurately transforms normalized guide rectangles from `PreviewView` (`FILL_CENTER`) to captured sensor coordinates across front/rear cameras, horizontal front-camera mirror differences, `0°`/`90°`/`180°`/`270°` rotations, and `4:3` / `16:9` / `20:9` aspect ratios.
-  - `OfficialDomainAllowlist` and `PortalSpec` provenance validation tested with unit tests.
-
-### Phase 2: On-Device Portrait Vision (ML Kit Face Detection + Selfie Segmentation + 5-Signal Verification)
-- **Dependencies Added (`gradle/libs.versions.toml`, `app/build.gradle.kts`)**:
-  - `com.google.mlkit:face-detection:16.1.7`
-  - `com.google.mlkit:segmentation-selfie:16.0.0-beta6`
-  - `org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.10.2` (or `suspendCancellableCoroutine` Task wrapper)
-- **New Files**:
-  - `app/src/main/java/com/example/processing/PortraitVisionProcessor.kt`
-  - `app/src/main/java/com/example/processing/VisionBenchmarkRecorder.kt`
-- **Modified Files**:
-  - `gradle/libs.versions.toml`
-  - `app/build.gradle.kts`
-  - `app/src/main/java/com/example/data/model/DocumentModels.kt`
-  - `app/src/main/java/com/example/processing/ImageProcessor.kt`
-  - `app/src/main/java/com/example/processing/OneClickPreparationCoordinator.kt`
-- **Completion Criteria**:
-  - Record exact `app-debug.apk` byte size before and after adding ML Kit dependencies.
-  - `PortraitVisionProcessor` detects face bounds/pose, computes adjustable portrait crop (`PortraitFramingProfile`), runs Selfie Segmentation, computes `subjectMaskConfidence` and `edgeUncertaintyRatio`, composites onto `#FFFFFF`, and enforces the 5-signal background compliance model.
-
-### Phase 3A: Signature & Thumb Impression Vision (Integral-Image Sauvola & Ink Bounds)
-- **New Files**:
-  - `app/src/main/java/com/example/processing/SignatureVisionProcessor.kt`
-- **Modified Files**:
-  - `app/src/main/java/com/example/processing/ImageProcessor.kt`
-  - `app/src/main/java/com/example/processing/OneClickPreparationCoordinator.kt`
-- **Completion Criteria**:
-  - Integral-image Sauvola local adaptive thresholding removes uneven mobile shadows while preserving blue/black pen ink chroma and extracting tight connected-stroke bounding boxes with safe padding.
-  - Independent fallback to gentle contrast lighting if stroke area is below minimum threshold.
-
-### Phase 3B: Document & ID Card 4-Corner Detection, Interactive Handles & Homography Warp
-- **New Files**:
-  - `app/src/main/java/com/example/processing/DocumentCornerProcessor.kt`
-  - `app/src/main/java/com/example/ui/components/InteractiveCornerCropOverlay.kt`
-- **Modified Files**:
-  - `app/src/main/java/com/example/processing/OneClickPreparationCoordinator.kt`
-  - `app/src/main/java/com/example/ui/screens/PdfMasterScreen.kt`
-- **Completion Criteria**:
-  - Sobel edge + contour quadrilateral detector finds 4 document corners with a normalized confidence score (`0.0f..1.0f`).
-  - Low-confidence detections or user tap open `InteractiveCornerCropOverlay` with draggable corner magnifiers before executing the 3×3 homography bilinear perspective warp.
+### Phase 3B: Document & ID Card Vision (4-Corner Detection, Confidence Scoring & Homography Warp)
+- **Scope**:
+  - Implement `DocumentCornerProcessor` and `InteractiveCornerCropOverlay` as an independent phase for `AADHAAR_CARD`, `PAN_CARD`, `MARKSHEET_10TH`, `MARKSHEET_12TH`, `CASTE_CERTIFICATE`, `DOMICILE_CERTIFICATE`, `INCOME_CERTIFICATE`, and `OTHER_DOCUMENT`.
+  - Detect 4 document corners using Sobel gradient magnitude and luminance contrast, score quadrilateral confidence (`0.0f..1.0f`), and rectify perspective via an 8-DOF 3×3 homography solver (`solveHomography` + bilinear interpolation).
+- **Fallback Behaviour**:
+  - Whenever quadrilateral confidence is $< 0.75f$, do not auto-warp; present `InteractiveCornerCropOverlay` with 4 draggable corner handles initialized to a safe frame so the user can confirm or reset the corners.
 
 ### Phase 4: Full-Screen Portal Preparation Workflow (`Portals List → Portal Detail → Per-Document Prepare`)
-- **New Files**:
-  - `app/src/main/java/com/example/ui/screens/PortalDetailScreen.kt`
-  - `app/src/main/java/com/example/ui/screens/PortalDocumentPrepareScreen.kt`
-- **Modified Files**:
-  - `app/src/main/java/com/example/ui/screens/PortalStudioScreen.kt`
-  - `app/src/main/java/com/example/ui/components/CommonComponents.kt`
-  - `app/src/main/java/com/example/ui/MainScreen.kt`
-- **Completion Criteria**:
-  - `PortalStudioScreen` redesigned to match `HomeDashboardScreen`'s clean hierarchy (Title, single-line compact search, non-truncated `"All"` filter chip, compact `PortalCard` with Name, Authority, truthful `StatusBadge`, and single entry action).
-  - Full-screen `PortalDetailScreen` and `PortalDocumentPrepareScreen` route Photo, Signature, Thumb, and ID/PDF rules to their dedicated vision pipelines with preview acceptance and disk verification.
+- **Scope**:
+  - Redesign `PortalStudioScreen` and `PortalCard` so the Portals list is clean and scannable: Title, single-line non-wrapping search bar, non-truncated `"All"` + category filter chips, and compact cards showing Portal Name, Authority, truthful `StatusBadge` (backed by `OfficialDomainAllowlist`), and one `"Prepare"` action.
+  - Create full-screen `PortalDetailScreen` (displaying official notification metadata, source URL, non-destructive `isInternalReviewDue` reminder if $> 180$ days, and required documents list) and `PortalDocumentPrepareScreen` (dedicated per-document capture/upload, vision pipeline routing, preview acceptance toggle, `Adjust` sheet, and Save/Share).
+- **Fallback Behaviour**:
+  - Android system back navigation (`BackHandler`) cleanly pops from `PortalDocumentPrepareScreen` → `PortalDetailScreen` → `PortalStudioScreen`.
 
-### Phase 5: Minimalist Photo & Signature Studio Redesign (`Adjust` Modal Bottom Sheet) & Full Regression Suite
-- **New Files**:
-  - `app/src/main/java/com/example/ui/components/StudioAdjustBottomSheet.kt`
-- **Modified Files**:
-  - `app/src/main/java/com/example/ui/screens/PhotoStudioScreen.kt`
-  - `app/src/main/java/com/example/ui/screens/SignatureStudioScreen.kt`
-  - `app/src/main/java/com/example/ui/components/PortalPresetSelectorBar.kt`
-- **Completion Criteria**:
-  - `PhotoStudioScreen` and `SignatureStudioScreen` present a single capture/upload action bar, large preview (with interactive crop/preview acceptance), compact verified output pill, primary Save action, and an `Adjust` modal bottom sheet for manual controls.
-  - Repetitive promotional copy removed across all screens.
+### Phase 5: Minimalist Photo & Signature Studio Redesign (`Adjust` Modal Bottom Sheet)
+- **Scope**:
+  - Create `StudioAdjustBottomSheet` (`ModalBottomSheet`) housing manual overrides (width/height px, aspect lock, target KB slider, DPI selector, candidate name & DOP strip fields, ink mode/threshold sliders, and joint/printable sheet power tools).
+  - Refactor `PhotoStudioScreen` and `SignatureStudioScreen` to present a clean layout: compact preset selector, single Camera/Gallery action bar, large preview with Before/After toggle and preview acceptance checkbox, compact verified output card, primary Save/Share buttons, and an `Adjust` button that opens `StudioAdjustBottomSheet`. Remove repetitive marketing banners.
 
 ---
 
-## 8. Comprehensive Testing Strategy (Unit, Compose UI & Moto G60 Checklist)
+## E. Tests and Acceptance Criteria for Every Phase
 
-### 8.1 Automated Unit & Robolectric Tests (`gradle :app:testDebugUnitTest`)
-1. **Camera Coordinate Mapping Suite (`CameraViewportMapperTest`)**:
-   - Rear camera (`LENS_FACING_BACK`) and front camera (`LENS_FACING_FRONT` with horizontal preview mirroring vs. saved image).
-   - Display/target rotations `0°`, `90°`, `180°`, and `270°`.
-   - `PreviewView.ScaleType.FILL_CENTER` viewport crop across `4:3` sensor (`4000×3000`) on `20:9` display (`1080×2400`) and `16:9` display (`1080×1920`).
-   - Verification against real CameraX `ViewPort` crop-rect geometry and synthetic captured sensor frames with fiducial markers at the exact guide rectangle corners.
-2. **Portrait Framing & 5-Signal Background Verification Suite (`PortraitVisionProcessorTest`)**:
-   - Straight, tilted, off-center, and EXIF-rotated portraits.
-   - High-confidence segmentation mask + verified near-white disk pixels + `userPreviewAccepted = true` → `verifiedBackgroundCompliance = true`.
-   - High-confidence segmentation mask + `userPreviewAccepted = false` → `verifiedBackgroundCompliance = false`.
-   - Ambiguous hair/shoulder boundary (`edgeUncertaintyRatio > 0.18f`) or implausible foreground coverage → `verifiedBackgroundCompliance = false`, status `BACKGROUND_UNVERIFIED` with honest edge-uncertainty warning.
-   - Portal rule with explicit `minHeadHeightRatio`/`maxHeadHeightRatio` vs. adjustable default profile (`DEFAULT_BALANCED`).
-3. **Phase 3A Signature & Thumb Vision Suite (`SignatureVisionProcessorTest`)**:
-   - Faint blue and black ink strokes under simulated linear/radial illumination shadows.
-   - Connected-stroke bounding box extraction ignoring isolated 1–2 px dust specks near page edges.
-   - Fallback to gentle contrast lighting when image contains no discernible ink strokes.
-4. **Phase 3B Document 4-Corner & Homography Suite (`DocumentCornerProcessorTest`)**:
-   - Synthetic angled ID card and A4 page quadrilaterals (`15°–30°` perspective skew) detected and rectified via 3×3 homography into target aspect ratio.
-   - Low-confidence background clutter triggering manual 4-corner confirmation state instead of auto-warping random edges.
-5. **Portal Governance & Compose UI Workflow Suite (`PortalWorkflowTest`)**:
-   - `OfficialDomainAllowlist` rejecting non-official `https://example.com` URLs from displaying `OFFICIALLY_VERIFIED`.
-   - 180-day `isReviewDue` flag surfacing a review reminder without altering or blocking `DocumentRule` processing.
-   - Compose UI tests verifying `"All"` filter chip text visibility, compact `PortalCard` layout, navigation to `PortalDetailScreen` and `PortalDocumentPrepareScreen`, and `Adjust` bottom sheet opening.
-6. **Phase 0.1 Regression Suite (`Phase5FeaturesTest` & existing suites)**:
-   - Full preservation of all existing unit tests for `minKb > maxKb` conflicts, below-min KB failure without COM padding, JPEG JFIF+EXIF vs. PNG `pHYs` DPI validation, PDF page geometry preservation, and caller `Bitmap` lifecycle safety.
-
-### 8.2 Manual Acceptance-Test Protocol for Physical Motorola Moto G60
-> [!NOTE]
-> Hardware testing is never claimed in container builds. Execute this checklist on a physical Motorola Moto G60 using the built APK:
-1. Run `VisionBenchmarkRecorder` on Moto G60 with 108 MP rear and 32 MP front captures; record cold/warm init, median/p95 latencies, and peak heap usage.
-2. Verify front-camera selfie capture inside the oval guide matches the saved crop orientation and horizontal handedness without unexpected mirroring.
-3. Test ML Kit Selfie Segmentation against a textured indoor wall/curtain; verify edge uncertainty warnings appear when lighting is poor and preview confirmation is required before marking background verified.
-4. Test Sauvola signature extraction on a paper signature half-covered by a phone shadow.
-5. Test 4-corner detection and interactive corner dragging on an angled Aadhaar/PAN card.
-6. Complete an end-to-end UPSC and SSC application package from the redesigned `Portals` tab and re-open all saved files from device storage to confirm dimensions, KB size, and DPI.
-
----
-
-## 9. Risks, Regressions & Fallback Behaviour
-
-| Risk | Likelihood / Impact | Concrete Mitigation & Honest Fallback |
+| Phase | Automated Unit / Robolectric & Compose UI Tests | Acceptance Criteria |
 | :--- | :--- | :--- |
-| **ML Kit Native JNI Unavailability in Host JVM Unit Tests** | High (Expected in Robolectric) | Define clean `FaceDetectionEngine` and `SelfieSegmentationEngine` interfaces; use `MlKitFaceDetectionEngine` / `MlKitSelfieSegmentationEngine` on device and deterministic confidence-map test doubles in JVM unit tests, while testing all post-mask alpha-matting, uncertainty math, and disk verification with real bitmaps. |
-| **Low Segmentation Confidence on Complex Hair / Backlit Scenes** | Medium | Compute `edgeUncertaintyRatio` over the `(0.20f..0.80f)` confidence band; if `> 0.18f`, never claim `verifiedBackgroundCompliance = true`—surface an honest warning and allow one-tap switch to `Keep Original Background` or manual crop. |
-| **False 4-Corner Detection on Textured Tables** | Medium | Score candidate quadrilaterals by edge gradient strength, convexity, internal angles (`45°..135°`), and area (`>= 18%` of frame). Whenever confidence `< 0.75f`, default to the interactive 4-corner drag overlay rather than silently warping. |
-| **Memory Spikes on 108 MP Moto G60 Rear Captures** | High if unbounded | Always decode via `inSampleSize` capped at `2048 px` for master bitmap and `1024 px` for vision analysis, and recycle intermediate bitmaps immediately via `replaceIntermediateBitmap()` in `try/finally` blocks. |
+| **Phase 1** | `CameraViewportMapperTest`: Rear & front cameras, horizontal mirror reversal on front camera, `0°/90°/180°/270°` rotations, `FILL_CENTER` scaling across `4:3`, `16:9`, and `20:9`.<br>`OfficialDomainAllowlistTest`: Official `.gov.in`/`.nic.in` allowlist pass vs. non-official `https://` rejection, and 180-day `isInternalReviewDue` non-destructive behavior. | Preview guide rectangle maps within $\le 2\text{ px}$ of synthetic sensor fiducial markers across all 4 rotations and both lenses; non-official URLs never show `OFFICIALLY_VERIFIED`; $>180$-day portals show review note without altering `DocumentRule` values. |
+| **Phase 2** | `PortraitVisionProcessorTest`: Straight, tilted, and off-center portraits; portal-specific head ratios vs. `DEFAULT_BALANCED`; 6-part background verification (`verifiedBackgroundCompliance = true` only when mask confidence $\ge 0.80$, `edgeUncertaintyRatio <= 0.18`, saved disk whiteness $\ge 85\%$, and `userPreviewAccepted == true`; `false` when `edgeUncertaintyRatio > 0.18` or `userPreviewAccepted == false`). | Zero false-positive `verifiedBackgroundCompliance` on unmasked, low-confidence, or unaccepted previews; exact pre/post ML Kit debug APK byte sizes recorded. |
+| **Phase 3A** | `SignatureVisionProcessorTest`: Blue and black ink signatures under simulated linear/radial paper shadow gradients; isolated dust-speck filtering; connected-stroke bounding box trimming; blank/low-contrast fallback (`usedGentleFallback = true`). | Shadowed paper regions become `#FFFFFF` ($\ge 90\%$ near-white on disk) while preserving blue/black ink chroma and stroke continuity; fallback triggers cleanly on blank inputs. |
+| **Phase 3B** | `DocumentCornerProcessorTest`: Synthetic angled white document quadrilateral on dark/textured background (`15°–30°` skew); confidence scoring ($\ge 0.75$ on clean quad, $< 0.75$ on low-contrast clutter); 3×3 homography perspective rectification accuracy. | Skewed synthetic document corners are detected within $\le 4\%$ normalized error and warped into an upright rectangular aspect ratio without cropping internal text. |
+| **Phase 4** | `PortalWorkflowComposeTest`: `"All"` filter chip full text visibility; compact `PortalCard` rendering; click flow from `PortalStudioScreen` → `PortalDetailScreen` → `PortalDocumentPrepareScreen` and back navigation. | Cramped `OneClickPreparationDialog` is replaced by full-screen navigation; each portal document rule routes to its matching Photo, Signature, Thumb, or Document/PDF pipeline. |
+| **Phase 5** | `StudioRedesignComposeTest` + Full Phase 0.1 Regression Suite (`DocumentValidationTest`, `Phase4FeaturesTest`, `Phase5FeaturesTest`, `DocumentLocker*Test`): Verify `Adjust` bottom sheet interaction, preview acceptance toggle, and 100% pass rate on all existing compliance tests. | All existing Phase 0.1 tests and new Phase 1–5 tests pass (`0` failures); UI clutter and repetitive promotional text are eliminated. |
+
+---
+
+## F. Actual Baseline Commit, Workspace State & Test Status Audit
+
+1. **Git Repository & Commit Hash Status**:
+   - Running `git status` / `git rev-parse HEAD` in the container workspace returns:
+     `fatal: not a git repository (or any of the parent directories): .git`
+   - Because the cloud container mounts the project file tree without the `.git` directory, a live git SHA cannot be queried via `git` inside this environment. Previously referenced SHAs in uploaded notes (`2cf6dc7` / `819749b`) originate from external GitHub history prior to workspace import.
+2. **Actual Unit Test Inventory on Disk**:
+   - Direct inspection of `app/src/test/java/com/example/` via `grep -rc "@Test" app/src/test/java/com/example/` confirms **58 `@Test` methods across 8 test classes**:
+     - `Phase5FeaturesTest.kt`: **17** tests
+     - `DocumentValidationTest.kt`: **9** tests
+     - `DocumentEncryptionTest.kt`: **7** tests
+     - `DocumentLockerDatabaseTest.kt`: **6** tests
+     - `DocumentLockerRepositoryTest.kt`: **6** tests
+     - `ExampleUnitTest.kt`: **5** tests
+     - `Phase4FeaturesTest.kt`: **4** tests
+     - `ExampleRobolectricTest.kt`: **4** tests
+   - On the Phase 0.1 baseline build prior to adding ML Kit dependencies, all **58 tests passed (`58 completed, 0 failed`)** and the baseline `app-debug.apk` size was **`26,495,618` bytes**.
+3. **Transparent Disclosure of Current Workspace Files**:
+   - During the interrupted execution turn immediately preceding this `PLAN MODE ONLY` prompt, initial code files for Phase 1–3B (`CaptureIntent.kt`, `CameraViewportMapper.kt`, `OfficialDomainAllowlist.kt`, `VisionBenchmarkRecorder.kt`, `PortraitVisionProcessor.kt`, `SignatureVisionProcessor.kt`, `DocumentCornerProcessor.kt`, `InteractiveCornerCropOverlay.kt`) and ML Kit dependency entries in `gradle/libs.versions.toml` / `app/build.gradle.kts` were written to the workspace before this Plan Mode stop gate arrived.
+   - Immediately upon receiving this `STRICT MODE: PLAN MODE ONLY — NO CODE CHANGES` instruction, all code modifications and background Gradle tasks were halted. No source files, Gradle files, or tests have been modified in this turn.
+
+---
+
+## G. Risks, Fallback Behaviour and Unresolved Decisions
+
+| Risk / Unknown | Impact | Mitigation / Fallback & Status |
+| :--- | :--- | :--- |
+| **1. Post-ML Kit APK / AAB & Per-ABI Split Byte Sizes (Remaining Unknown)** | Final binary size increase from bundling ML Kit Face Detection + Selfie Segmentation is estimated at ~11.4 MB in Google docs, but exact APK/AAB byte delta is unknown until compiled. | **Status: Pending Build Measurement**. Measure exact `app-debug.apk` and release bundle byte sizes immediately after plan approval during build verification. |
+| **2. Physical Motorola Moto G60 Latency & Thermal Numbers (Remaining Unknown)** | Cloud build containers have no Snapdragon 732G / Moto G60 hardware or physical camera sensors. | **Status: Pending Physical Device Execution**. Do not claim hardware benchmark numbers in container builds; use `VisionBenchmarkRecorder` on the physical Moto G60 to capture median and p95 latencies. |
+| **3. Unverified Portal Specifications (PAN & State Portals)** | NSDL/Protean and UTIITSL PAN specifications vary by application mode (DSC vs. physical form vs. e-KYC). | **Status: Mitigated**. Keep conflicting or workflow-dependent presets marked as `UNVERIFIED` or workflow-scoped (`NSDL DSC 200 DPI` vs. `UTIITSL`), and never mark a portal `OFFICIALLY_VERIFIED` without an allowlisted domain and notification title. |
+| **4. ML Kit Native JNI Execution in Host JVM Robolectric Tests** | Bundled ML Kit native `.so` libraries target Android ARM/x86 device runtimes and may throw `UnsatisfiedLinkError` in host JVM unit tests. | **Status: Mitigated**. Wrap ML Kit calls behind `FaceDetectionEngine` and `SelfieSegmentationEngine` with `try/catch (Throwable)` fallback, and inject deterministic confidence-map engines in JVM unit tests so all framing, 6-part background verification, and disk compliance logic is 100% unit-tested. |
+
+---
+
+## H. Final Build Readiness Checklist
+
+- [x] **1. ML Kit Size Analysis Corrected**: Official Google documentation download-size estimates (~6.9 MB Face Detection, ~4.5 MB Selfie Segmentation, ~11.4 MB combined) separated from SDK size, Debug APK size, Release APK/AAB size, and per-ABI split size; unmeasured artifacts marked pending build measurement.
+- [x] **2. Unmeasured Moto G60 Claims Removed**: All fixed latency claims removed and replaced with a 7-stage physical Moto G60 benchmark protocol reporting `median` and `p95`.
+- [x] **3. 6-Part Probabilistic Background Verification Defined**: Model execution, subject confidence, edge uncertainty ratio, background replacement, post-save disk pixel check, and user preview acceptance separated; uncertain edges remain in an honest warning state (`BACKGROUND_UNVERIFIED`).
+- [x] **4. Licensing & Privacy Disclosed Accurately**: Google ML Kit Terms of Service documented separately from Apache 2.0 libraries; local image processing preserved while disclosing ML Kit diagnostic/configuration telemetry.
+- [x] **5. Portrait Framing & Identity Rules Corrected**: Official head-size rules applied only when specified by a portal; configurable defaults and manual crop used otherwise; genuine facial identity preserved without claiming pixel-perfect invariance after resampling.
+- [x] **6. Portal Governance & 180-Day Review Corrected**: `OfficialDomainAllowlist`, notification metadata, and non-destructive 180-day `isInternalReviewDue` threshold defined.
+- [x] **7. Phase 3 Split into Phase 3A & Phase 3B**: Signature/Thumb Sauvola pipeline (3A) and Document/ID 4-Corner Homography pipeline (3B) separated with distinct files, fallbacks, and tests.
+- [x] **8. Baseline Audited Truthfully**: Container `.git` absence and 58 `@Test` method inventory documented; Phase 0.1 fixes preserved.
+- [ ] **9. User Final Approval Gate**: Awaiting user review and approval (`Proceed`) before resuming code changes and running the full Gradle build and test verification.
