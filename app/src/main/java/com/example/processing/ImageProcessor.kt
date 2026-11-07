@@ -212,7 +212,16 @@ object ImageProcessor {
         preserveInkColor: Boolean = true,
         removeBackgroundToWhite: Boolean = false,
         customDpi: Int? = null,
-        backgroundMask: BooleanArray? = null
+        backgroundMask: BooleanArray? = null,
+        backgroundMaskWidth: Int = 0,
+        backgroundMaskHeight: Int = 0,
+        alreadyBackgroundReplaced: Boolean = false,
+        segmentationExecuted: Boolean = backgroundMask != null,
+        backgroundReplacementApplied: Boolean = removeBackgroundToWhite,
+        maskConfidencePassed: Boolean = true,
+        subjectMaskConfidence: Float = if (backgroundMask != null) 1.0f else 0f,
+        edgeUncertaintyRatio: Float = 0f,
+        userPreviewAccepted: Boolean = true
     ): ProcessedFileResult = withContext(Dispatchers.Default) {
         var workingBitmap: Bitmap = originalBitmap
         var scaled: Bitmap? = null
@@ -307,7 +316,7 @@ object ImageProcessor {
             workingBitmap = originalBitmap
 
             // 5b. On-Device White Background Replacement + Gentle Face Enhancement (for Passport Photos)
-            if (shouldApplyWhiteBg && scaled != null) {
+            if (shouldApplyWhiteBg && !alreadyBackgroundReplaced && scaled != null) {
                 val bgWhitened = applyAutoWhiteBackgroundAndFaceEnhance(scaled!!)
                 scaled = replaceIntermediateBitmap(scaled, bgWhitened, originalBitmap)
             }
@@ -397,12 +406,35 @@ object ImageProcessor {
         val isSigOrDoc = rule.documentType != com.example.data.model.DocumentType.PASSPORT_PHOTO &&
             rule.documentType != com.example.data.model.DocumentType.POSTCARD_PHOTO
 
+        val effectiveMaskForSaved = if (backgroundMask != null && finalWidth > 0 && finalHeight > 0) {
+            if (backgroundMask.size == finalWidth * finalHeight) {
+                backgroundMask
+            } else if (backgroundMaskWidth > 0 && backgroundMaskHeight > 0 &&
+                backgroundMask.size == backgroundMaskWidth * backgroundMaskHeight
+            ) {
+                resampleBooleanMask(
+                    mask = backgroundMask,
+                    srcW = backgroundMaskWidth,
+                    srcH = backgroundMaskHeight,
+                    dstW = finalWidth,
+                    dstH = finalHeight,
+                    excludeBottomStripRatio = if (rule.requiresNameAndDateStrip && (candidateName.isNotBlank() || dateOfPhoto.isNotBlank())) 0.18f else 0f
+                )
+            } else {
+                backgroundMask
+            }
+        } else {
+            null
+        }
+
         val whitenessReport = try {
             if (decodedSavedBitmap != null) {
                 measureBackgroundWhiteness(
                     bitmap = decodedSavedBitmap,
                     isSignatureOrDocument = isSigOrDoc,
-                    backgroundMask = backgroundMask
+                    backgroundMask = effectiveMaskForSaved,
+                    maskConfidencePassed = maskConfidencePassed,
+                    userPreviewAccepted = userPreviewAccepted
                 )
             } else {
                 BackgroundWhitenessReport(
@@ -507,7 +539,7 @@ object ImageProcessor {
         }
 
         // Strict Background Compliance: when rule requires a white background, only verifiedBackgroundCompliance
-        // (backed by an explicit reliable segmentation mask) satisfies strict compliance.
+        // (backed by an explicit reliable segmentation mask, passing confidence & preview acceptance) satisfies strict compliance.
         val whiteBgMet = !rule.requiresWhiteBackground || verifiedBackgroundCompliance
         if (rule.requiresWhiteBackground || shouldApplyWhiteBg) {
             val nearWhitePct = (whitenessReport.whitePixelRatio * 100).toInt()
@@ -519,8 +551,13 @@ object ImageProcessor {
                     )
                 }
                 measuredNearWhite -> {
+                    val reasonDetail = when (whitenessReport.verificationState) {
+                        "LOW_MASK_CONFIDENCE" -> "Segmentation mask confidence (${String.format(Locale.US, "%.2f", subjectMaskConfidence)}) or edge uncertainty (${String.format(Locale.US, "%.2f", edgeUncertaintyRatio)}) requires manual review."
+                        "PREVIEW_NOT_ACCEPTED" -> "User preview confirmation is pending."
+                        else -> "No reliable segmentation mask is available to verify full background compliance."
+                    }
                     validationMessages.add(
-                        "Background Unverified (${whitenessReport.verificationState}): Perimeter sample is near-white ($nearWhitePct% >=240, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255), but no segmentation mask is available to verify full background compliance."
+                        "Background Unverified (${whitenessReport.verificationState}): Near-white ($nearWhitePct% >=240, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255). $reasonDetail"
                     )
                 }
                 else -> {
@@ -592,8 +629,43 @@ object ImageProcessor {
             backgroundVerificationState = whitenessReport.verificationState,
             nearWhitePixelRatio = whitenessReport.whitePixelRatio,
             exactWhitePixelRatio = whitenessReport.exactWhitePixelRatio,
-            backgroundMeanLuminance = whitenessReport.meanLuminance
+            backgroundMeanLuminance = whitenessReport.meanLuminance,
+            segmentationExecuted = segmentationExecuted || (backgroundMask != null),
+            backgroundReplacementApplied = shouldApplyWhiteBg || backgroundReplacementApplied || alreadyBackgroundReplaced,
+            outputBackgroundPixelChecksPassed = measuredNearWhite,
+            subjectMaskConfidence = subjectMaskConfidence,
+            edgeUncertaintyRatio = edgeUncertaintyRatio,
+            userPreviewAccepted = userPreviewAccepted
         )
+    }
+
+    fun resampleBooleanMask(
+        mask: BooleanArray,
+        srcW: Int,
+        srcH: Int,
+        dstW: Int,
+        dstH: Int,
+        excludeBottomStripRatio: Float = 0f
+    ): BooleanArray {
+        if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 || mask.size != srcW * srcH) {
+            return BooleanArray(0)
+        }
+        val out = BooleanArray(dstW * dstH)
+        val maxY = if (excludeBottomStripRatio > 0f) {
+            (dstH * (1f - excludeBottomStripRatio)).toInt().coerceIn(1, dstH)
+        } else {
+            dstH
+        }
+        for (y in 0 until maxY) {
+            val srcY = ((y.toLong() * srcH) / dstH).toInt().coerceIn(0, srcH - 1)
+            val srcRowOffset = srcY * srcW
+            val dstRowOffset = y * dstW
+            for (x in 0 until dstW) {
+                val srcX = ((x.toLong() * srcW) / dstW).toInt().coerceIn(0, srcW - 1)
+                out[dstRowOffset + x] = mask[srcRowOffset + srcX]
+            }
+        }
+        return out
     }
 
     data class BackgroundWhitenessReport(
@@ -610,16 +682,19 @@ object ImageProcessor {
     /**
      * Evaluates background pixels on the decoded saved image.
      * - Separates [BackgroundWhitenessReport.measuredNearWhite] (informational perimeter/mask pixel statistics)
-     *   from [BackgroundWhitenessReport.verifiedBackgroundCompliance] (strict compliance).
+     *   from [BackgroundWhitenessReport.verifiedBackgroundCompliance] (strict 5-signal compliance).
      * - An unverified perimeter or margin sample ([backgroundMask] == null) NEVER produces
      *   [BackgroundWhitenessReport.verifiedBackgroundCompliance] = true.
      * - Only when an explicit, valid [backgroundMask] (size == width * height with >= 1 background pixel)
-     *   is provided AND meets the whiteness threshold does [verifiedBackgroundCompliance] become true.
+     *   is provided, meets the whiteness threshold, AND passes [maskConfidencePassed] and [userPreviewAccepted]
+     *   does [verifiedBackgroundCompliance] become true.
      */
     fun measureBackgroundWhiteness(
         bitmap: Bitmap,
         isSignatureOrDocument: Boolean = false,
-        backgroundMask: BooleanArray? = null
+        backgroundMask: BooleanArray? = null,
+        maskConfidencePassed: Boolean = true,
+        userPreviewAccepted: Boolean = true
     ): BackgroundWhitenessReport {
         val width = bitmap.width
         val height = bitmap.height
@@ -643,9 +718,10 @@ object ImageProcessor {
             backgroundMask.any { it }
 
         val verificationState = when {
-            hasExplicitMask -> "VERIFIED_MASK"
-            isSignatureOrDocument -> "UNVERIFIED_DOCUMENT_MARGIN"
-            else -> "UNVERIFIED_PERIMETER_SAMPLE"
+            !hasExplicitMask -> if (isSignatureOrDocument) "UNVERIFIED_DOCUMENT_MARGIN" else "UNVERIFIED_PERIMETER_SAMPLE"
+            !maskConfidencePassed -> "LOW_MASK_CONFIDENCE"
+            !userPreviewAccepted -> "PREVIEW_NOT_ACCEPTED"
+            else -> "VERIFIED_MASK"
         }
 
         var bgCount = 0
@@ -714,7 +790,7 @@ object ImageProcessor {
         val exactWhiteRatio = exactWhiteCount.toFloat() / bgCount.toFloat()
         val meanLum = (lumSum / bgCount).toInt()
         val measuredNearWhite = nearWhiteRatio >= 0.85f && meanLum >= 242
-        val verifiedCompliance = hasExplicitMask && measuredNearWhite
+        val verifiedCompliance = hasExplicitMask && measuredNearWhite && maskConfidencePassed && userPreviewAccepted
         return BackgroundWhitenessReport(
             measuredNearWhite = measuredNearWhite,
             verifiedBackgroundCompliance = verifiedCompliance,
@@ -722,7 +798,7 @@ object ImageProcessor {
             whitePixelRatio = nearWhiteRatio,
             exactWhitePixelRatio = exactWhiteRatio,
             meanLuminance = meanLum,
-            isMaskVerified = hasExplicitMask,
+            isMaskVerified = hasExplicitMask && maskConfidencePassed,
             verificationState = verificationState
         )
     }

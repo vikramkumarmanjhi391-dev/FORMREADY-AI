@@ -85,12 +85,16 @@ data class UnifiedMediaInput(
     val mimeType: String = "image/jpeg",
     val timestamp: Long = System.currentTimeMillis(),
     val rotationDegrees: Int = 0,
-    val displayName: String = "media_${System.currentTimeMillis()}"
+    val displayName: String = "media_${System.currentTimeMillis()}",
+    val mappedSensorCropRectNorm: RectF? = null,
+    val captureIntent: CaptureIntent? = null
 ) {
     val file: File? get() = privateFile
     val fileSizeBytes: Long get() = privateFile?.length() ?: 0L
     val isFromCamera: Boolean
         get() = origin == MediaInputOrigin.CAMERA || origin == MediaInputOrigin.IN_APP_CAMERA
+    val effectiveGuideCropRectNorm: RectF
+        get() = mappedSensorCropRectNorm ?: mode.guideCropRectNorm
 
     /**
      * Resolves a working Bitmap safely with EXIF orientation correction and memory bounds protection.
@@ -187,7 +191,8 @@ data class UnifiedMediaInput(
             uri: Uri,
             mode: CameraCaptureMode,
             displayName: String = "gallery_image",
-            mimeType: String = "image/jpeg"
+            mimeType: String = "image/jpeg",
+            captureIntent: CaptureIntent? = null
         ): UnifiedMediaInput {
             return UnifiedMediaInput(
                 uri = uri,
@@ -195,7 +200,8 @@ data class UnifiedMediaInput(
                 origin = MediaInputOrigin.GALLERY,
                 mode = mode,
                 mimeType = mimeType,
-                displayName = displayName
+                displayName = displayName,
+                captureIntent = captureIntent
             )
         }
 
@@ -215,7 +221,13 @@ data class UnifiedMediaInput(
             )
         }
 
-        fun fromCameraFile(file: File, mode: CameraCaptureMode, rotationDegrees: Int = 0): UnifiedMediaInput {
+        fun fromCameraFile(
+            file: File,
+            mode: CameraCaptureMode,
+            rotationDegrees: Int = 0,
+            mappedSensorCropRectNorm: RectF? = null,
+            captureIntent: CaptureIntent? = null
+        ): UnifiedMediaInput {
             val ext = file.extension.lowercase(Locale.US)
             val detectedMime = when (ext) {
                 "png" -> "image/png"
@@ -229,7 +241,9 @@ data class UnifiedMediaInput(
                 mode = mode,
                 mimeType = detectedMime,
                 rotationDegrees = rotationDegrees,
-                displayName = file.name
+                displayName = file.name,
+                mappedSensorCropRectNorm = mappedSensorCropRectNorm,
+                captureIntent = captureIntent
             )
         }
 

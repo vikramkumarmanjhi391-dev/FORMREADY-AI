@@ -98,6 +98,9 @@ data class DocumentRule(
     val colorMode: ColorMode = ColorMode.COLOUR,
     val requiresWhiteBackground: Boolean = false,
     val requiresNameAndDateStrip: Boolean = false,
+    val minHeadHeightRatio: Float? = null,
+    val maxHeadHeightRatio: Float? = null,
+    val topHeadroomRatio: Float? = null,
     val instructions: String = ""
 )
 
@@ -114,6 +117,9 @@ data class PortalSpec(
     val verificationStatus: VerificationStatus,
     val lastVerifiedDate: String,
     val version: String = "v1.4",
+    val notificationNumber: String? = null,
+    val recruitmentCycle: String = year,
+    val sourceRevisionDate: String? = null,
     val documents: List<DocumentRule>
 )
 
@@ -142,7 +148,13 @@ data class ProcessedFileResult(
     val backgroundVerificationState: String = "UNVERIFIED",
     val nearWhitePixelRatio: Float = 0f,
     val exactWhitePixelRatio: Float = 0f,
-    val backgroundMeanLuminance: Int = 0
+    val backgroundMeanLuminance: Int = 0,
+    val segmentationExecuted: Boolean = false,
+    val backgroundReplacementApplied: Boolean = false,
+    val outputBackgroundPixelChecksPassed: Boolean = measuredNearWhite,
+    val subjectMaskConfidence: Float = 0f,
+    val edgeUncertaintyRatio: Float = 0f,
+    val userPreviewAccepted: Boolean = false
 )
 
 data class ValidationIssue(

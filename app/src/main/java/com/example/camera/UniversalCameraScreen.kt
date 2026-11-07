@@ -79,14 +79,19 @@ import kotlin.math.roundToInt
 
 @Composable
 fun UniversalCameraScreen(
-    mode: CameraCaptureMode,
+    mode: CameraCaptureMode = CameraCaptureMode.PASSPORT_PHOTO,
     onMediaCaptured: (UnifiedMediaInput) -> Unit,
     onMultiPageCaptured: ((List<File>) -> Unit)? = null,
     onDismiss: () -> Unit,
-    instantOneClickByDefault: Boolean = !mode.isMultiPageAllowed
+    instantOneClickByDefault: Boolean = !mode.isMultiPageAllowed,
+    captureIntent: CaptureIntent = CaptureIntent.ForStudio(mode)
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    var activeMode by remember(captureIntent, mode) {
+        mutableStateOf(captureIntent.initialMode)
+    }
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -122,9 +127,9 @@ fun UniversalCameraScreen(
 
     val cameraController = remember { UniversalCameraController(context) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
-    var lensFacing by remember {
+    var lensFacing by remember(activeMode) {
         mutableIntStateOf(
-            if (mode.defaultToFrontCamera) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+            if (activeMode.defaultToFrontCamera) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
         )
     }
     var hasFlashUnit by remember { mutableStateOf(false) }
@@ -133,7 +138,9 @@ fun UniversalCameraScreen(
     var isInitializing by remember { mutableStateOf(true) }
     var cameraError by remember { mutableStateOf<String?>(null) }
     var resumeTrigger by remember { mutableIntStateOf(0) }
-    var isInstantOneClick by remember(mode) { mutableStateOf(instantOneClickByDefault && !mode.isMultiPageAllowed) }
+    var isInstantOneClick by remember(activeMode) {
+        mutableStateOf(instantOneClickByDefault && !activeMode.isMultiPageAllowed)
+    }
 
     // Tap-to-focus visual indicator state
     var focusTapOffset by remember { mutableStateOf<Offset?>(null) }
@@ -142,6 +149,47 @@ fun UniversalCameraScreen(
     var capturedFileForReview by remember { mutableStateOf<File?>(null) }
     val multiPageCaptures = remember { mutableStateListOf<File>() }
     var sessionTransferredOwnership by remember { mutableStateOf(false) }
+
+    val buildMappedMediaInput: (File) -> UnifiedMediaInput = { file ->
+        val pv = previewView
+        val pvW = pv?.width?.takeIf { it > 0 } ?: 1080
+        val pvH = pv?.height?.takeIf { it > 0 } ?: 1920
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+        val exifRot = try {
+            val exif = android.media.ExifInterface(file.absolutePath)
+            when (exif.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, android.media.ExifInterface.ORIENTATION_NORMAL)) {
+                android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                else -> 0
+            }
+        } catch (_: Exception) {
+            0
+        }
+        val rawW = bounds.outWidth.takeIf { it > 0 } ?: 1200
+        val rawH = bounds.outHeight.takeIf { it > 0 } ?: 1600
+        val guideRect = CaptureIntent.resolveGuideRectNorm(activeMode, captureIntent.targetAspectRatio)
+        val mappedRect = CameraViewportMapper.mapPreviewRectToSensorNormalizedRect(
+            previewRectNorm = guideRect,
+            config = CameraViewportMapper.ViewportMappingConfig(
+                rawSensorWidth = rawW,
+                rawSensorHeight = rawH,
+                rotationDegrees = exifRot,
+                previewWidth = pvW,
+                previewHeight = pvH,
+                isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT,
+                isSavedOutputMirrored = false
+            )
+        )
+        UnifiedMediaInput.fromCameraFile(
+            file = file,
+            mode = activeMode,
+            rotationDegrees = exifRot,
+            mappedSensorCropRectNorm = mappedRect,
+            captureIntent = captureIntent
+        )
+    }
 
     val dismissAndCleanup: () -> Unit = {
         if (!sessionTransferredOwnership) {
@@ -240,9 +288,9 @@ fun UniversalCameraScreen(
     if (capturedFileForReview != null) {
         CameraCaptureReviewView(
             file = capturedFileForReview!!,
-            mode = mode,
+            mode = activeMode,
             pageIndex = multiPageCaptures.size + 1,
-            isMultiPageAllowed = mode.isMultiPageAllowed,
+            isMultiPageAllowed = activeMode.isMultiPageAllowed,
             onRetake = {
                 val toDelete = capturedFileForReview
                 capturedFileForReview = null
@@ -252,11 +300,11 @@ fun UniversalCameraScreen(
                 val file = capturedFileForReview!!
                 sessionTransferredOwnership = true
                 capturedFileForReview = null
-                if (mode.isMultiPageAllowed) {
+                if (activeMode.isMultiPageAllowed) {
                     multiPageCaptures.add(file)
                     onMultiPageCaptured?.invoke(multiPageCaptures.toList())
                 } else {
-                    val mediaInput = UnifiedMediaInput.fromCameraFile(file, mode)
+                    val mediaInput = buildMappedMediaInput(file)
                     onMediaCaptured(mediaInput)
                 }
             },
@@ -311,7 +359,7 @@ fun UniversalCameraScreen(
         }
 
         // Mode-Specific Visual Guidance Overlay (with darkened outer mask)
-        CameraModeGuidanceOverlay(mode = mode)
+        CameraModeGuidanceOverlay(mode = activeMode)
 
         // Top Control Bar
         Row(
@@ -343,14 +391,14 @@ fun UniversalCameraScreen(
                     color = Color.Black.copy(alpha = 0.65f)
                 ) {
                     Text(
-                        text = mode.title,
+                        text = if (captureIntent is CaptureIntent.ForPortalRule) captureIntent.contextLabel else activeMode.title,
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                     )
                 }
-                if (!mode.isMultiPageAllowed) {
+                if (!activeMode.isMultiPageAllowed) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Surface(
                         onClick = { isInstantOneClick = !isInstantOneClick },
@@ -449,6 +497,41 @@ fun UniversalCameraScreen(
                 .align(Alignment.BottomCenter),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // Task Selector Bar when opened from a generic entry point
+            if (captureIntent.showTaskSelector) {
+                Row(
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .testTag("camera_task_selector_bar"),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val selectableModes = listOf(
+                        CameraCaptureMode.PASSPORT_PHOTO to "Photo",
+                        CameraCaptureMode.SIGNATURE to "Signature",
+                        CameraCaptureMode.THUMB_IMPRESSION to "Thumb",
+                        CameraCaptureMode.DOCUMENT_PAGE to "Doc / ID"
+                    )
+                    selectableModes.forEach { (itemMode, shortLabel) ->
+                        val selected = activeMode == itemMode
+                        Surface(
+                            onClick = { activeMode = itemMode },
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (selected) Color.White else Color.Black.copy(alpha = 0.65f),
+                            modifier = Modifier.testTag("camera_mode_pill_${itemMode.name.lowercase()}")
+                        ) {
+                            Text(
+                                text = shortLabel,
+                                color = if (selected) Color.Black else Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+            }
+
             // Instruction Banner
             Surface(
                 shape = RoundedCornerShape(10.dp),
@@ -456,7 +539,7 @@ fun UniversalCameraScreen(
                 modifier = Modifier.padding(horizontal = 24.dp)
             ) {
                 Text(
-                    text = "${mode.instruction} (Tap to focus)",
+                    text = "${activeMode.instruction} (Tap to focus)",
                     color = Color.White.copy(alpha = 0.95f),
                     fontSize = 12.sp,
                     textAlign = TextAlign.Center,
@@ -491,10 +574,10 @@ fun UniversalCameraScreen(
                                     previewView = previewView,
                                     onSuccess = { file, _ ->
                                         isCapturing = false
-                                        if (isInstantOneClick && !mode.isMultiPageAllowed) {
+                                        if (isInstantOneClick && !activeMode.isMultiPageAllowed) {
                                             // Instant 1-Click Auto-Processing: transfer directly without manual review step
                                             sessionTransferredOwnership = true
-                                            val mediaInput = UnifiedMediaInput.fromCameraFile(file, mode)
+                                            val mediaInput = buildMappedMediaInput(file)
                                             onMediaCaptured(mediaInput)
                                         } else {
                                             capturedFileForReview = file
@@ -527,7 +610,7 @@ fun UniversalCameraScreen(
                     }
                 }
 
-                if (mode.isMultiPageAllowed && multiPageCaptures.isNotEmpty()) {
+                if (activeMode.isMultiPageAllowed && multiPageCaptures.isNotEmpty()) {
                     Spacer(modifier = Modifier.width(20.dp))
                     Button(
                         onClick = {

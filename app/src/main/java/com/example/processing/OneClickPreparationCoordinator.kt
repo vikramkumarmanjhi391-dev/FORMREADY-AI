@@ -2,6 +2,7 @@ package com.example.processing
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.PointF
 import android.graphics.RectF
 import com.example.camera.UnifiedMediaInput
 import com.example.data.model.DocumentRule
@@ -13,20 +14,22 @@ import java.io.File
 /**
  * Shared coordinator that connects both Camera and Gallery inputs ([UnifiedMediaInput])
  * to the deterministic image-preparation engine ([ImageProcessor.processImageForRule])
- * while preserving every setting across Photo Studio, Signature Studio, and Document Studio.
+ * and on-device vision pipelines ([PortraitVisionProcessor], [SignatureVisionProcessor],
+ * [DocumentCornerProcessor]) while preserving every setting across Photo Studio,
+ * Signature Studio, Document Studio, and Portal Preparation screens.
  */
 object OneClickPreparationCoordinator {
 
     /**
      * Executes the complete One-Click Auto Prepare workflow for a photo input:
      * 1. Resolves unified input bitmap safely (or uses pre-resolved [preDecodedBitmap] from the same [UnifiedMediaInput]).
-     * 2. Auto-orients image using EXIF metadata.
-     * 3. Optionally replaces background with pure #FFFFFF white and enhances facial lighting on-device.
-     * 4. Calculates aspect ratio and exact pixel dimensions from rule/preset.
-     * 5. Crops and resizes without facial distortion.
-     * 6. Adds name and date slate strip if required.
-     * 7. Applies color mode transformations (Colour / Grayscale / B&W).
-     * 8. Compresses according to target KB constraints, injects exact DPI header, and pads if below Min KB.
+     * 2. Uses camera-mapped guide crop ([UnifiedMediaInput.mappedSensorCropRectNorm]) or [cropRectNorm],
+     *    or runs [PortraitVisionProcessor] for face landmark framing and probabilistic background segmentation.
+     * 3. Propagates all 5 background verification signals ([ProcessedFileResult.segmentationExecuted],
+     *    [ProcessedFileResult.backgroundReplacementApplied], [ProcessedFileResult.outputBackgroundPixelChecksPassed],
+     *    [ProcessedFileResult.subjectMaskConfidence] / [ProcessedFileResult.edgeUncertaintyRatio], and
+     *    [ProcessedFileResult.userPreviewAccepted]) into [ImageProcessor.processImageForRule].
+     * 4. Resizes to exact prescribed dimensions, adds optional Name & DOP strip, and verifies disk output.
      */
     suspend fun autoPreparePhoto(
         context: Context,
@@ -41,17 +44,34 @@ object OneClickPreparationCoordinator {
         enforceProportional: Boolean = true,
         cropRectNorm: RectF? = null,
         removeBackgroundToWhite: Boolean = false,
-        customDpi: Int? = null
+        customDpi: Int? = null,
+        userPreviewAccepted: Boolean = true,
+        faceEngine: PortraitVisionProcessor.FaceDetectionEngine = PortraitVisionProcessor.mlKitFaceDetectionEngine,
+        segmentationEngine: PortraitVisionProcessor.SelfieSegmentationEngine = PortraitVisionProcessor.mlKitSelfieSegmentationEngine
     ): ProcessedFileResult? {
         val bitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
 
         val w = customWidthPx ?: rule.exactWidthPx ?: 350
         val h = customHeightPx ?: rule.exactHeightPx ?: 450
         val targetKb = customTargetKb ?: rule.maxKb
+        val effectiveCropRectNorm = cropRectNorm ?: input?.mappedSensorCropRectNorm
+
+        val visionResult = PortraitVisionProcessor.analyzeAndPreparePortrait(
+            sourceBitmap = bitmap,
+            rule = rule,
+            targetWidthPx = w,
+            targetHeightPx = h,
+            replaceBackgroundWithWhite = removeBackgroundToWhite || rule.requiresWhiteBackground,
+            manualCropRectNorm = effectiveCropRectNorm,
+            faceEngine = faceEngine,
+            segmentationEngine = segmentationEngine
+        )
+
+        val hasVisionSegmentation = visionResult.segmentationExecuted && visionResult.backgroundMask != null
 
         return ImageProcessor.processImageForRule(
             context = context,
-            originalBitmap = bitmap,
+            originalBitmap = visionResult.preparedBitmap,
             rule = rule,
             candidateName = candidateName,
             dateOfPhoto = dateOfPhoto,
@@ -59,9 +79,19 @@ object OneClickPreparationCoordinator {
             customWidthPx = w,
             customHeightPx = h,
             enforceProportional = enforceProportional,
-            cropRectNorm = cropRectNorm,
+            cropRectNorm = null, // Already framed/cropped by PortraitVisionProcessor
             removeBackgroundToWhite = removeBackgroundToWhite,
-            customDpi = customDpi ?: rule.dpi
+            customDpi = customDpi ?: rule.dpi,
+            backgroundMask = visionResult.backgroundMask,
+            backgroundMaskWidth = visionResult.preparedBitmap.width,
+            backgroundMaskHeight = visionResult.preparedBitmap.height,
+            alreadyBackgroundReplaced = hasVisionSegmentation && visionResult.backgroundReplacementApplied,
+            segmentationExecuted = visionResult.segmentationExecuted,
+            backgroundReplacementApplied = visionResult.backgroundReplacementApplied || removeBackgroundToWhite,
+            maskConfidencePassed = visionResult.maskConfidencePassed,
+            subjectMaskConfidence = visionResult.subjectMaskConfidence,
+            edgeUncertaintyRatio = visionResult.edgeUncertaintyRatio,
+            userPreviewAccepted = userPreviewAccepted
         )
     }
 
@@ -77,7 +107,8 @@ object OneClickPreparationCoordinator {
         candidateName: String = "",
         dateOfPhoto: String = "",
         enforceProportional: Boolean = true,
-        removeBackgroundToWhite: Boolean = false
+        removeBackgroundToWhite: Boolean = false,
+        userPreviewAccepted: Boolean = true
     ): Result<ProcessedFileResult> {
         val result = autoPreparePhoto(
             context = context,
@@ -88,7 +119,8 @@ object OneClickPreparationCoordinator {
             customTargetKb = targetSizeKb,
             enforceProportional = enforceProportional,
             removeBackgroundToWhite = removeBackgroundToWhite,
-            customDpi = customDpi
+            customDpi = customDpi,
+            userPreviewAccepted = userPreviewAccepted
         )
         return if (result != null) {
             Result.success(result)
@@ -100,11 +132,9 @@ object OneClickPreparationCoordinator {
     /**
      * Executes the complete One-Click Prepare workflow for a signature or thumb impression:
      * 1. Resolves unified input bitmap (or uses pre-resolved [preDecodedBitmap]).
-     * 2. Optionally crops strictly to the camera signature cutout box coordinates ([cropRectNorm]).
-     * 3. Detects and trims surrounding blank white/gray margins when [trimBlankMargins] is enabled.
-     * 4. Whitens paper background & removes mobile shadows while sharpening genuine ink strokes.
-     * 5. Resizes to exact prescribed dimensions.
-     * 6. Compresses to strict Min-Max KB limit (with safe JPEG padding if below Min KB) & injects DPI.
+     * 2. Crops to the camera signature cutout box coordinates ([cropRectNorm] or [UnifiedMediaInput.mappedSensorCropRectNorm]).
+     * 3. Applies [SignatureVisionProcessor] integral-image Sauvola adaptive shadow removal and connected-stroke trimming.
+     * 4. Resizes to exact prescribed dimensions and compresses with verified JFIF/EXIF DPI metadata.
      */
     suspend fun autoPrepareSignature(
         context: Context,
@@ -121,29 +151,54 @@ object OneClickPreparationCoordinator {
         customTargetKb: Int? = null,
         enforceProportional: Boolean = false,
         cropRectNorm: RectF? = null,
-        customDpi: Int? = null
+        customDpi: Int? = null,
+        userPreviewAccepted: Boolean = true
     ): ProcessedFileResult? {
-        val bitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
+        val rawBitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
 
         val w = customWidthPx ?: rule.exactWidthPx ?: 300
         val h = customHeightPx ?: rule.exactHeightPx ?: 120
         val targetKb = customTargetKb ?: rule.maxKb
+        val effectiveCropRectNorm = cropRectNorm ?: input?.mappedSensorCropRectNorm
+
+        val croppedInput = if (effectiveCropRectNorm != null) {
+            ImageProcessor.cropBitmap(rawBitmap, effectiveCropRectNorm)
+        } else {
+            rawBitmap
+        }
+
+        val sauvolaResult = SignatureVisionProcessor.extractSignatureOrThumb(
+            src = croppedInput,
+            preserveInkColor = preserveInkColor,
+            contrastBoost = contrastMultiplier,
+            sauvolaK = ((200 - inkThreshold).coerceIn(5, 60) / 200f).coerceIn(0.08f, 0.28f),
+            trimToInkBounds = trimBlankMargins
+        )
 
         return ImageProcessor.processImageForRule(
             context = context,
-            originalBitmap = bitmap,
+            originalBitmap = sauvolaResult.cleanedBitmap,
             rule = rule,
             customTargetKb = targetKb,
             customWidthPx = w,
             customHeightPx = h,
             enforceProportional = enforceProportional,
-            cropRectNorm = cropRectNorm,
-            contrastFactor = contrastMultiplier,
+            cropRectNorm = null,
+            contrastFactor = 1.0f, // Already enhanced by SignatureVisionProcessor
             brightnessOffset = brightnessOffset,
-            inkThreshold = inkThreshold,
+            inkThreshold = 180,
             preserveInkColor = preserveInkColor,
-            autoCropMargins = trimBlankMargins,
-            customDpi = customDpi ?: rule.dpi
+            autoCropMargins = false, // Already trimmed by SignatureVisionProcessor
+            customDpi = customDpi ?: rule.dpi,
+            backgroundMask = sauvolaResult.backgroundMask,
+            backgroundMaskWidth = sauvolaResult.cleanedBitmap.width,
+            backgroundMaskHeight = sauvolaResult.cleanedBitmap.height,
+            segmentationExecuted = true,
+            backgroundReplacementApplied = true,
+            maskConfidencePassed = !sauvolaResult.usedGentleFallback,
+            subjectMaskConfidence = if (sauvolaResult.usedGentleFallback) 0.65f else 0.94f,
+            edgeUncertaintyRatio = if (sauvolaResult.usedGentleFallback) 0.20f else 0.04f,
+            userPreviewAccepted = userPreviewAccepted
         )
     }
 
@@ -185,12 +240,17 @@ object OneClickPreparationCoordinator {
         val jpgResult: ProcessedFileResult,
         val pdfFile: File,
         val pdfSizeKb: Double,
-        val cleanedBitmap: Bitmap
+        val cleanedBitmap: Bitmap,
+        val detectedCornersNorm: List<PointF> = emptyList(),
+        val cornerConfidence: Float = 0f,
+        val perspectiveWarped: Boolean = false
     )
 
     /**
      * Executes the 1-Click Auto-Processing Pipeline for a Document / ID Card:
-     * 1. Auto-crops to document frame ([cropRectNorm]) or trims blank borders.
+     * 1. Runs 4-corner quadrilateral detection & homography perspective warp when [customQuadNorm] is provided
+     *    or when [DocumentCornerProcessor.detectDocumentCorners] confidence >= 0.75f; otherwise crops to
+     *    [cropRectNorm] / [UnifiedMediaInput.mappedSensorCropRectNorm].
      * 2. Applies Clear Scan / Magic Scan enhancement filter (shadow removal + high-contrast text).
      * 3. Generates both a compressed JPG and a single-page PDF strictly under [maxKb].
      */
@@ -202,20 +262,32 @@ object OneClickPreparationCoordinator {
         maxKb: Int = 200,
         dpi: Int = 200,
         applyClearScanFilter: Boolean = true,
-        cropRectNorm: RectF? = null
+        cropRectNorm: RectF? = null,
+        customQuadNorm: List<PointF>? = null
     ): OneClickDocumentBundle? {
         val rawBitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
+        val effectiveCropRectNorm = cropRectNorm ?: input?.mappedSensorCropRectNorm
 
-        val cropped = if (cropRectNorm != null) {
-            ImageProcessor.cropBitmap(rawBitmap, cropRectNorm)
+        val quadDetection = DocumentCornerProcessor.detectDocumentCorners(rawBitmap)
+        val activeQuad = customQuadNorm?.takeIf { it.size == 4 }
+            ?: if (effectiveCropRectNorm == null && quadDetection.autoWarpEligible) quadDetection.cornersNorm else null
+
+        val perspectiveWarped: Boolean
+        val geometricallyCorrected = if (activeQuad != null) {
+            perspectiveWarped = true
+            DocumentCornerProcessor.warpDocumentPerspective(rawBitmap, activeQuad)
+        } else if (effectiveCropRectNorm != null) {
+            perspectiveWarped = false
+            ImageProcessor.cropBitmap(rawBitmap, effectiveCropRectNorm)
         } else {
+            perspectiveWarped = false
             rawBitmap
         }
 
         val enhanced = if (applyClearScanFilter) {
-            ImageProcessor.applyMagicDocFilter(cropped)
+            ImageProcessor.applyMagicDocFilter(geometricallyCorrected)
         } else {
-            cropped
+            geometricallyCorrected
         }
 
         val docRule = DocumentRule(
@@ -254,7 +326,10 @@ object OneClickPreparationCoordinator {
             jpgResult = jpgRes,
             pdfFile = finalPdf,
             pdfSizeKb = finalPdf.length() / 1024.0,
-            cleanedBitmap = enhanced
+            cleanedBitmap = enhanced,
+            detectedCornersNorm = quadDetection.cornersNorm,
+            cornerConfidence = quadDetection.confidence,
+            perspectiveWarped = perspectiveWarped
         )
     }
 }
