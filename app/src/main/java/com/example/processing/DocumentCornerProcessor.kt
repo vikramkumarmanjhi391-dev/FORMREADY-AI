@@ -12,22 +12,29 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * Phase 3B: On-Device Document & ID Card 4-Corner Detection and Homography Perspective Warp.
+ * Phase 3B / Phase 0.4D: On-Device Document & ID Card 4-Corner Detection and Homography Perspective Warp.
  *
  * Responsibilities:
- * 1. Detects the 4 corners (`topLeft`, `topRight`, `bottomRight`, `bottomLeft` in normalized
- *    `[0..1]` coordinates) of a photographed page or ID card using luminance contrast / Sobel
- *    gradient analysis.
- * 2. Computes a quadrilateral confidence score (`0.0f..1.0f`) based on convexity, interior corner
- *    angles (`45°..135°`), area coverage (`>= 18%`), and boundary gradient support.
- * 3. Flags uncertain detections (`confidence < 0.75f`) so the UI presents interactive 4-corner
- *    drag handles rather than silently warping random background edges.
- * 4. Solves the 8-DOF 3×3 projective homography matrix and performs bilinear perspective
+ * 1. Discovers 8-connected foreground document components on a downsampled luminance + Sobel
+ *    gradient grid (`maxSampleDim = 240`), suppressing textured background noise (such as wood grain)
+ *    using outer-border percentile statistics.
+ * 2. Rejects disconnected 4-corner clutter, competing multi-object scenes, and border-clipped documents
+ *    from unattended auto-warping.
+ * 3. Evaluates 4-edge directional normal-gradient continuity (`minEdgeSupport >= 0.65f`), convex
+ *    interior corner angles (`55°..125°`), component solidity (`>= 0.75f`), and area coverage (`16%..92%`).
+ * 4. Enforces `AUTO_WARP_CONFIDENCE_THRESHOLD = 0.80f` so any uncertain scene sets
+ *    `requiresUserConfirmation = true` (`autoWarpEligible = false`) and opens interactive 4-corner handles.
+ * 5. Solves the 8-DOF 3×3 projective homography matrix and performs bilinear perspective
  *    rectification into a flat, upright rectangular [Bitmap].
  */
 object DocumentCornerProcessor {
 
-    const val AUTO_WARP_CONFIDENCE_THRESHOLD = 0.75f
+    const val AUTO_WARP_CONFIDENCE_THRESHOLD = 0.80f
+    const val MIN_CANDIDATE_AREA_RATIO = 0.05f
+    const val MIN_AUTO_WARP_AREA_RATIO = 0.16f
+    const val MAX_AUTO_WARP_AREA_RATIO = 0.92f
+    const val MIN_EDGE_SUPPORT_RATIO = 0.65f
+    const val MIN_QUAD_SOLIDITY = 0.75f
 
     data class DocumentQuadNorm(
         val topLeft: PointF,
@@ -35,7 +42,10 @@ object DocumentCornerProcessor {
         val bottomRight: PointF,
         val bottomLeft: PointF,
         val confidence: Float,
-        val requiresUserConfirmation: Boolean = confidence < AUTO_WARP_CONFIDENCE_THRESHOLD
+        val requiresUserConfirmation: Boolean = confidence < AUTO_WARP_CONFIDENCE_THRESHOLD,
+        val minEdgeSupport: Float = 0f,
+        val isClippedAtBorder: Boolean = false,
+        val hasCompetingObjects: Boolean = false
     ) {
         fun toPointsList(): List<PointF> = listOf(topLeft, topRight, bottomRight, bottomLeft)
 
@@ -43,7 +53,10 @@ object DocumentCornerProcessor {
             get() = toPointsList()
 
         val autoWarpEligible: Boolean
-            get() = !requiresUserConfirmation
+            get() = !requiresUserConfirmation &&
+                confidence >= AUTO_WARP_CONFIDENCE_THRESHOLD &&
+                !isClippedAtBorder &&
+                !hasCompetingObjects
 
         companion object {
             fun defaultInsetFrame(marginNorm: Float = 0.07f): DocumentQuadNorm {
@@ -60,6 +73,16 @@ object DocumentCornerProcessor {
         }
     }
 
+    private data class ConnectedComponentInfo(
+        val id: Int,
+        val pixelCount: Int,
+        val borderTouchCount: Int,
+        val minX: Int,
+        val minY: Int,
+        val maxX: Int,
+        val maxY: Int
+    )
+
     /**
      * Detects the dominant 4-corner document quadrilateral in [bitmap].
      * Always returns ordered corners (`topLeft`, `topRight`, `bottomRight`, `bottomLeft`) in `[0..1]`.
@@ -71,7 +94,6 @@ object DocumentCornerProcessor {
             return DocumentQuadNorm.defaultInsetFrame()
         }
 
-        // Downsample for fast edge/foreground analysis
         val maxSampleDim = 240
         val scale = min(1f, maxSampleDim.toFloat() / max(srcW, srcH).toFloat())
         val w = (srcW * scale).roundToInt().coerceAtLeast(32)
@@ -88,9 +110,12 @@ object DocumentCornerProcessor {
             sampled.recycle()
         }
 
-        val lum = IntArray(w * h)
+        val totalPixels = w * h
+        val lum = IntArray(totalPixels)
+        val borderLums = IntArray(2 * (w + h) * 3)
+        var borderIdx = 0
         var borderLumSum = 0L
-        var borderCount = 0
+
         for (y in 0 until h) {
             val yOff = y * w
             for (x in 0 until w) {
@@ -98,75 +123,178 @@ object DocumentCornerProcessor {
                 val l = (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
                 lum[yOff + x] = l
                 if (x < 3 || x >= w - 3 || y < 3 || y >= h - 3) {
+                    if (borderIdx < borderLums.size) {
+                        borderLums[borderIdx++] = l
+                    }
                     borderLumSum += l
-                    borderCount++
                 }
             }
         }
-        val borderMeanLum = if (borderCount > 0) (borderLumSum / borderCount).toInt() else 60
 
-        // Sobel gradient + luminance contrast against outer border backdrop
-        val gradMag = FloatArray(w * h)
-        val isDocCandidate = BooleanArray(w * h)
-        var candidateCount = 0
+        val sortedBorder = borderLums.copyOf(borderIdx).also { it.sort() }
+        val borderMeanLum = if (borderIdx > 0) (borderLumSum / borderIdx).toInt() else 60
+        val borderP90Lum = if (sortedBorder.isNotEmpty()) sortedBorder[(sortedBorder.size * 0.90).toInt().coerceIn(0, sortedBorder.lastIndex)] else borderMeanLum
+        val borderP35Lum = if (sortedBorder.isNotEmpty()) sortedBorder[(sortedBorder.size * 0.35).toInt().coerceIn(0, sortedBorder.lastIndex)] else borderMeanLum
+        val borderP10Lum = if (sortedBorder.isNotEmpty()) sortedBorder[(sortedBorder.size * 0.10).toInt().coerceIn(0, sortedBorder.lastIndex)] else borderMeanLum
+
+        // Compute 3x3 smoothed luminance and Sobel directional gradients
+        val gxArr = FloatArray(totalPixels)
+        val gyArr = FloatArray(totalPixels)
+        val gradMag = FloatArray(totalPixels)
+        val isDocCandidate = BooleanArray(totalPixels)
+
+        // Adaptive threshold above textured backdrop (e.g., wood-grain desk), while handling
+        // bimodal borders when a clipped document extends off 1-2 frame edges (borderP90 - borderP10 > 60)
+        val brightThreshold = if (borderP90Lum - borderP10Lum > 60) {
+            borderP35Lum + 32
+        } else {
+            max(borderP90Lum + 22, borderMeanLum + 28)
+        }
+        val darkThreshold = min(borderP10Lum - 22, borderMeanLum - 28)
 
         for (y in 1 until h - 1) {
             for (x in 1 until w - 1) {
                 val idx = y * w + x
-                val gx = -lum[(y - 1) * w + (x - 1)] + lum[(y - 1) * w + (x + 1)] -
+                val gx = (-lum[(y - 1) * w + (x - 1)] + lum[(y - 1) * w + (x + 1)] -
                     2 * lum[y * w + (x - 1)] + 2 * lum[y * w + (x + 1)] -
-                    lum[(y + 1) * w + (x - 1)] + lum[(y + 1) * w + (x + 1)]
-                val gy = -lum[(y - 1) * w + (x - 1)] - 2 * lum[(y - 1) * w + x] - lum[(y - 1) * w + (x + 1)] +
-                    lum[(y + 1) * w + (x - 1)] + 2 * lum[(y + 1) * w + x] + lum[(y + 1) * w + (x + 1)]
-                val mag = sqrt((gx * gx + gy * gy).toFloat())
-                gradMag[idx] = mag
+                    lum[(y + 1) * w + (x - 1)] + lum[(y + 1) * w + (x + 1)]).toFloat()
+                val gy = (-lum[(y - 1) * w + (x - 1)] - 2 * lum[(y - 1) * w + x] - lum[(y - 1) * w + (x + 1)] +
+                    lum[(y + 1) * w + (x - 1)] + 2 * lum[(y + 1) * w + x] + lum[(y + 1) * w + (x + 1)]).toFloat()
+                gxArr[idx] = gx
+                gyArr[idx] = gy
+                gradMag[idx] = sqrt(gx * gx + gy * gy)
 
-                val lumDiffFromBorder = abs(lum[idx] - borderMeanLum)
-                if (lumDiffFromBorder >= 28 || (lum[idx] >= 185 && borderMeanLum < 150)) {
+                val l = lum[idx]
+                if (l >= brightThreshold || (borderMeanLum > 170 && l <= darkThreshold)) {
                     isDocCandidate[idx] = true
-                    candidateCount++
                 }
             }
         }
 
-        if (candidateCount < (w * h * 0.12f).toInt()) {
+        // Morphological 3x3 filter to preserve 90-degree document corners (which have 4 neighbors
+        // inside the quad) while removing isolated 1-pixel and 2-pixel background noise specks
+        val filteredCandidate = BooleanArray(totalPixels)
+        for (y in 1 until h - 1) {
+            val yOff = y * w
+            for (x in 1 until w - 1) {
+                if (!isDocCandidate[yOff + x]) continue
+                var neighbors = 0
+                for (dy in -1..1) {
+                    val nyOff = (y + dy) * w
+                    for (dx in -1..1) {
+                        if (isDocCandidate[nyOff + x + dx]) neighbors++
+                    }
+                }
+                if (neighbors >= 4) {
+                    filteredCandidate[yOff + x] = true
+                }
+            }
+        }
+
+        // 8-Connected Component Labeling
+        val labels = IntArray(totalPixels)
+        val components = mutableListOf<ConnectedComponentInfo>()
+        val queue = IntArray(totalPixels)
+        var nextLabel = 1
+        val minComponentPixels = (totalPixels * MIN_CANDIDATE_AREA_RATIO).toInt().coerceAtLeast(32)
+
+        for (y in 1 until h - 1) {
+            for (x in 1 until w - 1) {
+                val startIdx = y * w + x
+                if (!filteredCandidate[startIdx] || labels[startIdx] != 0) continue
+
+                val currentLabel = nextLabel++
+                var head = 0
+                var tail = 0
+                queue[tail++] = startIdx
+                labels[startIdx] = currentLabel
+
+                var count = 0
+                var borderTouch = 0
+                var cMinX = x
+                var cMaxX = x
+                var cMinY = y
+                var cMaxY = y
+
+                while (head < tail) {
+                    val curr = queue[head++]
+                    count++
+                    val cx = curr % w
+                    val cy = curr / w
+                    if (cx < cMinX) cMinX = cx
+                    if (cx > cMaxX) cMaxX = cx
+                    if (cy < cMinY) cMinY = cy
+                    if (cy > cMaxY) cMaxY = cy
+                    if (cx <= 2 || cx >= w - 3 || cy <= 2 || cy >= h - 3) {
+                        borderTouch++
+                    }
+
+                    for (dy in -1..1) {
+                        val ny = cy + dy
+                        if (ny <= 0 || ny >= h - 1) continue
+                        val nyOff = ny * w
+                        for (dx in -1..1) {
+                            val nx = cx + dx
+                            if (nx <= 0 || nx >= w - 1) continue
+                            val nIdx = nyOff + nx
+                            if (filteredCandidate[nIdx] && labels[nIdx] == 0) {
+                                labels[nIdx] = currentLabel
+                                queue[tail++] = nIdx
+                            }
+                        }
+                    }
+                }
+
+                if (count >= minComponentPixels) {
+                    components.add(
+                        ConnectedComponentInfo(
+                            id = currentLabel,
+                            pixelCount = count,
+                            borderTouchCount = borderTouch,
+                            minX = cMinX,
+                            minY = cMinY,
+                            maxX = cMaxX,
+                            maxY = cMaxY
+                        )
+                    )
+                }
+            }
+        }
+
+        if (components.isEmpty()) {
             return DocumentQuadNorm.defaultInsetFrame()
         }
 
-        // Find extreme boundary points in the 4 diagonal directions:
-        // TL minimizes (x + y), TR maximizes (x - y), BR maximizes (x + y), BL minimizes (x - y)
+        // Sort candidate components by pixel count descending
+        components.sortByDescending { it.pixelCount }
+        val primaryComp = components.first()
+        val primaryAreaRatio = primaryComp.pixelCount.toFloat() / totalPixels.toFloat()
+
+        // Check for competing rectangular objects (e.g. 2 separate cards or 4-corner clutter blobs)
+        val hasCompetingObjects = components.size >= 2 &&
+            components[1].pixelCount >= (primaryComp.pixelCount * 0.30f).toInt()
+
+        // Find the 4 corners strictly from the primary connected component's pixels
+        val normW = (w - 1).coerceAtLeast(1).toFloat()
+        val normH = (h - 1).coerceAtLeast(1).toFloat()
         var bestTlScore = Float.MAX_VALUE
         var bestTrScore = -Float.MAX_VALUE
         var bestBrScore = -Float.MAX_VALUE
         var bestBlScore = Float.MAX_VALUE
 
-        var tlX = w * 0.08f
-        var tlY = h * 0.08f
-        var trX = w * 0.92f
-        var trY = h * 0.08f
-        var brX = w * 0.92f
-        var brY = h * 0.92f
-        var blX = w * 0.08f
-        var blY = h * 0.92f
+        var tlX = primaryComp.minX.toFloat()
+        var tlY = primaryComp.minY.toFloat()
+        var trX = primaryComp.maxX.toFloat()
+        var trY = primaryComp.minY.toFloat()
+        var brX = primaryComp.maxX.toFloat()
+        var brY = primaryComp.maxY.toFloat()
+        var blX = primaryComp.minX.toFloat()
+        var blY = primaryComp.maxY.toFloat()
 
-        val normW = w.toFloat()
-        val normH = h.toFloat()
-
-        for (y in 2 until h - 2) {
+        for (y in primaryComp.minY..primaryComp.maxY) {
             val yOff = y * w
-            for (x in 2 until w - 2) {
-                val idx = yOff + x
-                if (!isDocCandidate[idx]) continue
-
-                // Require local 3x3 candidate support to ignore isolated glare specks
-                var support = 0
-                for (dy in -1..1) {
-                    for (dx in -1..1) {
-                        if (isDocCandidate[(y + dy) * w + (x + dx)]) support++
-                    }
-                }
-                if (support < 5) continue
-
+            for (x in primaryComp.minX..primaryComp.maxX) {
+                if (labels[yOff + x] != primaryComp.id) continue
                 val nx = x / normW
                 val ny = y / normH
                 val sumXY = nx + ny
@@ -200,19 +328,191 @@ object DocumentCornerProcessor {
         val br = PointF((brX / normW).coerceIn(0f, 1f), (brY / normH).coerceIn(0f, 1f))
         val bl = PointF((blX / normW).coerceIn(0f, 1f), (blY / normH).coerceIn(0f, 1f))
 
-        val confidence = evaluateQuadConfidence(tl, tr, br, bl, gradMag, w, h)
-        return if (confidence < 0.25f) {
-            DocumentQuadNorm.defaultInsetFrame()
-        } else {
-            DocumentQuadNorm(
-                topLeft = tl,
-                topRight = tr,
-                bottomRight = br,
-                bottomLeft = bl,
-                confidence = confidence,
-                requiresUserConfirmation = confidence < AUTO_WARP_CONFIDENCE_THRESHOLD
-            )
+        // Check if the document is clipped at the image boundary
+        val cornerNearBorder = listOf(tl, tr, br, bl).any { pt ->
+            pt.x <= 0.015f || pt.x >= 0.985f || pt.y <= 0.015f || pt.y >= 0.985f
         }
+        val borderPerimeterRatio = primaryComp.borderTouchCount.toFloat() / max(w, h).toFloat()
+        val isClippedAtBorder = cornerNearBorder || borderPerimeterRatio >= 0.12f
+
+        // Compute quad area and component solidity (protecting against L-shaped or hollow artifacts)
+        val quadAreaNorm = computeQuadAreaNorm(tl, tr, br, bl)
+        val solidity = if (quadAreaNorm > 0.01f) {
+            (primaryAreaRatio / quadAreaNorm).coerceIn(0f, 1.2f)
+        } else {
+            0f
+        }
+
+        val edgeEval = evaluateDirectionalEdgeSupport(
+            tl = tl,
+            tr = tr,
+            br = br,
+            bl = bl,
+            lum = lum,
+            gxArr = gxArr,
+            gyArr = gyArr,
+            gradMag = gradMag,
+            gridW = w,
+            gridH = h
+        )
+
+        val baseConfidence = evaluateQuadConfidence(tl, tr, br, bl, gradMag, w, h)
+        val strictAnglesValid = areInteriorAnglesWithinStrictBounds(tl, tr, br, bl, minDeg = 55f, maxDeg = 125f)
+
+        val adjustedConfidence = when {
+            !strictAnglesValid -> min(baseConfidence, 0.45f)
+            solidity < MIN_QUAD_SOLIDITY -> min(baseConfidence, 0.50f)
+            edgeEval.minEdgeSupport < MIN_EDGE_SUPPORT_RATIO -> min(baseConfidence, 0.65f)
+            primaryAreaRatio < MIN_AUTO_WARP_AREA_RATIO || primaryAreaRatio > MAX_AUTO_WARP_AREA_RATIO ->
+                min(baseConfidence, 0.72f)
+            isClippedAtBorder || hasCompetingObjects ->
+                min(baseConfidence, 0.74f)
+            else -> (baseConfidence * 0.50f + edgeEval.meanEdgeSupport * 0.30f + edgeEval.minEdgeSupport * 0.20f)
+                .coerceIn(0f, 1f)
+        }
+
+        if (adjustedConfidence < 0.25f) {
+            return DocumentQuadNorm.defaultInsetFrame()
+        }
+
+        val requiresManual = adjustedConfidence < AUTO_WARP_CONFIDENCE_THRESHOLD ||
+            edgeEval.minEdgeSupport < MIN_EDGE_SUPPORT_RATIO ||
+            !strictAnglesValid ||
+            solidity < MIN_QUAD_SOLIDITY ||
+            primaryAreaRatio !in MIN_AUTO_WARP_AREA_RATIO..MAX_AUTO_WARP_AREA_RATIO ||
+            isClippedAtBorder ||
+            hasCompetingObjects
+
+        return DocumentQuadNorm(
+            topLeft = tl,
+            topRight = tr,
+            bottomRight = br,
+            bottomLeft = bl,
+            confidence = adjustedConfidence,
+            requiresUserConfirmation = requiresManual,
+            minEdgeSupport = edgeEval.minEdgeSupport,
+            isClippedAtBorder = isClippedAtBorder,
+            hasCompetingObjects = hasCompetingObjects
+        )
+    }
+
+    private data class DirectionalEdgeEvaluation(
+        val edgeSupports: FloatArray,
+        val minEdgeSupport: Float,
+        val meanEdgeSupport: Float
+    )
+
+    private fun evaluateDirectionalEdgeSupport(
+        tl: PointF,
+        tr: PointF,
+        br: PointF,
+        bl: PointF,
+        lum: IntArray,
+        gxArr: FloatArray,
+        gyArr: FloatArray,
+        gradMag: FloatArray,
+        gridW: Int,
+        gridH: Int
+    ): DirectionalEdgeEvaluation {
+        val pts = listOf(tl, tr, br, bl)
+        val supports = FloatArray(4)
+
+        for (i in 0 until 4) {
+            val p0 = pts[i]
+            val p1 = pts[(i + 1) % 4]
+            val dx = (p1.x - p0.x) * (gridW - 1)
+            val dy = (p1.y - p0.y) * (gridH - 1)
+            val edgeLen = hypot(dx, dy)
+            if (edgeLen < 4f) {
+                supports[i] = 0f
+                continue
+            }
+            // For clockwise (tl -> tr -> br -> bl) in screen coords (y down),
+            // outward unit normal is (dy / edgeLen, -dx / edgeLen)
+            val outNx = dy / edgeLen
+            val outNy = -dx / edgeLen
+
+            val steps = 28
+            var supportedSamples = 0
+            var totalSamples = 0
+
+            for (s in 2 until steps - 1) {
+                val t = s.toFloat() / steps.toFloat()
+                val cx = (p0.x + (p1.x - p0.x) * t) * (gridW - 1)
+                val cy = (p0.y + (p1.y - p0.y) * t) * (gridH - 1)
+
+                val ix = (cx - outNx * 3.0f).roundToInt().coerceIn(1, gridW - 2)
+                val iy = (cy - outNy * 3.0f).roundToInt().coerceIn(1, gridH - 2)
+                val ex = (cx + outNx * 3.0f).roundToInt().coerceIn(1, gridW - 2)
+                val ey = (cy + outNy * 3.0f).roundToInt().coerceIn(1, gridH - 2)
+
+                val insideLum = lum[iy * gridW + ix]
+                val outsideLum = lum[ey * gridW + ex]
+                val stepDiff = abs(insideLum - outsideLum)
+
+                var bestNormalAlignedGrad = 0f
+                val sx = cx.roundToInt().coerceIn(2, gridW - 3)
+                val sy = cy.roundToInt().coerceIn(2, gridH - 3)
+                for (oy in -2..2) {
+                    for (ox in -2..2) {
+                        val gIdx = (sy + oy) * gridW + (sx + ox)
+                        val mag = gradMag[gIdx]
+                        if (mag >= 40f) {
+                            val align = abs(gxArr[gIdx] * outNx + gyArr[gIdx] * outNy) / mag
+                            if (align >= 0.70f && mag > bestNormalAlignedGrad) {
+                                bestNormalAlignedGrad = mag
+                            }
+                        }
+                    }
+                }
+
+                if (bestNormalAlignedGrad >= 42f || stepDiff >= 24) {
+                    supportedSamples++
+                }
+                totalSamples++
+            }
+            supports[i] = if (totalSamples > 0) supportedSamples.toFloat() / totalSamples.toFloat() else 0f
+        }
+
+        val minSupport = supports.minOrNull() ?: 0f
+        val meanSupport = supports.average().toFloat()
+        return DirectionalEdgeEvaluation(supports, minSupport, meanSupport)
+    }
+
+    private fun computeQuadAreaNorm(tl: PointF, tr: PointF, br: PointF, bl: PointF): Float {
+        return 0.5f * abs(
+            (tl.x * tr.y - tr.x * tl.y) +
+                (tr.x * br.y - br.x * tr.y) +
+                (br.x * bl.y - bl.x * br.y) +
+                (bl.x * tl.y - tl.x * bl.y)
+        )
+    }
+
+    private fun areInteriorAnglesWithinStrictBounds(
+        tl: PointF,
+        tr: PointF,
+        br: PointF,
+        bl: PointF,
+        minDeg: Float,
+        maxDeg: Float
+    ): Boolean {
+        val pts = listOf(tl, tr, br, bl)
+        for (i in 0 until 4) {
+            val prev = pts[(i + 3) % 4]
+            val curr = pts[i]
+            val next = pts[(i + 1) % 4]
+            val v1x = prev.x - curr.x
+            val v1y = prev.y - curr.y
+            val v2x = next.x - curr.x
+            val v2y = next.y - curr.y
+            val len1 = hypot(v1x, v1y)
+            val len2 = hypot(v2x, v2y)
+            if (len1 < 0.10f || len2 < 0.10f) return false
+            val cosTheta = ((v1x * v2x + v1y * v2y) / (len1 * len2)).coerceIn(-1f, 1f)
+            val deg = Math.toDegrees(acos(cosTheta.toDouble())).toFloat()
+            if (deg < minDeg || deg > maxDeg) return false
+        }
+        return true
     }
 
     /**
@@ -238,16 +538,9 @@ object DocumentCornerProcessor {
             if (cross <= 0.001f) return 0f
         }
 
-        // Shoelace area in normalized [0..1] space
-        val area = 0.5f * abs(
-            (tl.x * tr.y - tr.x * tl.y) +
-                (tr.x * br.y - br.x * tr.y) +
-                (br.x * bl.y - bl.x * br.y) +
-                (bl.x * tl.y - tl.x * bl.y)
-        )
-        if (area < 0.16f || area > 0.98f) return 0.15f
+        val area = computeQuadAreaNorm(tl, tr, br, bl)
+        if (area < MIN_AUTO_WARP_AREA_RATIO || area > 0.98f) return 0.15f
 
-        // Check interior angles are between 45° and 135°
         var anglePenalty = 0f
         for (i in 0 until 4) {
             val prev = pts[(i + 3) % 4]
@@ -267,11 +560,10 @@ object DocumentCornerProcessor {
         }
 
         val geometryScore = (1f - anglePenalty * 0.6f).coerceIn(0.2f, 1f)
-        if (gradMag == null || gridW <= 4 || gridH <= 4) {
+        if (gradMag == null || gridW <= 6 || gridH <= 6) {
             return geometryScore
         }
 
-        // Sample edge gradient support along the 4 perimeter segments
         var edgeHits = 0
         var totalSamples = 0
         for (i in 0 until 4) {
@@ -280,11 +572,11 @@ object DocumentCornerProcessor {
             val steps = 24
             for (s in 1 until steps) {
                 val t = s.toFloat() / steps.toFloat()
-                val sx = ((p0.x + (p1.x - p0.x) * t) * (gridW - 1)).roundToInt().coerceIn(1, gridW - 2)
-                val sy = ((p0.y + (p1.y - p0.y) * t) * (gridH - 1)).roundToInt().coerceIn(1, gridH - 2)
+                val sx = ((p0.x + (p1.x - p0.x) * t) * (gridW - 1)).roundToInt().coerceIn(2, gridW - 3)
+                val sy = ((p0.y + (p1.y - p0.y) * t) * (gridH - 1)).roundToInt().coerceIn(2, gridH - 3)
                 var maxLocalGrad = 0f
-                for (dy in -1..1) {
-                    for (dx in -1..1) {
+                for (dy in -2..2) {
+                    for (dx in -2..2) {
                         val g = gradMag[(sy + dy) * gridW + (sx + dx)]
                         if (g > maxLocalGrad) maxLocalGrad = g
                     }
@@ -349,8 +641,6 @@ object DocumentCornerProcessor {
         val dstW = (targetWidthPx ?: max(topWidth, bottomWidth).roundToInt()).coerceIn(64, 2048)
         val dstH = (targetHeightPx ?: max(leftHeight, rightHeight).roundToInt()).coerceIn(64, 2048)
 
-        // Compute inverse homography mapping destination (u, v) in [0..dstW-1, 0..dstH-1]
-        // to source pixel coordinates (x, y)
         val dstPts = arrayOf(
             PointF(0f, 0f),
             PointF((dstW - 1).toFloat(), 0f),

@@ -3,21 +3,55 @@ package com.example.camera
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.RectF
+import android.media.ExifInterface
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
  * Accurate coordinate transformation utility between CameraX [androidx.camera.view.PreviewView]
  * (`ScaleType.FILL_CENTER`) and the captured full-sensor image buffer.
  *
- * Accounts for:
- * 1. Raw sensor dimensions vs. display/target rotation (`0°`, `90°`, `180°`, `270°`).
- * 2. `PreviewView.ScaleType.FILL_CENTER` center-crop scaling between the upright sensor aspect ratio
- *    (e.g., 4:3) and the device screen viewport aspect ratio (e.g., 20:9 on Motorola Moto G60).
- * 3. Front-camera (`LENS_FACING_FRONT`) horizontal preview mirroring versus unmirrored saved JPEGs.
+ * Enforces the Phase 0.4B Single-Transform Invariant across three explicit coordinate spaces:
+ * 1. `RawSensorSpace`: Unrotated pixel coordinates `(0..rawW, 0..rawH)` as stored in the encoded JPEG stream.
+ * 2. `UprightBitmapSpace`: Post-EXIF pixel coordinates `(0..uprightW, 0..uprightH)` returned by
+ *    [UnifiedMediaInput.decodeBitmapWithExif].
+ * 3. `PreviewViewSpace`: On-screen layout pixel coordinates `(0..previewW, 0..previewH)` of the
+ *    live `PreviewView` (`ScaleType.FILL_CENTER`).
+ *
+ * Because [UnifiedMediaInput.resolveBitmap] and [UnifiedMediaInput.toBitmap] already return a bitmap in
+ * `UprightBitmapSpace`, `mappedSensorCropRectNorm` is always defined in `UprightBitmapSpace` (`[0..1]`)
+ * and must NEVER be chained with [mapUprightNormalizedRectToRawSensorRect].
  */
 object CameraViewportMapper {
+
+    /**
+     * Resolves upright post-EXIF `(width, height)` for all 8 standard EXIF orientation tags.
+     */
+    fun resolveUprightDimensions(rawWidth: Int, rawHeight: Int, exifOrientation: Int): Pair<Int, Int> {
+        return when (exifOrientation) {
+            ExifInterface.ORIENTATION_ROTATE_90,
+            ExifInterface.ORIENTATION_ROTATE_270,
+            ExifInterface.ORIENTATION_TRANSPOSE,
+            ExifInterface.ORIENTATION_TRANSVERSE -> rawHeight to rawWidth
+            else -> rawWidth to rawHeight
+        }
+    }
+
+    /**
+     * Converts an EXIF orientation tag (`ORIENTATION_*`) to its clockwise rotation angle in degrees
+     * (`0`, `90`, `180`, `270`).
+     */
+    fun exifOrientationToDegrees(exifOrientation: Int): Int {
+        return when (exifOrientation) {
+            ExifInterface.ORIENTATION_ROTATE_90,
+            ExifInterface.ORIENTATION_TRANSPOSE -> 90
+            ExifInterface.ORIENTATION_ROTATE_180,
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> 180
+            ExifInterface.ORIENTATION_ROTATE_270,
+            ExifInterface.ORIENTATION_TRANSVERSE -> 270
+            else -> 0
+        }
+    }
 
     data class ViewportMappingConfig(
         val rawSensorWidth: Int,
@@ -26,27 +60,37 @@ object CameraViewportMapper {
         val previewWidth: Int,
         val previewHeight: Int,
         val isFrontCamera: Boolean = false,
-        val isSavedOutputMirrored: Boolean = false
+        val isSavedOutputMirrored: Boolean = false,
+        val exifOrientation: Int = ExifInterface.ORIENTATION_UNDEFINED
     ) {
         val normalizedRotation: Int
             get() = ((rotationDegrees % 360) + 360) % 360
 
         /**
-         * Upright image width after EXIF / target rotation is applied.
+         * Upright image width after EXIF / target rotation is applied (`UprightBitmapSpace`).
          */
         val uprightImageWidth: Int
-            get() = if (normalizedRotation == 90 || normalizedRotation == 270) rawSensorHeight else rawSensorWidth
+            get() = if (exifOrientation != ExifInterface.ORIENTATION_UNDEFINED) {
+                resolveUprightDimensions(rawSensorWidth, rawSensorHeight, exifOrientation).first
+            } else {
+                if (normalizedRotation == 90 || normalizedRotation == 270) rawSensorHeight else rawSensorWidth
+            }
 
         /**
-         * Upright image height after EXIF / target rotation is applied.
+         * Upright image height after EXIF / target rotation is applied (`UprightBitmapSpace`).
          */
         val uprightImageHeight: Int
-            get() = if (normalizedRotation == 90 || normalizedRotation == 270) rawSensorWidth else rawSensorHeight
+            get() = if (exifOrientation != ExifInterface.ORIENTATION_UNDEFINED) {
+                resolveUprightDimensions(rawSensorWidth, rawSensorHeight, exifOrientation).second
+            } else {
+                if (normalizedRotation == 90 || normalizedRotation == 270) rawSensorWidth else rawSensorHeight
+            }
     }
 
     /**
-     * Computes the visible sensor crop rectangle (in upright post-EXIF image pixel coordinates)
+     * Computes the visible sensor crop rectangle (in `UprightBitmapSpace` pixel coordinates)
      * that is displayed inside a `PreviewView` using `ScaleType.FILL_CENTER`.
+     * Works for both portrait and landscape `PreviewView` and sensor dimensions.
      */
     fun computeVisibleSensorViewportPx(config: ViewportMappingConfig): RectF {
         val imgW = config.uprightImageWidth.toFloat().coerceAtLeast(1f)
@@ -71,9 +115,9 @@ object CameraViewportMapper {
     }
 
     /**
-     * Maps a normalized rectangle `[0..1]` defined in the `PreviewView` coordinate space
-     * (such as the passport oval, signature cutout box, or document frame) into the
-     * normalized `[0..1]` coordinate space of the upright EXIF-corrected captured image.
+     * Maps a normalized rectangle `[0..1]` defined in `PreviewViewSpace`
+     * (such as the measured passport oval, signature cutout box, or document frame) into the
+     * normalized `[0..1]` coordinate space of `UprightBitmapSpace` (the EXIF-corrected image).
      *
      * Handles front-camera horizontal preview mirroring: Android's `PreviewView` mirrors the live
      * front-camera preview horizontally like a mirror, whereas `ImageCapture` saves an unmirrored
@@ -112,7 +156,7 @@ object CameraViewportMapper {
 
     /**
      * Maps a normalized preview rectangle `[0..1]` directly to integer pixel coordinates
-     * in the upright EXIF-normalized captured image.
+     * in `UprightBitmapSpace`.
      */
     fun mapPreviewRectToUprightPixelRect(
         previewRectNorm: RectF,
@@ -130,13 +174,20 @@ object CameraViewportMapper {
     }
 
     /**
-     * Maps an upright post-EXIF normalized rectangle into the unrotated raw sensor buffer
-     * normalized coordinate space (`0°`, `90°`, `180°`, `270°`).
+     * Standalone utility mapping an upright post-EXIF normalized rectangle (`UprightBitmapSpace`)
+     * into the unrotated raw sensor buffer normalized coordinate space (`RawSensorSpace`) for
+     * rotation degrees (`0°`, `90°`, `180°`, `270°`) or EXIF orientation constants (`1..8`).
+     *
+     * WARNING: Never chain this output with [UnifiedMediaInput.decodeBitmapWithExif], which
+     * already returns a bitmap in `UprightBitmapSpace`.
      */
     fun mapUprightNormalizedRectToRawSensorRect(
         uprightRectNorm: RectF,
         rotationDegrees: Int
     ): RectF {
+        if (rotationDegrees in 1..8) {
+            return mapUprightNormalizedRectToRawSensorRectByExif(uprightRectNorm, rotationDegrees)
+        }
         val l = uprightRectNorm.left.coerceIn(0f, 1f)
         val t = uprightRectNorm.top.coerceIn(0f, 1f)
         val r = uprightRectNorm.right.coerceIn(l, 1f)
@@ -151,8 +202,34 @@ object CameraViewportMapper {
     }
 
     /**
-     * Crops an upright EXIF-normalized sensor [Bitmap] to the exact region visible inside
-     * `previewRectNorm` on the `PreviewView` (`FILL_CENTER`).
+     * Maps an upright post-EXIF normalized rectangle (`UprightBitmapSpace`) into `RawSensorSpace`
+     * for all 8 standard EXIF orientation tags (`ORIENTATION_NORMAL` .. `ORIENTATION_ROTATE_270`).
+     */
+    fun mapUprightNormalizedRectToRawSensorRectByExif(
+        uprightRectNorm: RectF,
+        exifOrientation: Int
+    ): RectF {
+        val l = uprightRectNorm.left.coerceIn(0f, 1f)
+        val t = uprightRectNorm.top.coerceIn(0f, 1f)
+        val r = uprightRectNorm.right.coerceIn(l, 1f)
+        val b = uprightRectNorm.bottom.coerceIn(t, 1f)
+
+        return when (exifOrientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> RectF(1f - r, t, 1f - l, b)
+            ExifInterface.ORIENTATION_ROTATE_180 -> RectF(1f - r, 1f - b, 1f - l, 1f - t)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> RectF(l, 1f - b, r, 1f - t)
+            ExifInterface.ORIENTATION_TRANSPOSE -> RectF(t, l, b, r)
+            ExifInterface.ORIENTATION_ROTATE_90 -> RectF(t, 1f - r, b, 1f - l)
+            ExifInterface.ORIENTATION_TRANSVERSE -> RectF(1f - b, 1f - r, 1f - t, 1f - l)
+            ExifInterface.ORIENTATION_ROTATE_270 -> RectF(1f - b, l, 1f - t, r)
+            else -> RectF(l, t, r, b)
+        }
+    }
+
+    /**
+     * Crops an upright EXIF-normalized sensor [Bitmap] (`UprightBitmapSpace`) to the exact region
+     * visible inside `previewRectNorm` on the `PreviewView` (`FILL_CENTER`), preserving the caller's
+     * actual `previewWidth` and `previewHeight` in both portrait and landscape orientations.
      */
     fun cropUprightSensorBitmapToPreviewGuide(
         uprightBitmap: Bitmap,
@@ -165,9 +242,9 @@ object CameraViewportMapper {
         val config = ViewportMappingConfig(
             rawSensorWidth = uprightBitmap.width,
             rawSensorHeight = uprightBitmap.height,
-            rotationDegrees = 0, // Bitmap is already EXIF-normalized upright
-            previewWidth = min(previewWidth, previewHeight).coerceAtLeast(1),
-            previewHeight = max(previewWidth, previewHeight).coerceAtLeast(1),
+            rotationDegrees = 0, // Bitmap is already EXIF-normalized in UprightBitmapSpace
+            previewWidth = previewWidth.coerceAtLeast(1),
+            previewHeight = previewHeight.coerceAtLeast(1),
             isFrontCamera = isFrontCamera,
             isSavedOutputMirrored = isSavedOutputMirrored
         )

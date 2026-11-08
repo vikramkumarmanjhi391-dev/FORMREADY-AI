@@ -40,6 +40,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -155,7 +156,8 @@ fun SignatureStudioScreen(
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
     var showAdjustSheet by remember { mutableStateOf(false) }
-    var userPreviewAccepted by remember { mutableStateOf(true) }
+    var userPreviewAccepted by remember { mutableStateOf(false) }
+    var cameraGeometryUnavailable by remember { mutableStateOf(false) }
 
     LaunchedEffect(initialRule) {
         if (initialRule != null) {
@@ -171,6 +173,7 @@ fun SignatureStudioScreen(
     val triggerOneClickSignaturePrepare: (Bitmap, UnifiedMediaInput?) -> Unit = { bmp, mediaInput ->
         val w = customWidthPx.toIntOrNull()?.coerceAtLeast(30) ?: 140
         val h = customHeightPx.toIntOrNull()?.coerceAtLeast(20) ?: 60
+        userPreviewAccepted = false
         coroutineScope.launch {
             isProcessing = true
             saveStatusMessage = null
@@ -189,10 +192,15 @@ fun SignatureStudioScreen(
                 requiresWhiteBackground = true
             )
 
-            // Use calibrated CameraViewportMapper sensor crop when captured from in-app camera
+            // Use calibrated CameraViewportMapper sensor crop when captured from in-app camera;
+            // NEVER silently fall back to static mode.guideCropRectNorm
             val guideCrop = if (mediaInput?.isFromCamera == true) {
-                mediaInput.mappedSensorCropRectNorm ?: mediaInput.mode.guideCropRectNorm
-            } else null
+                cameraGeometryUnavailable = mediaInput.mappedSensorCropRectNorm == null
+                mediaInput.mappedSensorCropRectNorm
+            } else {
+                cameraGeometryUnavailable = false
+                null
+            }
 
             processedResult = OneClickPreparationCoordinator.autoPrepareSignature(
                 context = context,
@@ -209,7 +217,8 @@ fun SignatureStudioScreen(
                 enforceProportional = true,
                 cropRectNorm = guideCrop,
                 customDpi = customDpi,
-                userPreviewAccepted = userPreviewAccepted
+                requiresUserPreviewApproval = true,
+                userPreviewAccepted = false
             )
             isProcessing = false
         }
@@ -531,9 +540,56 @@ fun SignatureStudioScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 3. Immediate Results & 1-Click Download to Gallery Card
+            // 3. Explicit User Preview Approval Gate & Immediate Results Card
             processedResult?.let { res ->
-                val isSuccess = res.status == PreparationStatus.SUCCESS_PREPARED
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainer
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = userPreviewAccepted,
+                            onCheckedChange = { accepted ->
+                                userPreviewAccepted = accepted
+                                processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(res, accepted)
+                            },
+                            modifier = Modifier.testTag("sign_preview_acceptance_checkbox")
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "I have reviewed the processed signature/thumb preview and approve it for export",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            res.signatureEvidence?.let { ev ->
+                                Text(
+                                    text = "Ink Ratio: ${String.format(Locale.US, "%.1f", ev.inkPixelRatio * 100f)}% • Paper White: ${(ev.paperWhitenessRatio * 100f).toInt()}%",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            if (cameraGeometryUnavailable) {
+                                Text(
+                                    text = "Camera cutout geometry was unavailable; extracted using connected-stroke bounds. Verify crop or retake.",
+                                    fontSize = 11.sp,
+                                    color = SaffronSecondary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                val isSuccess = res.isExportReady && res.status == PreparationStatus.SUCCESS_PREPARED
                 val cardBg = if (isSuccess) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
                 val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
 

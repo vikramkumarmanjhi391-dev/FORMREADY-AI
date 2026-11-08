@@ -5,24 +5,29 @@ import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.ceil
 
 /**
- * On-device performance and memory telemetry recorder for Motorola Moto G60 (and other physical
- * devices) benchmarking.
+ * On-device performance and sampled memory telemetry recorder for Motorola Moto G60 (and other
+ * physical devices) benchmarking (Phase 0.4E).
  *
- * Records actual measured durations and heap deltas for:
- * - Cold and warm model initialization
- * - Face detection latency
- * - Single-image selfie segmentation latency
- * - Sauvola signature binarization latency
- * - Document 4-corner detection & homography warp latency
- * - Total end-to-end document preparation time
- * - Peak Java and native heap memory usage
+ * Records actual measured durations and pre/post stage heap snapshots (`sampledPre*`, `sampledPost*`,
+ * `sampled*DeltaBytes`) for:
+ * - Client construction (`CLIENT_CONSTRUCTION`)
+ * - Cold first inference (`FACE_DETECTION_COLD_FIRST_INFERENCE`, `SELFIE_SEGMENTATION_COLD_FIRST_INFERENCE`)
+ * - Warm subsequent inference (`FACE_DETECTION_WARM_INFERENCE`, `SELFIE_SEGMENTATION_WARM_INFERENCE`)
+ * - Sauvola signature binarization (`SAUVOLA_SIGNATURE`)
+ * - Document 4-corner detection & homography warp (`DOCUMENT_CORNER_WARP`)
+ * - Total end-to-end document preparation (`END_TO_END_PREPARATION`)
  *
- * Does NOT fabricate benchmark numbers; median and p95 statistics are computed strictly from
- * recorded execution samples.
+ * Never fabricates benchmark numbers and never mislabels boundary heap snapshots as continuous
+ * hardware peak memory.
  */
 object VisionBenchmarkRecorder {
 
     enum class Stage {
+        CLIENT_CONSTRUCTION,
+        FACE_DETECTION_COLD_FIRST_INFERENCE,
+        FACE_DETECTION_WARM_INFERENCE,
+        SELFIE_SEGMENTATION_COLD_FIRST_INFERENCE,
+        SELFIE_SEGMENTATION_WARM_INFERENCE,
         MODEL_INIT_COLD,
         MODEL_INIT_WARM,
         FACE_DETECTION,
@@ -32,15 +37,32 @@ object VisionBenchmarkRecorder {
         END_TO_END_PREPARATION
     }
 
+    data class HeapSnapshot(
+        val javaHeapBytes: Long,
+        val nativeHeapBytes: Long
+    )
+
     data class BenchmarkSample(
         val stage: Stage,
         val durationMs: Long,
         val imageWidth: Int,
         val imageHeight: Int,
-        val javaHeapUsedBytes: Long,
-        val nativeHeapAllocatedBytes: Long,
+        val sampledPreJavaHeapBytes: Long,
+        val sampledPostJavaHeapBytes: Long,
+        val sampledJavaHeapDeltaBytes: Long = sampledPostJavaHeapBytes - sampledPreJavaHeapBytes,
+        val sampledPreNativeHeapBytes: Long,
+        val sampledPostNativeHeapBytes: Long,
+        val sampledNativeHeapDeltaBytes: Long = sampledPostNativeHeapBytes - sampledPreNativeHeapBytes,
         val timestampMs: Long = System.currentTimeMillis()
-    )
+    ) {
+        @Deprecated("Use sampledPostJavaHeapBytes instead.", ReplaceWith("sampledPostJavaHeapBytes"))
+        val javaHeapUsedBytes: Long
+            get() = sampledPostJavaHeapBytes
+
+        @Deprecated("Use sampledPostNativeHeapBytes instead.", ReplaceWith("sampledPostNativeHeapBytes"))
+        val nativeHeapAllocatedBytes: Long
+            get() = sampledPostNativeHeapBytes
+    }
 
     data class StageSummary(
         val stage: Stage,
@@ -49,18 +71,23 @@ object VisionBenchmarkRecorder {
         val p95Ms: Long,
         val minMs: Long,
         val maxMs: Long,
-        val peakJavaHeapBytes: Long,
+        val maxSampledPostJavaHeapBytes: Long,
+        val maxSampledJavaHeapDeltaBytes: Long,
+        val maxSampledPostNativeHeapBytes: Long,
+        val maxSampledNativeHeapDeltaBytes: Long
+    ) {
+        @Deprecated("Use maxSampledPostJavaHeapBytes instead.", ReplaceWith("maxSampledPostJavaHeapBytes"))
+        val peakJavaHeapBytes: Long
+            get() = maxSampledPostJavaHeapBytes
+
+        @Deprecated("Use maxSampledPostNativeHeapBytes instead.", ReplaceWith("maxSampledPostNativeHeapBytes"))
         val peakNativeHeapBytes: Long
-    )
+            get() = maxSampledPostNativeHeapBytes
+    }
 
     private val samples = CopyOnWriteArrayList<BenchmarkSample>()
 
-    fun recordSample(
-        stage: Stage,
-        durationMs: Long,
-        imageWidth: Int = 0,
-        imageHeight: Int = 0
-    ): BenchmarkSample {
+    fun captureHeapSnapshot(): HeapSnapshot {
         val runtime = Runtime.getRuntime()
         val javaUsed = (runtime.totalMemory() - runtime.freeMemory()).coerceAtLeast(0L)
         val nativeUsed = try {
@@ -68,13 +95,30 @@ object VisionBenchmarkRecorder {
         } catch (_: Throwable) {
             0L
         }
+        return HeapSnapshot(javaHeapBytes = javaUsed, nativeHeapBytes = nativeUsed)
+    }
+
+    fun recordSample(
+        stage: Stage,
+        durationMs: Long,
+        imageWidth: Int = 0,
+        imageHeight: Int = 0,
+        preSnapshot: HeapSnapshot? = null,
+        postSnapshot: HeapSnapshot? = null
+    ): BenchmarkSample {
+        val post = postSnapshot ?: captureHeapSnapshot()
+        val pre = preSnapshot ?: post
         val sample = BenchmarkSample(
             stage = stage,
             durationMs = durationMs.coerceAtLeast(0L),
             imageWidth = imageWidth,
             imageHeight = imageHeight,
-            javaHeapUsedBytes = javaUsed,
-            nativeHeapAllocatedBytes = nativeUsed
+            sampledPreJavaHeapBytes = pre.javaHeapBytes,
+            sampledPostJavaHeapBytes = post.javaHeapBytes,
+            sampledJavaHeapDeltaBytes = post.javaHeapBytes - pre.javaHeapBytes,
+            sampledPreNativeHeapBytes = pre.nativeHeapBytes,
+            sampledPostNativeHeapBytes = post.nativeHeapBytes,
+            sampledNativeHeapDeltaBytes = post.nativeHeapBytes - pre.nativeHeapBytes
         )
         samples.add(sample)
         return sample
@@ -86,12 +130,21 @@ object VisionBenchmarkRecorder {
         imageHeight: Int = 0,
         block: () -> T
     ): T {
+        val pre = captureHeapSnapshot()
         val startNs = System.nanoTime()
         try {
             return block()
         } finally {
             val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-            recordSample(stage, elapsedMs, imageWidth, imageHeight)
+            val post = captureHeapSnapshot()
+            recordSample(
+                stage = stage,
+                durationMs = elapsedMs,
+                imageWidth = imageWidth,
+                imageHeight = imageHeight,
+                preSnapshot = pre,
+                postSnapshot = post
+            )
         }
     }
 
@@ -115,8 +168,10 @@ object VisionBenchmarkRecorder {
             p95Ms = p95,
             minMs = sortedDurations.first(),
             maxMs = sortedDurations.last(),
-            peakJavaHeapBytes = stageSamples.maxOf { it.javaHeapUsedBytes },
-            peakNativeHeapBytes = stageSamples.maxOf { it.nativeHeapAllocatedBytes }
+            maxSampledPostJavaHeapBytes = stageSamples.maxOf { it.sampledPostJavaHeapBytes },
+            maxSampledJavaHeapDeltaBytes = stageSamples.maxOf { it.sampledJavaHeapDeltaBytes },
+            maxSampledPostNativeHeapBytes = stageSamples.maxOf { it.sampledPostNativeHeapBytes },
+            maxSampledNativeHeapDeltaBytes = stageSamples.maxOf { it.sampledNativeHeapDeltaBytes }
         )
     }
 

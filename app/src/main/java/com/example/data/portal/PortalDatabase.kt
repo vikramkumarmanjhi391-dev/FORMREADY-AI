@@ -21,7 +21,8 @@ object PortalDatabase {
             category = "Civil Services",
             officialUrl = "https://upsconline.nic.in",
             sourceDocumentTitle = "UPSC CSE Official Notification Instructions for Photo & Signature",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            applicableWorkflow = "Online OTR & CSP Application Upload",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v2.1",
             documents = listOf(
@@ -82,7 +83,8 @@ object PortalDatabase {
             category = "Recruitment",
             officialUrl = "https://ssc.gov.in",
             sourceDocumentTitle = "SSC General Instructions for Document Upload",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            applicableWorkflow = "SSC OTR & Online Exam Application (JPEG upload; live webcam capture also used on portal)",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Jan 2025",
             version = "v3.0",
             documents = listOf(
@@ -144,6 +146,7 @@ object PortalDatabase {
             category = "Civil Services",
             officialUrl = "https://onlinebpsc.bihar.gov.in",
             sourceDocumentTitle = "BPSC Online Application Guidelines and Dimensions",
+            applicableWorkflow = "BPSC Online Application Portal",
             verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v1.8",
@@ -209,7 +212,8 @@ object PortalDatabase {
             category = "Railways",
             officialUrl = "https://rrbapply.gov.in",
             sourceDocumentTitle = "CEN Railway Recruitment Information Brochure - Document Guidelines",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            applicableWorkflow = "Online RRB CEN Application Upload",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Jan 2025",
             version = "v2.0",
             documents = listOf(
@@ -263,7 +267,8 @@ object PortalDatabase {
             category = "Banking",
             officialUrl = "https://ibps.in",
             sourceDocumentTitle = "IBPS Guidelines for Scanning and Upload of Documents",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            applicableWorkflow = "IBPS CRP Online Application (Photo, Sign, LTI, Handwritten Declaration)",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v2.4",
             documents = listOf(
@@ -332,7 +337,8 @@ object PortalDatabase {
             category = "Entrance",
             officialUrl = "https://nta.ac.in",
             sourceDocumentTitle = "NTA Information Bulletin - Appendix for Upload Specifications",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            applicableWorkflow = "Combined NEET UG / JEE Main / CUET UG Online Form",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v3.1",
             documents = listOf(
@@ -398,6 +404,7 @@ object PortalDatabase {
             category = "RTPS / Services",
             officialUrl = "https://serviceonline.bihar.gov.in",
             sourceDocumentTitle = "Bihar RTPS Document Attachment Guidelines",
+            applicableWorkflow = "ServicePlus Bihar Citizen Certificate Application",
             verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Feb 2025",
             version = "v1.5",
@@ -446,6 +453,7 @@ object PortalDatabase {
             category = "Identity",
             officialUrl = "https://passportindia.gov.in",
             sourceDocumentTitle = "Passport Seva Photo Specifications and Document Upload Rules",
+            applicableWorkflow = "Passport Seva Online Portal Supporting Document Upload",
             verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Jan 2025",
             version = "v2.2",
@@ -490,6 +498,7 @@ object PortalDatabase {
             category = "RTPS / Services",
             officialUrl = "https://sarathi.parivahan.gov.in",
             sourceDocumentTitle = "Parivahan Citizen Portal Upload Parameters (State-specific variations)",
+            applicableWorkflow = "Sarathi LL/DL Online Upload (varies by State RTO)",
             verificationStatus = VerificationStatus.NEEDS_REVERIFICATION,
             lastVerifiedDate = "Mid 2024 (Re-verify with state RTO)",
             version = "v1.9",
@@ -540,7 +549,8 @@ object PortalDatabase {
             category = "Teacher Recruitment",
             officialUrl = "https://ctet.nic.in",
             sourceDocumentTitle = "CTET Information Bulletin Photo Dimensions",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            applicableWorkflow = "CBSE CTET Online Application Upload",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Jan 2025",
             version = "v1.7",
             documents = listOf(
@@ -575,18 +585,19 @@ object PortalDatabase {
             )
         ),
 
-        // 11. NSDL / Protean PAN Card (TIN-NSDL)
+        // 11. NSDL / Protean PAN Card (TIN-NSDL Agency 300 DPI vs DSC 200 DPI separated workflows)
         PortalSpec(
             id = "nsdl_pan",
-            portalName = "NSDL / Protean eGov PAN Portal",
-            examOrServiceName = "New PAN Card / Correction (Protean TIN-NSDL)",
+            portalName = "NSDL / Protean eGov PAN Portal (300 DPI Agency Scan Preset)",
+            examOrServiceName = "New PAN Card / Correction (Legacy 213x213 px @ 300 DPI Agency Scan)",
             department = "Income Tax Department / Protean eGov",
             stateOrCentral = "Central",
             year = "2025-2026",
             category = "Identity",
-            officialUrl = "https://www.onlineservices.nsdl.com",
-            sourceDocumentTitle = "Protean (NSDL) Photo, Signature & Supporting Document Specifications",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            officialUrl = "https://tin.tin.proteantech.in",
+            sourceDocumentTitle = "Protean (NSDL) Agency Scanning Preset (Under Source Review — see nsdl_pan_dsc for 200 DPI DSC workflow)",
+            applicableWorkflow = "Legacy Third-Party / Agency Scanning Workflow (213x213 px @ 300 DPI)",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Mar 2025",
             version = "v3.2",
             documents = listOf(
@@ -599,12 +610,10 @@ object PortalDatabase {
                     maxKb = 50,
                     exactWidthPx = 213,
                     exactHeightPx = 213,
-                    physicalWidthMm = 25f,
-                    physicalHeightMm = 35f,
                     dpi = 300,
                     targetAspectRatio = 1.0f,
                     requiresWhiteBackground = true,
-                    instructions = "3.5 cm x 2.5 cm (213 x 213 px at 300 DPI), pure white background, strictly under 50 KB."
+                    instructions = "213 x 213 px at 300 DPI (square agency scan preset), pure white background, under 50 KB."
                 ),
                 DocumentRule(
                     id = "nsdl_pan_sign",
@@ -615,13 +624,11 @@ object PortalDatabase {
                     maxKb = 20,
                     exactWidthPx = 140,
                     exactHeightPx = 60,
-                    physicalWidthMm = 45f,
-                    physicalHeightMm = 20f,
                     dpi = 300,
                     targetAspectRatio = 140f / 60f,
                     colorMode = ColorMode.BLACK_AND_WHITE,
                     requiresWhiteBackground = true,
-                    instructions = "2.0 cm x 4.5 cm (140 x 60 px at 300 DPI), black ink on pure white background, under 20 KB."
+                    instructions = "140 x 60 px at 300 DPI, black ink on pure white background, under 20 KB."
                 ),
                 DocumentRule(
                     id = "nsdl_pan_doc",
@@ -637,6 +644,72 @@ object PortalDatabase {
             )
         ),
 
+        // 11B. Protean (TIN-NSDL) DSC-Based Online PAN Application (200 DPI, 3.5x2.5 cm <=20 KB)
+        PortalSpec(
+            id = "nsdl_pan_dsc",
+            portalName = "Protean (TIN-NSDL) DSC Online PAN",
+            examOrServiceName = "DSC-Based Online PAN Application (Form 49A / CSF — 200 DPI)",
+            department = "Income Tax Department / Protean eGov Technologies",
+            stateOrCentral = "Central",
+            year = "2025-2026",
+            category = "Identity",
+            officialUrl = "https://tin.tin.proteantech.in",
+            sourceDocumentTitle = "Protean (NSDL) DSC-Based Online PAN Application Guidelines",
+            sourceIdentifier = "Protean TIN DSC PAN Guidelines",
+            applicableWorkflow = "DSC-Based Online PAN Application (Form 49A / CSF): Photo 200 DPI 3.5x2.5 cm <=20 KB; Sign 200 DPI 2x4.5 cm <=10 KB",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
+            lastVerifiedDate = "Mar 2025",
+            version = "v1.0",
+            documents = listOf(
+                DocumentRule(
+                    id = "nsdl_dsc_photo",
+                    documentType = DocumentType.PASSPORT_PHOTO,
+                    isRequired = true,
+                    allowedFormats = listOf(FileFormat.JPG, FileFormat.JPEG),
+                    minKb = 2,
+                    maxKb = 20,
+                    exactWidthPx = 197,
+                    exactHeightPx = 276,
+                    physicalWidthMm = 25f,
+                    physicalHeightMm = 35f,
+                    dpi = 200,
+                    targetAspectRatio = 25f / 35f,
+                    requiresWhiteBackground = true,
+                    sourceClauseRef = "Protean DSC PAN Photo & Signature Table (200 DPI, 3.5x2.5 cm <=20 KB)",
+                    instructions = "3.5 cm (height) x 2.5 cm (width) at 200 DPI (197 x 276 px), colour JPEG <= 20 KB."
+                ),
+                DocumentRule(
+                    id = "nsdl_dsc_sign",
+                    documentType = DocumentType.SIGNATURE_ENGLISH,
+                    isRequired = true,
+                    allowedFormats = listOf(FileFormat.JPG, FileFormat.JPEG),
+                    minKb = 1,
+                    maxKb = 10,
+                    exactWidthPx = 354,
+                    exactHeightPx = 157,
+                    physicalWidthMm = 45f,
+                    physicalHeightMm = 20f,
+                    dpi = 200,
+                    targetAspectRatio = 45f / 20f,
+                    requiresWhiteBackground = true,
+                    sourceClauseRef = "Protean DSC PAN Photo & Signature Table (200 DPI, 2x4.5 cm <=10 KB)",
+                    instructions = "2.0 cm x 4.5 cm at 200 DPI (354 x 157 px), JPEG <= 10 KB."
+                ),
+                DocumentRule(
+                    id = "nsdl_dsc_doc",
+                    documentType = DocumentType.AADHAAR_CARD,
+                    isRequired = true,
+                    allowedFormats = listOf(FileFormat.PDF),
+                    minKb = 10,
+                    maxKb = 300,
+                    dpi = 200,
+                    maxPages = 2,
+                    sourceClauseRef = "Protean DSC PAN Supporting Document Specification (PDF <= 300 KB)",
+                    instructions = "Supporting document in PDF format at 200 DPI under 300 KB."
+                )
+            )
+        ),
+
         // 12. UTI (UTIITSL) PAN Card Portal
         PortalSpec(
             id = "uti_pan",
@@ -647,8 +720,9 @@ object PortalDatabase {
             year = "2025-2026",
             category = "Identity",
             officialUrl = "https://www.pan.utiitsl.com",
-            sourceDocumentTitle = "UTIITSL PAN Scanning & Upload Specifications (300/600 DPI)",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            sourceDocumentTitle = "UTIITSL PAN Scanning & Upload Specifications (300/600 DPI Digital Scan vs Physical Form 49A 4.5x3.5 cm)",
+            applicableWorkflow = "UTIITSL Digital Portal Upload (213x213 px @ 300 DPI photo, 600 DPI B&W signature; physical Form 49A uses 4.5x3.5 cm photos)",
+            verificationStatus = VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             lastVerifiedDate = "Mar 2025",
             version = "v3.0",
             documents = listOf(
@@ -705,8 +779,9 @@ object PortalDatabase {
             year = "2025-2026",
             category = "Universal",
             officialUrl = "https://india.gov.in",
-            sourceDocumentTitle = "Universal Government Form Specifications",
-            verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+            sourceDocumentTitle = "Universal Government Form Specifications (Convenience Preset)",
+            applicableWorkflow = "General-purpose 350x450 px (3.5x4.5 cm) photo & 140x60 px signature template",
+            verificationStatus = VerificationStatus.USER_SUPPLIED,
             lastVerifiedDate = "Mar 2025",
             version = "v1.0",
             documents = listOf(
@@ -864,6 +939,7 @@ object PortalDatabase {
                     )
                 )
 
+                val isAllowlisted = OfficialDomainAllowlist.isVerifiedOfficialUrl(officialUrl)
                 val spec = PortalSpec(
                     id = id,
                     portalName = portalName,
@@ -874,7 +950,12 @@ object PortalDatabase {
                     category = category,
                     officialUrl = officialUrl,
                     sourceDocumentTitle = "GitHub JSON Synced Specification",
-                    verificationStatus = VerificationStatus.OFFICIALLY_VERIFIED,
+                    applicableWorkflow = "Remote JSON Preset Sync",
+                    verificationStatus = if (isAllowlisted) {
+                        VerificationStatus.OFFICIAL_SOURCE_REVIEW
+                    } else {
+                        VerificationStatus.USER_SUPPLIED
+                    },
                     lastVerifiedDate = "Synced",
                     version = "v1.0-sync",
                     documents = rules

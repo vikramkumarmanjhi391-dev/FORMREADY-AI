@@ -32,8 +32,13 @@ class ExampleUnitTest {
 
         val upsc = portals.find { it.id == "upsc_cse" }
         assertNotNull("UPSC CSE portal should exist", upsc)
-        assertEquals(VerificationStatus.OFFICIALLY_VERIFIED, upsc?.verificationStatus)
+        assertEquals(VerificationStatus.OFFICIAL_SOURCE_REVIEW, upsc?.verificationStatus)
         assertTrue(upsc?.sourceDocumentTitle?.isNotBlank() == true)
+        assertTrue(upsc?.applicableWorkflow?.isNotBlank() == true)
+
+        val universal = portals.find { it.id == "universal_passport" }
+        assertNotNull("Universal preset should exist", universal)
+        assertEquals(VerificationStatus.USER_SUPPLIED, universal?.verificationStatus)
 
         val bpsc = portals.find { it.id == "bpsc_cce" }
         assertNotNull("BPSC portal should exist", bpsc)

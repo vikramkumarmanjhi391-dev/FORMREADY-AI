@@ -799,12 +799,22 @@ class Phase5FeaturesTest {
             backgroundMask = verifiedBgMask
         )
         assertTrue(verifiedWhitenedResult.measuredNearWhite)
-        assertTrue(verifiedWhitenedResult.verifiedBackgroundCompliance)
+        assertTrue(verifiedWhitenedResult.technicalBackgroundCompliant)
         assertTrue(verifiedWhitenedResult.hasWhiteBackground)
         assertTrue(verifiedWhitenedResult.isCompliant)
-        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, verifiedWhitenedResult.status)
+        assertFalse("Default userPreviewAccepted must be false", verifiedWhitenedResult.userPreviewAccepted)
+        assertFalse("Must not be export-ready before user preview approval", verifiedWhitenedResult.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, verifiedWhitenedResult.status)
         assertEquals("VERIFIED_MASK", verifiedWhitenedResult.backgroundVerificationState)
         assertTrue(verifiedWhitenedResult.nearWhitePixelRatio >= 0.85f)
+
+        val approvedWhitenedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+            verifiedWhitenedResult,
+            userPreviewAccepted = true
+        )
+        assertTrue(approvedWhitenedResult.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, approvedWhitenedResult.status)
+
         val whitenedFile = File(verifiedWhitenedResult.processedFilePath)
         assertEquals(300, com.example.processing.ImageProcessor.readJfifDpiHeader(whitenedFile))
         assertEquals(300, com.example.processing.ImageProcessor.readExifDpi(whitenedFile))
@@ -1097,7 +1107,10 @@ class Phase5FeaturesTest {
         )
         assertEquals(300, jpegRes.dpi)
         assertTrue(jpegRes.isCompliant)
-        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, jpegRes.status)
+        assertFalse(jpegRes.userPreviewAccepted)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, jpegRes.status)
+        val approvedJpegRes = OneClickPreparationCoordinator.updateUserPreviewAcceptance(jpegRes, true)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, approvedJpegRes.status)
 
         // 2. PNG output with required DPI = 300 -> Android PNG encoder does not embed pHYs DPI metadata,
         // so readPngPhysMetadata is null, reported dpi MUST be 0 (not 300!), and status MUST be DPI_MISMATCH
@@ -1236,33 +1249,45 @@ class Phase5FeaturesTest {
 
     @Test
     fun testPhase1OfficialDomainAllowlistAndNonDestructive180DayReview() {
-        val officialUpsc = com.example.data.portal.PortalDatabase.OFFICIAL_PORTALS.first { it.id == "upsc_cse" }
+        val baseUpsc = com.example.data.portal.PortalDatabase.OFFICIAL_PORTALS.first { it.id == "upsc_cse" }
+        // Construct a complete, clause-verified portal snapshot to test fresh vs >180d review
+        val verifiedUpsc = baseUpsc.copy(
+            sourceIdentifier = "UPSC-CSE-2025-NOTIF-05",
+            applicableWorkflow = "Online OTR & CSP Application Upload",
+            verificationStatus = com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED,
+            documents = baseUpsc.documents.mapIndexed { idx, rule ->
+                rule.copy(
+                    sourceClauseRef = "Appendix-III Clause ${idx + 1}",
+                    isRuleIndividuallyVerified = true
+                )
+            }
+        )
         val upscEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
-            portal = officialUpsc,
+            portal = verifiedUpsc,
             nowEpochMs = com.example.data.portal.OfficialDomainAllowlist.parseVerifiedDateEpochMs("2025-03-01")!!
         )
         assertTrue(upscEval.isOfficialDomain)
         assertFalse(upscEval.isInternalReviewDue)
         assertEquals(com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED, upscEval.effectiveStatus)
 
-        // 180-day threshold check: 250 days after lastVerifiedDate -> triggers internal review note ONLY,
-        // preserving OFFICIALLY_VERIFIED status and keeping all DocumentRule specs intact!
+        // 180-day threshold check: 250 days after lastVerifiedDate -> triggers internal review due
+        // and downgrades effectiveStatus to OFFICIAL_SOURCE_REVIEW while keeping all DocumentRule specs intact!
         val futureEpoch = com.example.data.portal.OfficialDomainAllowlist.parseVerifiedDateEpochMs("2025-11-15")!!
         val reviewDueEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
-            portal = officialUpsc,
+            portal = verifiedUpsc,
             nowEpochMs = futureEpoch
         )
         assertTrue("More than 180 days since check should flag internal review due", reviewDueEval.isInternalReviewDue)
         assertNotNull(reviewDueEval.reviewNote)
         assertEquals(
-            "180-day internal review threshold must NOT invalidate an official portal's verified status",
-            com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED,
+            "Stale (>180 days) check downgrades effectiveStatus to OFFICIAL_SOURCE_REVIEW",
+            com.example.data.model.VerificationStatus.OFFICIAL_SOURCE_REVIEW,
             reviewDueEval.effectiveStatus
         )
-        assertTrue(officialUpsc.documents.isNotEmpty())
+        assertTrue(verifiedUpsc.documents.isNotEmpty())
 
         // Non-official https:// domain must NEVER be granted OFFICIALLY_VERIFIED
-        val fakeDomainPortal = officialUpsc.copy(
+        val fakeDomainPortal = verifiedUpsc.copy(
             id = "fake_blog_portal",
             officialUrl = "https://exam-tricks-blog.example.com/upsc-rules",
             verificationStatus = com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED
@@ -1323,7 +1348,7 @@ class Phase5FeaturesTest {
             com.example.processing.PortraitVisionProcessor.RawSegmentationMask(w, h, mask)
         }
 
-        // 1A. High confidence + userPreviewAccepted = true -> verifiedBackgroundCompliance = true & SUCCESS_PREPARED
+        // 1A. High confidence + userPreviewAccepted = true -> technicalBackgroundCompliant = true & isExportReady = true & SUCCESS_PREPARED
         val acceptedResult = OneClickPreparationCoordinator.autoPreparePhoto(
             context = context,
             input = null,
@@ -1341,11 +1366,15 @@ class Phase5FeaturesTest {
         assertTrue(acceptedResult.subjectMaskConfidence >= 0.80f)
         assertTrue(acceptedResult.edgeUncertaintyRatio <= 0.18f)
         assertTrue(acceptedResult.userPreviewAccepted)
-        assertTrue(acceptedResult.verifiedBackgroundCompliance)
+        assertTrue(acceptedResult.technicalBackgroundCompliant)
         assertTrue(acceptedResult.isCompliant)
+        assertTrue(acceptedResult.isExportReady)
+        assertEquals(com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER, acceptedResult.approvalStatus)
         assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, acceptedResult.status)
 
-        // 1B. High confidence + userPreviewAccepted = false -> verifiedBackgroundCompliance = false & BACKGROUND_UNVERIFIED
+        // 1B. High confidence + userPreviewAccepted = false ->
+        // Phase 0.4A Invariant: technicalBackgroundCompliant and isCompliant remain TRUE,
+        // while approvalStatus == PENDING_USER_APPROVAL, status == PENDING_PREVIEW_APPROVAL, and isExportReady == FALSE!
         val unacceptedResult = OneClickPreparationCoordinator.autoPreparePhoto(
             context = context,
             input = null,
@@ -1359,10 +1388,12 @@ class Phase5FeaturesTest {
         assertNotNull(unacceptedResult)
         assertTrue(unacceptedResult!!.segmentationExecuted)
         assertFalse(unacceptedResult.userPreviewAccepted)
-        assertFalse("Unaccepted preview must NOT set verifiedBackgroundCompliance = true", unacceptedResult.verifiedBackgroundCompliance)
-        assertFalse(unacceptedResult.isCompliant)
-        assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, unacceptedResult.status)
-        assertEquals("PREVIEW_NOT_ACCEPTED", unacceptedResult.backgroundVerificationState)
+        assertTrue("Technically clean image must report technicalBackgroundCompliant = true even before preview approval", unacceptedResult.technicalBackgroundCompliant)
+        assertTrue("Technically clean image must report isCompliant = true", unacceptedResult.isCompliant)
+        assertFalse("Unaccepted preview must NOT be export-ready", unacceptedResult.isExportReady)
+        assertEquals(com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL, unacceptedResult.approvalStatus)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, unacceptedResult.status)
+        assertEquals("VERIFIED_MASK", unacceptedResult.backgroundVerificationState)
 
         // Case 2: Ambiguous boundary segmentation mask (large fraction of pixels in 0.20..0.80 uncertainty band)
         val uncertainEdgeSegEngine = com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { bmp ->
@@ -1393,9 +1424,10 @@ class Phase5FeaturesTest {
         assertNotNull(uncertainResult)
         assertTrue(uncertainResult!!.edgeUncertaintyRatio > 0.18f)
         assertFalse(
-            "High edge uncertainty must NOT set verifiedBackgroundCompliance = true",
-            uncertainResult.verifiedBackgroundCompliance
+            "High edge uncertainty must NOT set technicalBackgroundCompliant = true even when userPreviewAccepted = true",
+            uncertainResult.technicalBackgroundCompliant
         )
+        assertFalse("Technical background failure must NEVER be overridden by userPreviewAccepted = true", uncertainResult.isExportReady)
         assertEquals(com.example.data.model.PreparationStatus.BACKGROUND_UNVERIFIED, uncertainResult.status)
         assertEquals("LOW_MASK_CONFIDENCE", uncertainResult.backgroundVerificationState)
     }
@@ -1409,12 +1441,10 @@ class Phase5FeaturesTest {
         val shadowedSigBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         for (y in 0 until height) {
             for (x in 0 until width) {
-                // Paper luminance drops from 235 on the left to 145 on the right (heavy phone shadow)
                 val paperLum = (235 - (x.toFloat() / width.toFloat()) * 90f).toInt().coerceIn(120, 245)
                 val isStroke = (y in 52..62 && x in 45..270 && ((x + y) % 7 != 0)) ||
                     (y in 70..76 && x in 80..230)
                 if (isStroke) {
-                    // Blue ballpoint ink darker than local paper
                     val inkR = (paperLum * 0.18f).toInt()
                     val inkG = (paperLum * 0.25f).toInt()
                     val inkB = (paperLum * 0.65f).toInt()
@@ -1435,7 +1465,6 @@ class Phase5FeaturesTest {
         assertTrue("Cropped width should trim outer blank margins", sauvolaRes.cleanedBitmap.width < width)
         assertTrue("Cropped height should trim outer blank margins", sauvolaRes.cleanedBitmap.height < height)
 
-        // Verify background pixels in cleanedBitmap are pure white (#FFFFFF)
         val whiteness = com.example.processing.ImageProcessor.measureBackgroundWhiteness(
             bitmap = sauvolaRes.cleanedBitmap,
             isSignatureOrDocument = true,
@@ -1491,16 +1520,17 @@ class Phase5FeaturesTest {
 
         val detection = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(docSceneBmp)
         assertEquals(4, detection.cornersNorm.size)
-        assertTrue("Clean high-contrast angled document should achieve confidence >= 0.75 (was ${detection.confidence})", detection.confidence >= 0.75f)
+        assertTrue(
+            "Clean high-contrast angled document should achieve confidence >= 0.80 (was ${detection.confidence})",
+            detection.confidence >= 0.80f
+        )
         assertTrue(detection.autoWarpEligible)
 
-        // Verify detected corners are close to the true quadrilateral corners
         assertEquals(0.16f, detection.cornersNorm[0].x, 0.06f)
         assertEquals(0.14f, detection.cornersNorm[0].y, 0.06f)
         assertEquals(0.86f, detection.cornersNorm[1].x, 0.06f)
         assertEquals(0.18f, detection.cornersNorm[1].y, 0.06f)
 
-        // Warp document perspective and verify rectified output is bright document content
         val warped = com.example.processing.DocumentCornerProcessor.warpDocumentPerspective(
             src = docSceneBmp,
             cornersNorm = detection.cornersNorm,
@@ -1512,12 +1542,737 @@ class Phase5FeaturesTest {
         val centerColor = warped.getPixel(150, 200)
         assertTrue("Center of rectified document must be bright white paper", Color.red(centerColor) >= 235)
 
-        // Uniform low-contrast image -> confidence < 0.75f (not auto-warp eligible)
         val uniformBmp = createSampleBitmap(300, 400, Color.rgb(180, 180, 180))
         val lowConfDetection = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(uniformBmp)
         assertFalse("Uniform image without document edges must not be autoWarpEligible", lowConfDetection.autoWarpEligible)
     }
+
+    // =========================================================================
+    // PHASE 0.4 REMEDIATION REGRESSION TESTS (BATCHES 1 - 5)
+    // =========================================================================
+
+    @Test
+    fun testBatch1IsExportReadyTruthTableAll8Cases() {
+        data class TruthTableCase(
+            val caseId: Int,
+            val requiresWhiteBg: Boolean,
+            val technicalBgCompliant: Boolean,
+            val baseMetricsPass: Boolean,
+            val requiresApproval: Boolean,
+            val userPreviewAccepted: Boolean,
+            val expectedIsCompliant: Boolean,
+            val expectedApprovalStatus: com.example.data.model.PreviewApprovalStatus,
+            val expectedIsExportReady: Boolean
+        )
+
+        val cases = listOf(
+            // Case 1: White BG required, tech BG pass, metrics pass, approval required, user NOT accepted -> pending approval, NOT export ready
+            TruthTableCase(1, true, true, true, true, false, true, com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL, false),
+            // Case 2: White BG required, tech BG pass, metrics pass, approval required, user ACCEPTED -> export ready!
+            TruthTableCase(2, true, true, true, true, true, true, com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER, true),
+            // Case 3: White BG required, tech BG FAIL, metrics pass, approval required, user NOT accepted -> tech fail, NOT export ready
+            TruthTableCase(3, true, false, true, true, false, false, com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL, false),
+            // Case 4: White BG required, tech BG FAIL, metrics pass, approval required, user ACCEPTED -> user approval MUST NEVER override tech failure!
+            TruthTableCase(4, true, false, true, true, true, false, com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER, false),
+            // Case 5: White BG NOT required, tech BG false, metrics pass, approval required, user NOT accepted -> pending approval, NOT export ready
+            TruthTableCase(5, false, false, true, true, false, true, com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL, false),
+            // Case 6: White BG NOT required, tech BG false, metrics pass, approval required, user ACCEPTED -> export ready (not blocked by white BG)
+            TruthTableCase(6, false, false, true, true, true, true, com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER, true),
+            // Case 7: White BG required, tech BG pass, base metrics FAIL (e.g. size exceeded), approval required, user ACCEPTED -> NOT export ready
+            TruthTableCase(7, true, true, false, true, true, false, com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER, false),
+            // Case 8: White BG NOT required, tech BG false, metrics pass, approval NOT required, user NOT accepted -> export ready
+            TruthTableCase(8, false, false, true, false, false, true, com.example.data.model.PreviewApprovalStatus.NOT_REQUIRED, true)
+        )
+
+        for (c in cases) {
+            val isCompliant = c.baseMetricsPass && (!c.requiresWhiteBg || c.technicalBgCompliant)
+            assertEquals("Case ${c.caseId} isCompliant mismatch", c.expectedIsCompliant, isCompliant)
+
+            val result = com.example.data.model.ProcessedFileResult(
+                ruleId = "truth_table_${c.caseId}",
+                documentType = DocumentType.PASSPORT_PHOTO,
+                originalFileName = "test_${c.caseId}.jpg",
+                processedFilePath = "/tmp/test_${c.caseId}.jpg",
+                fileSizeBytes = 25_000L,
+                fileSizeKb = 25.0,
+                widthPx = 350,
+                heightPx = 450,
+                dpi = 300,
+                fileFormat = FileFormat.JPG,
+                isCompliant = isCompliant,
+                validationMessages = emptyList(),
+                requiresWhiteBackground = c.requiresWhiteBg,
+                technicalBackgroundCompliant = c.technicalBgCompliant,
+                requiresUserPreviewApproval = c.requiresApproval,
+                userPreviewAccepted = c.userPreviewAccepted
+            )
+
+            assertEquals("Case ${c.caseId} approvalStatus mismatch", c.expectedApprovalStatus, result.approvalStatus)
+            assertEquals("Case ${c.caseId} isExportReady mismatch", c.expectedIsExportReady, result.isExportReady)
+        }
+    }
+
+    @Test
+    fun testBatch1InitialPreviewAcceptanceStartsFalseAndResetsOnParameterChange() = runBlocking {
+        val sampleBmp = createTexturedSubjectBitmap(350, 450, Color.WHITE)
+        val rule = DocumentRule(
+            id = "batch1_reset_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+
+        // 1. Initial preparation must default to userPreviewAccepted == false and status == PENDING_PREVIEW_APPROVAL
+        val initialResult = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = sampleBmp
+        )
+        assertNotNull(initialResult)
+        assertTrue(initialResult!!.isCompliant)
+        assertFalse("Initial preparation must start with userPreviewAccepted = false", initialResult.userPreviewAccepted)
+        assertFalse("Initial preparation must start with isExportReady = false", initialResult.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, initialResult.status)
+
+        // 2. Explicit user preview approval transitions to APPROVED_BY_USER, isExportReady = true, SUCCESS_PREPARED
+        val approved = OneClickPreparationCoordinator.updateUserPreviewAcceptance(initialResult, true)
+        assertTrue(approved.userPreviewAccepted)
+        assertTrue(approved.isExportReady)
+        assertEquals(com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER, approved.approvalStatus)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, approved.status)
+
+        // 3. Re-running preparation with new parameters (e.g. Adjust sheet apply) resets userPreviewAccepted to false
+        val reprocessed = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = sampleBmp,
+            candidateName = "UPDATED NAME",
+            dateOfPhoto = "07/11/2026"
+        )
+        assertNotNull(reprocessed)
+        assertFalse("Re-processing must reset userPreviewAccepted to false", reprocessed!!.userPreviewAccepted)
+        assertFalse("Re-processing must reset isExportReady to false until new preview is approved", reprocessed.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, reprocessed.status)
+    }
+
+    @Test
+    fun testBatch1SignatureAndThumbValidationEvidenceWithoutPortraitSpoofing() = runBlocking {
+        val sigRule = DocumentRule(
+            id = "batch1_sig_rule",
+            documentType = DocumentType.SIGNATURE_ENGLISH,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 1,
+            maxKb = 30,
+            exactWidthPx = 280,
+            exactHeightPx = 120,
+            requiresWhiteBackground = true
+        )
+
+        // 1. Valid signature on white paper -> Sauvola succeeds, zero portrait spoofing, signatureEvidence passes
+        val validSigBmp = Bitmap.createBitmap(320, 140, Bitmap.Config.ARGB_8888)
+        for (y in 0 until 140) {
+            for (x in 0 until 320) {
+                val paperLum = (242 - (x.toFloat() / 320f) * 35f).toInt().coerceIn(200, 250)
+                val isStroke = (y in 45..47 && x in 45..265 && ((x + y) % 5 != 0)) ||
+                    (y in 78..80 && x in 75..235 && ((x + y) % 6 != 0)) ||
+                    (y in 48..77 && x in (80 + (y - 48) * 2)..(82 + (y - 48) * 2))
+                if (isStroke) {
+                    validSigBmp.setPixel(x, y, Color.rgb(18, 28, 145))
+                } else {
+                    validSigBmp.setPixel(x, y, Color.rgb(paperLum, paperLum, paperLum))
+                }
+            }
+        }
+
+        val validSigRes = OneClickPreparationCoordinator.autoPrepareSignature(
+            context = context,
+            input = null,
+            rule = sigRule,
+            preDecodedBitmap = validSigBmp
+        )
+        assertNotNull(validSigRes)
+        // Verify fake portrait segmentation telemetry is completely removed
+        assertFalse("Signature processing must NEVER spoof portrait segmentationExecuted = true", validSigRes!!.segmentationExecuted)
+        assertEquals(0f, validSigRes.subjectMaskConfidence, 0.0001f)
+        assertEquals(0f, validSigRes.edgeUncertaintyRatio, 0.0001f)
+        assertNotNull("Signature result must populate signatureEvidence", validSigRes.signatureEvidence)
+        assertEquals(
+            com.example.data.model.SignatureProcessingMethod.SAUVOLA_ADAPTIVE_THRESHOLD,
+            validSigRes.signatureEvidence!!.processingMethod
+        )
+        assertTrue(validSigRes.signatureEvidence!!.inkPresenceVerified)
+        assertTrue(validSigRes.signatureEvidence!!.strokeBoundingBoxFound)
+        assertTrue(validSigRes.signatureEvidence!!.paperWhitenessRatio >= 0.85f)
+        assertTrue(
+            "Expected technicalBackgroundCompliant=true (evidence=${validSigRes.signatureEvidence})",
+            validSigRes.technicalBackgroundCompliant
+        )
+        assertTrue(
+            "Expected isCompliant=true (status=${validSigRes.status}, sizeBytes=${validSigRes.fileSizeBytes})",
+            validSigRes.isCompliant
+        )
+
+        // 2. Blank dark/shadowed paper where Sauvola falls back to gentle contrast ->
+        // gentle fallback MUST NOT bypass signature ink/whiteness validation!
+        val blankGrayPaper = Bitmap.createBitmap(280, 120, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(205, 205, 210))
+        }
+        val blankSigRes = OneClickPreparationCoordinator.autoPrepareSignature(
+            context = context,
+            input = null,
+            rule = sigRule,
+            preDecodedBitmap = blankGrayPaper,
+            userPreviewAccepted = true // Even if user tries to accept, technical failure must hold!
+        )
+        assertNotNull(blankSigRes)
+        assertNotNull(blankSigRes!!.signatureEvidence)
+        assertEquals(
+            com.example.data.model.SignatureProcessingMethod.GENTLE_CONTRAST_FALLBACK,
+            blankSigRes.signatureEvidence!!.processingMethod
+        )
+        assertFalse("Blank paper under gentle fallback must fail ink/paper validation", blankSigRes.technicalBackgroundCompliant)
+        assertFalse("Blank paper must NOT be compliant", blankSigRes.isCompliant)
+        assertFalse("User preview acceptance must NEVER make a blank/unverified signature export-ready", blankSigRes.isExportReady)
+
+        // 3. Thumb impression with dense ridge ink (~24% ink coverage) -> passes THUMB_IMPRESSION bounds
+        val thumbRule = DocumentRule(
+            id = "batch1_thumb_rule",
+            documentType = DocumentType.THUMB_IMPRESSION_LEFT,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 1,
+            maxKb = 50,
+            exactWidthPx = 240,
+            exactHeightPx = 240,
+            requiresWhiteBackground = true
+        )
+        val thumbBmp = Bitmap.createBitmap(240, 240, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        for (y in 45..195) {
+            for (x in 55..185) {
+                val dx = (x - 120f) / 65f
+                val dy = (y - 120f) / 75f
+                if (dx * dx + dy * dy <= 1.0f && (x + y * 2) % 3 != 0) {
+                    thumbBmp.setPixel(x, y, Color.rgb(20, 30, 130))
+                }
+            }
+        }
+        val thumbRes = OneClickPreparationCoordinator.autoPrepareSignature(
+            context = context,
+            input = null,
+            rule = thumbRule,
+            preDecodedBitmap = thumbBmp
+        )
+        assertNotNull(thumbRes)
+        assertNotNull(thumbRes!!.signatureEvidence)
+        assertTrue(
+            "Thumb impression with dense ink ridges must pass thumb-specific ink bounds",
+            thumbRes.signatureEvidence!!.inkPresenceVerified && thumbRes.signatureEvidence!!.strokeBoundingBoxFound
+        )
+        assertTrue(thumbRes.technicalBackgroundCompliant)
+    }
+
+    @Test
+    fun testBatch2All8ExifOrientationsSingleTransformPipeline() {
+        val exifOrientations = listOf(
+            ExifInterface.ORIENTATION_NORMAL,
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL,
+            ExifInterface.ORIENTATION_ROTATE_180,
+            ExifInterface.ORIENTATION_FLIP_VERTICAL,
+            ExifInterface.ORIENTATION_TRANSPOSE,
+            ExifInterface.ORIENTATION_ROTATE_90,
+            ExifInterface.ORIENTATION_TRANSVERSE,
+            ExifInterface.ORIENTATION_ROTATE_270
+        )
+
+        val previewRectNorm = android.graphics.RectF(0.20f, 0.25f, 0.75f, 0.80f)
+
+        for (orientation in exifOrientations) {
+            val swapsDims = orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_270 ||
+                orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+                orientation == ExifInterface.ORIENTATION_TRANSVERSE
+
+            val rawW = if (swapsDims) 400 else 300
+            val rawH = if (swapsDims) 300 else 400
+            val rawBmp = createSampleBitmap(rawW, rawH, Color.DKGRAY)
+            val file = saveBitmapToTestFile(rawBmp, "batch2_exif_$orientation.jpg")
+
+            val exif = ExifInterface(file.absolutePath)
+            exif.setAttribute(ExifInterface.TAG_ORIENTATION, orientation.toString())
+            exif.saveAttributes()
+
+            // Decode upright bitmap via UnifiedMediaInput.decodeBitmapWithExif
+            val uprightBmp = UnifiedMediaInput.decodeBitmapWithExif(file)
+            assertNotNull("Decoded bitmap must not be null for EXIF $orientation", uprightBmp)
+            val (expectedUprightW, expectedUprightH) = com.example.camera.CameraViewportMapper.resolveUprightDimensions(
+                rawW,
+                rawH,
+                orientation
+            )
+            assertEquals("Upright width mismatch for EXIF $orientation", expectedUprightW, uprightBmp!!.width)
+            assertEquals("Upright height mismatch for EXIF $orientation", expectedUprightH, uprightBmp.height)
+            assertEquals(300, uprightBmp.width)
+            assertEquals(400, uprightBmp.height)
+
+            // Test both portrait (1080x2400) and landscape (2400x1080) PreviewView layouts
+            for ((pvW, pvH) in listOf(1080 to 2400, 2400 to 1080)) {
+                val mediaInput = UnifiedMediaInput.buildMappedMediaInputFromGeometry(
+                    file = file,
+                    mode = CameraCaptureMode.PASSPORT_PHOTO,
+                    previewWidth = pvW,
+                    previewHeight = pvH,
+                    measuredGuideRectNorm = previewRectNorm,
+                    isFrontCamera = false
+                )
+                assertNotNull(
+                    "Valid geometry must produce non-null mappedSensorCropRectNorm for EXIF $orientation (${pvW}x$pvH)",
+                    mediaInput.mappedSensorCropRectNorm
+                )
+                val cropped = com.example.camera.CameraViewportMapper.cropUprightSensorBitmapToPreviewGuide(
+                    uprightBitmap = uprightBmp,
+                    previewRectNorm = previewRectNorm,
+                    previewWidth = pvW,
+                    previewHeight = pvH,
+                    isFrontCamera = false
+                )
+                assertTrue(cropped.width > 0 && cropped.height > 0)
+            }
+
+            // Also verify standalone raw sensor coordinate mapping stays within [0..1]
+            val rawSensorRect = com.example.camera.CameraViewportMapper.mapUprightNormalizedRectToRawSensorRectByExif(
+                uprightRectNorm = previewRectNorm,
+                exifOrientation = orientation
+            )
+            assertTrue(rawSensorRect.left >= 0f && rawSensorRect.right <= 1f && rawSensorRect.left < rawSensorRect.right)
+            assertTrue(rawSensorRect.top >= 0f && rawSensorRect.bottom <= 1f && rawSensorRect.top < rawSensorRect.bottom)
+        }
+    }
+
+    @Test
+    fun testBatch2UnknownCameraGeometryReturnsNullCropAndNeverSilentlyCrops() {
+        val bmp = createSampleBitmap(400, 500, Color.WHITE)
+        val file = saveBitmapToTestFile(bmp, "batch2_unknown_geom.jpg")
+        val validGuide = android.graphics.RectF(0.15f, 0.15f, 0.85f, 0.85f)
+
+        // 1. Unknown PreviewView width/height (0x0) -> mappedSensorCropRectNorm MUST be null
+        val zeroPreviewInput = UnifiedMediaInput.buildMappedMediaInputFromGeometry(
+            file = file,
+            mode = CameraCaptureMode.SIGNATURE,
+            previewWidth = 0,
+            previewHeight = 0,
+            measuredGuideRectNorm = validGuide
+        )
+        assertNull(
+            "Zero PreviewView dimensions must produce mappedSensorCropRectNorm = null instead of 1080x1920 fallback",
+            zeroPreviewInput.mappedSensorCropRectNorm
+        )
+
+        // 2. Null measured guide overlay rect -> mappedSensorCropRectNorm MUST be null
+        val nullGuideInput = UnifiedMediaInput.buildMappedMediaInputFromGeometry(
+            file = file,
+            mode = CameraCaptureMode.PASSPORT_PHOTO,
+            previewWidth = 1080,
+            previewHeight = 2400,
+            measuredGuideRectNorm = null
+        )
+        assertNull(
+            "Unmeasured guide overlay rect must produce mappedSensorCropRectNorm = null instead of mode.guideCropRectNorm fallback",
+            nullGuideInput.mappedSensorCropRectNorm
+        )
+    }
+
+    @Test
+    fun testBatch3UnlistedGovInAndNicInDomainsAreRejected() {
+        // Explicit allowlisted domains pass
+        assertTrue(com.example.data.portal.OfficialDomainAllowlist.isVerifiedOfficialUrl("https://upsconline.nic.in"))
+        assertTrue(com.example.data.portal.OfficialDomainAllowlist.isVerifiedOfficialUrl("https://ssc.gov.in"))
+        assertTrue(com.example.data.portal.OfficialDomainAllowlist.isVerifiedOfficialUrl("https://tin.tin.proteantech.in"))
+
+        // Arbitrary unlisted .gov.in and .nic.in domains MUST be rejected (no wildcard suffix acceptance!)
+        assertFalse(
+            "Unlisted .gov.in domain must NOT pass strict allowlist",
+            com.example.data.portal.OfficialDomainAllowlist.isVerifiedOfficialUrl("https://unlisted-random-agency.gov.in")
+        )
+        assertFalse(
+            "Unlisted .nic.in domain must NOT pass strict allowlist",
+            com.example.data.portal.OfficialDomainAllowlist.isVerifiedOfficialUrl("https://unknown-portal-test.nic.in")
+        )
+        assertFalse(
+            "onlineservices.nsdl.com must not be silently allowlisted without traceable source governance",
+            com.example.data.portal.OfficialDomainAllowlist.isVerifiedOfficialUrl("https://www.onlineservices.nsdl.com")
+        )
+    }
+
+    @Test
+    fun testBatch3IncompleteOrStaleProvenanceDowngradesToOfficialSourceReview() {
+        val basePortal = com.example.data.portal.PortalDatabase.findPortalById("ssc_cgl")!!
+        val checkEpoch = com.example.data.portal.OfficialDomainAllowlist.parseVerifiedDateEpochMs("2025-02-01")!!
+
+        // 1. Missing sourceIdentifier / rule sourceClauseRef -> downgraded to OFFICIAL_SOURCE_REVIEW
+        val incompletePortal = basePortal.copy(
+            verificationStatus = com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED,
+            sourceIdentifier = null
+        )
+        val incompleteEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
+            portal = incompletePortal,
+            nowEpochMs = checkEpoch
+        )
+        assertEquals(
+            com.example.data.model.VerificationStatus.OFFICIAL_SOURCE_REVIEW,
+            incompleteEval.effectiveStatus
+        )
+
+        // 2. All portal & rule provenance fields present and fresh (<= 180 days) -> retains OFFICIALLY_VERIFIED
+        val completePortal = basePortal.copy(
+            verificationStatus = com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED,
+            sourceIdentifier = "SSC-CGL-2025-NOTICE-01",
+            applicableWorkflow = "SSC Online Application Upload",
+            lastVerifiedDate = "2025-01-15",
+            documents = basePortal.documents.mapIndexed { idx, r ->
+                r.copy(
+                    sourceClauseRef = "Annexure-II Para ${idx + 1}",
+                    isRuleIndividuallyVerified = true
+                )
+            }
+        )
+        val freshEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
+            portal = completePortal,
+            nowEpochMs = checkEpoch
+        )
+        assertEquals(
+            com.example.data.model.VerificationStatus.OFFICIALLY_VERIFIED,
+            freshEval.effectiveStatus
+        )
+
+        // 3. Stale check (> 180 days) -> downgraded to OFFICIAL_SOURCE_REVIEW
+        val staleEpoch = com.example.data.portal.OfficialDomainAllowlist.parseVerifiedDateEpochMs("2025-10-15")!!
+        val staleEval = com.example.data.portal.OfficialDomainAllowlist.evaluatePortalProvenance(
+            portal = completePortal,
+            nowEpochMs = staleEpoch
+        )
+        assertTrue(staleEval.isInternalReviewDue)
+        assertEquals(
+            com.example.data.model.VerificationStatus.OFFICIAL_SOURCE_REVIEW,
+            staleEval.effectiveStatus
+        )
+    }
+
+    @Test
+    fun testBatch3PanWorkflowSeparationAndUniversalPresetStatus() {
+        val universal = com.example.data.portal.PortalDatabase.findPortalById("universal_passport")
+        assertNotNull(universal)
+        assertEquals(com.example.data.model.VerificationStatus.USER_SUPPLIED, universal!!.verificationStatus)
+
+        val nsdlLegacy = com.example.data.portal.PortalDatabase.findPortalById("nsdl_pan")
+        val nsdlDsc = com.example.data.portal.PortalDatabase.findPortalById("nsdl_pan_dsc")
+        assertNotNull(nsdlLegacy)
+        assertNotNull(nsdlDsc)
+        assertEquals(com.example.data.model.VerificationStatus.OFFICIAL_SOURCE_REVIEW, nsdlLegacy!!.verificationStatus)
+        assertEquals(com.example.data.model.VerificationStatus.OFFICIAL_SOURCE_REVIEW, nsdlDsc!!.verificationStatus)
+
+        // Verify DSC workflow uses 200 DPI (3.5x2.5 cm <=20 KB photo, 2x4.5 cm <=10 KB sign)
+        // and does NOT mix 213x213 square pixels with 25x35mm physical dimensions
+        val dscPhoto = nsdlDsc.documents.first { it.documentType == DocumentType.PASSPORT_PHOTO }
+        val dscSign = nsdlDsc.documents.first { it.documentType == DocumentType.SIGNATURE_ENGLISH }
+        assertEquals(200, dscPhoto.dpi)
+        assertEquals(20, dscPhoto.maxKb)
+        assertEquals(200, dscSign.dpi)
+        assertEquals(10, dscSign.maxKb)
+        assertNull("Square 213x213 preset must not attach conflicting 25x35mm physical dimensions", nsdlLegacy.documents.first().physicalWidthMm)
+    }
+
+    @Test
+    fun testBatch4DocumentCornerDetection8SceneValidationCorpus() {
+        val w = 360
+        val h = 440
+
+        fun buildQuadScene(
+            tl: android.graphics.PointF,
+            tr: android.graphics.PointF,
+            br: android.graphics.PointF,
+            bl: android.graphics.PointF,
+            bgFn: (Int, Int) -> Int,
+            fgFn: (Int, Int) -> Int
+        ): Bitmap {
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val verts = arrayOf(
+                android.graphics.PointF(tl.x * w, tl.y * h),
+                android.graphics.PointF(tr.x * w, tr.y * h),
+                android.graphics.PointF(br.x * w, br.y * h),
+                android.graphics.PointF(bl.x * w, bl.y * h)
+            )
+            val pixels = IntArray(w * h)
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    var inside = true
+                    for (i in 0 until 4) {
+                        val a = verts[i]
+                        val b = verts[(i + 1) % 4]
+                        val cross = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+                        if (cross < 0f) {
+                            inside = false
+                            break
+                        }
+                    }
+                    pixels[y * w + x] = if (inside) fgFn(x, y) else bgFn(x, y)
+                }
+            }
+            bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+            return bmp
+        }
+
+        // Scene 1: Clean high-contrast angled document on dark desk -> autoWarpEligible = true
+        val scene1 = buildQuadScene(
+            tl = android.graphics.PointF(0.15f, 0.14f),
+            tr = android.graphics.PointF(0.85f, 0.17f),
+            br = android.graphics.PointF(0.82f, 0.85f),
+            bl = android.graphics.PointF(0.13f, 0.82f),
+            bgFn = { _, _ -> Color.rgb(35, 38, 45) },
+            fgFn = { _, _ -> Color.rgb(245, 245, 245) }
+        )
+        val det1 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene1)
+        assertTrue("Scene 1 (clean dark desk) must be autoWarpEligible (conf=${det1.confidence})", det1.autoWarpEligible)
+        assertEquals(0.15f, det1.topLeft.x, 0.05f)
+        assertEquals(0.14f, det1.topLeft.y, 0.05f)
+
+        // Scene 2: Document on textured wooden desk (alternating wood grain stripes lum 55..92) -> autoWarpEligible = true
+        val scene2 = buildQuadScene(
+            tl = android.graphics.PointF(0.16f, 0.15f),
+            tr = android.graphics.PointF(0.84f, 0.16f),
+            br = android.graphics.PointF(0.84f, 0.84f),
+            bl = android.graphics.PointF(0.16f, 0.84f),
+            bgFn = { x, y ->
+                val grain = 60 + ((x * 3 + y) % 30)
+                Color.rgb(grain + 10, grain, (grain - 10).coerceAtLeast(30))
+            },
+            fgFn = { _, _ -> Color.rgb(244, 244, 240) }
+        )
+        val det2 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene2)
+        assertTrue("Scene 2 (wooden desk) must be autoWarpEligible (conf=${det2.confidence})", det2.autoWarpEligible)
+
+        // Scene 3: Multiple competing rectangular objects (two separate bright sheets side-by-side) -> autoWarpEligible = false
+        val scene3 = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(35, 38, 45))
+        }
+        for (y in (h * 0.18).toInt()..(h * 0.82).toInt()) {
+            for (x in (w * 0.08).toInt()..(w * 0.44).toInt()) {
+                scene3.setPixel(x, y, Color.WHITE)
+            }
+            for (x in (w * 0.56).toInt()..(w * 0.92).toInt()) {
+                scene3.setPixel(x, y, Color.WHITE)
+            }
+        }
+        val det3 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene3)
+        assertTrue("Scene 3 (multiple rectangular objects) must flag hasCompetingObjects", det3.hasCompetingObjects)
+        assertFalse("Scene 3 must NOT auto-warp without user confirmation", det3.autoWarpEligible)
+
+        // Scene 4: Low-contrast white paper (lum 242) on light cream desk (lum 230) -> autoWarpEligible = false
+        val scene4 = buildQuadScene(
+            tl = android.graphics.PointF(0.15f, 0.15f),
+            tr = android.graphics.PointF(0.85f, 0.15f),
+            br = android.graphics.PointF(0.85f, 0.85f),
+            bl = android.graphics.PointF(0.15f, 0.85f),
+            bgFn = { _, _ -> Color.rgb(230, 228, 222) },
+            fgFn = { _, _ -> Color.rgb(242, 242, 240) }
+        )
+        val det4 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene4)
+        assertFalse("Scene 4 (low contrast white-on-cream) must NOT auto-warp", det4.autoWarpEligible)
+
+        // Scene 5: Document with moderate diagonal illumination shadow (lum 245 down to 145) on dark desk -> autoWarpEligible = true
+        val scene5 = buildQuadScene(
+            tl = android.graphics.PointF(0.15f, 0.15f),
+            tr = android.graphics.PointF(0.85f, 0.15f),
+            br = android.graphics.PointF(0.85f, 0.85f),
+            bl = android.graphics.PointF(0.15f, 0.85f),
+            bgFn = { _, _ -> Color.rgb(35, 38, 45) },
+            fgFn = { x, y ->
+                val t = ((x.toFloat() / w) * 0.5f + (y.toFloat() / h) * 0.5f).coerceIn(0f, 1f)
+                val lumVal = (245 - t * 95f).toInt().coerceIn(145, 245)
+                Color.rgb(lumVal, lumVal, lumVal)
+            }
+        )
+        val det5 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene5)
+        assertTrue("Scene 5 (diagonal shadow on document) must be autoWarpEligible", det5.autoWarpEligible)
+
+        // Scene 6: Clipped document extending off the bottom and right borders -> autoWarpEligible = false
+        val scene6 = buildQuadScene(
+            tl = android.graphics.PointF(0.18f, 0.18f),
+            tr = android.graphics.PointF(0.995f, 0.18f),
+            br = android.graphics.PointF(0.995f, 0.995f),
+            bl = android.graphics.PointF(0.18f, 0.995f),
+            bgFn = { _, _ -> Color.rgb(35, 38, 45) },
+            fgFn = { _, _ -> Color.WHITE }
+        )
+        val det6 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene6)
+        assertTrue("Scene 6 (clipped document) must flag isClippedAtBorder", det6.isClippedAtBorder)
+        assertFalse("Scene 6 (clipped document) must NOT auto-warp", det6.autoWarpEligible)
+
+        // Scene 7: 4-corner background clutter (4 bright patches near the 4 corners, dark center) -> autoWarpEligible = false
+        val scene7 = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(35, 38, 45))
+        }
+        for (y in 10..70) {
+            for (x in 10..70) {
+                scene7.setPixel(x, y, Color.WHITE)
+                scene7.setPixel(w - 1 - x, y, Color.WHITE)
+                scene7.setPixel(x, h - 1 - y, Color.WHITE)
+                scene7.setPixel(w - 1 - x, h - 1 - y, Color.WHITE)
+            }
+        }
+        val det7 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene7)
+        assertFalse("Scene 7 (4-corner disconnected clutter) must NEVER be autoWarpEligible", det7.autoWarpEligible)
+
+        // Scene 8: Blank uniform surface -> autoWarpEligible = false
+        val scene8 = createSampleBitmap(w, h, Color.rgb(120, 125, 130))
+        val det8 = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(scene8)
+        assertFalse("Scene 8 (blank surface) must NEVER be autoWarpEligible", det8.autoWarpEligible)
+    }
+
+    @Test
+    fun testBatch5MlKitClientReuseConcurrentLocksAndLifecycleRelease() = runBlocking {
+        com.example.processing.VisionBenchmarkRecorder.clear()
+        com.example.processing.PortraitVisionProcessor.releaseEngines()
+
+        var faceClientCreatedCount = 0
+        var faceClientClosedCount = 0
+        var segClientCreatedCount = 0
+        var segClientClosedCount = 0
+
+        val originalFaceFactory = com.example.processing.PortraitVisionProcessor.faceDetectorClientFactory
+        val originalSegFactory = com.example.processing.PortraitVisionProcessor.selfieSegmenterClientFactory
+
+        try {
+            com.example.processing.PortraitVisionProcessor.faceDetectorClientFactory = {
+                faceClientCreatedCount++
+                object : com.example.processing.PortraitVisionProcessor.ManagedFaceDetectorClient {
+                    private var closed = false
+                    override suspend fun processBitmap(bitmap: Bitmap): List<com.example.processing.PortraitVisionProcessor.DetectedFaceInfo> {
+                        check(!closed) { "FaceDetector client used after close()!" }
+                        return listOf(
+                            com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                                boundingBox = android.graphics.RectF(0.25f, 0.20f, 0.75f, 0.70f)
+                            )
+                        )
+                    }
+
+                    override fun close() {
+                        closed = true
+                        faceClientClosedCount++
+                    }
+                }
+            }
+
+            com.example.processing.PortraitVisionProcessor.selfieSegmenterClientFactory = {
+                segClientCreatedCount++
+                object : com.example.processing.PortraitVisionProcessor.ManagedSelfieSegmenterClient {
+                    private var closed = false
+                    override suspend fun processBitmap(bitmap: Bitmap): com.example.processing.PortraitVisionProcessor.SegmentationConfidenceMask {
+                        check(!closed) { "SelfieSegmenter client used after close()!" }
+                        return com.example.processing.PortraitVisionProcessor.RawSegmentationMask(
+                            bitmap.width,
+                            bitmap.height,
+                            FloatArray(bitmap.width * bitmap.height) { 0.95f }
+                        )
+                    }
+
+                    override fun close() {
+                        closed = true
+                        segClientClosedCount++
+                    }
+                }
+            }
+
+            val testBmp = createSampleBitmap(200, 250, Color.WHITE)
+
+            // 1. First call creates client once and records *_COLD_FIRST_INFERENCE
+            val faces1 = com.example.processing.PortraitVisionProcessor.mlKitFaceDetectionEngine.detectFaces(testBmp)
+            val mask1 = com.example.processing.PortraitVisionProcessor.mlKitSelfieSegmentationEngine.segmentPortrait(testBmp)
+            assertEquals(1, faces1.size)
+            assertNotNull(mask1)
+            assertEquals(1, faceClientCreatedCount)
+            assertEquals(0, faceClientClosedCount)
+            assertEquals(1, segClientCreatedCount)
+            assertEquals(0, segClientClosedCount)
+            assertTrue(com.example.processing.PortraitVisionProcessor.isFaceDetectorWarm())
+            assertTrue(com.example.processing.PortraitVisionProcessor.isSelfieSegmenterWarm())
+
+            // 2. Second call reuses the SAME cached clients without re-creating or closing, and records *_WARM_INFERENCE
+            val faces2 = com.example.processing.PortraitVisionProcessor.mlKitFaceDetectionEngine.detectFaces(testBmp)
+            val mask2 = com.example.processing.PortraitVisionProcessor.mlKitSelfieSegmentationEngine.segmentPortrait(testBmp)
+            assertEquals(1, faces2.size)
+            assertNotNull(mask2)
+            assertEquals("Cached FaceDetector must be reused without recreation", 1, faceClientCreatedCount)
+            assertEquals("Cached SelfieSegmenter must be reused without recreation", 1, segClientCreatedCount)
+            assertEquals(0, faceClientClosedCount)
+            assertEquals(0, segClientClosedCount)
+
+            // 3. Lifecycle release closes both clients and resets warm state
+            com.example.processing.PortraitVisionProcessor.releaseEngines()
+            assertEquals(1, faceClientClosedCount)
+            assertEquals(1, segClientClosedCount)
+            assertFalse(com.example.processing.PortraitVisionProcessor.isFaceDetectorCached())
+            assertFalse(com.example.processing.PortraitVisionProcessor.isSelfieSegmenterCached())
+
+            // 4. Subsequent inference after release constructs a new client and runs cold first-inference
+            com.example.processing.PortraitVisionProcessor.mlKitFaceDetectionEngine.detectFaces(testBmp)
+            assertEquals(2, faceClientCreatedCount)
+        } finally {
+            com.example.processing.PortraitVisionProcessor.releaseEngines()
+            com.example.processing.PortraitVisionProcessor.faceDetectorClientFactory = originalFaceFactory
+            com.example.processing.PortraitVisionProcessor.selfieSegmenterClientFactory = originalSegFactory
+        }
+    }
+
+    @Test
+    fun testBatch5VisionBenchmarkRecorderSampledPrePostMemoryAndColdWarmStages() {
+        com.example.processing.VisionBenchmarkRecorder.clear()
+
+        val preSnap = com.example.processing.VisionBenchmarkRecorder.HeapSnapshot(
+            javaHeapBytes = 10_000_000L,
+            nativeHeapBytes = 20_000_000L
+        )
+        val postSnap = com.example.processing.VisionBenchmarkRecorder.HeapSnapshot(
+            javaHeapBytes = 14_500_000L,
+            nativeHeapBytes = 28_000_000L
+        )
+
+        val sample = com.example.processing.VisionBenchmarkRecorder.recordSample(
+            stage = com.example.processing.VisionBenchmarkRecorder.Stage.FACE_DETECTION_COLD_FIRST_INFERENCE,
+            durationMs = 85L,
+            imageWidth = 1200,
+            imageHeight = 1600,
+            preSnapshot = preSnap,
+            postSnapshot = postSnap
+        )
+
+        assertEquals(10_000_000L, sample.sampledPreJavaHeapBytes)
+        assertEquals(14_500_000L, sample.sampledPostJavaHeapBytes)
+        assertEquals(4_500_000L, sample.sampledJavaHeapDeltaBytes)
+        assertEquals(20_000_000L, sample.sampledPreNativeHeapBytes)
+        assertEquals(28_000_000L, sample.sampledPostNativeHeapBytes)
+        assertEquals(8_000_000L, sample.sampledNativeHeapDeltaBytes)
+
+        val summary = com.example.processing.VisionBenchmarkRecorder.summarizeStage(
+            com.example.processing.VisionBenchmarkRecorder.Stage.FACE_DETECTION_COLD_FIRST_INFERENCE
+        )
+        assertNotNull(summary)
+        assertEquals(1, summary!!.sampleCount)
+        assertEquals(85L, summary.medianMs)
+        assertEquals(14_500_000L, summary.maxSampledPostJavaHeapBytes)
+        assertEquals(4_500_000L, summary.maxSampledJavaHeapDeltaBytes)
+        assertEquals(28_000_000L, summary.maxSampledPostNativeHeapBytes)
+        assertEquals(8_000_000L, summary.maxSampledNativeHeapDeltaBytes)
+    }
 }
+
 
 
 

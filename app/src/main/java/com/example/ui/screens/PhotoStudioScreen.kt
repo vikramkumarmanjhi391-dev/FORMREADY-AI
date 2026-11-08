@@ -45,6 +45,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -185,7 +186,8 @@ fun PhotoStudioScreen(
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
     var showAdjustSheet by remember { mutableStateOf(false) }
-    var userPreviewAccepted by remember { mutableStateOf(true) }
+    var userPreviewAccepted by remember { mutableStateOf(false) }
+    var cameraGeometryUnavailable by remember { mutableStateOf(false) }
 
     // Apply initialRule if navigated from Portals tab
     LaunchedEffect(initialRule) {
@@ -203,6 +205,7 @@ fun PhotoStudioScreen(
     val triggerOneClickAutoPrepare: (Bitmap, UnifiedMediaInput?) -> Unit = { bmp, mediaInput ->
         val w = customWidthPx.toIntOrNull()?.coerceAtLeast(50) ?: 350
         val h = customHeightPx.toIntOrNull()?.coerceAtLeast(50) ?: 450
+        userPreviewAccepted = false
         coroutineScope.launch {
             isProcessing = true
             saveStatusMessage = null
@@ -223,10 +226,15 @@ fun PhotoStudioScreen(
                 colorMode = colorMode
             )
 
-            // Use calibrated CameraViewportMapper sensor crop when captured from in-app camera
+            // Use calibrated CameraViewportMapper sensor crop when captured from in-app camera;
+            // NEVER silently fall back to static mode.guideCropRectNorm
             val cropRect = if (mediaInput?.isFromCamera == true) {
-                mediaInput.mappedSensorCropRectNorm ?: CameraCaptureMode.PASSPORT_PHOTO.guideCropRectNorm
-            } else null
+                cameraGeometryUnavailable = mediaInput.mappedSensorCropRectNorm == null
+                mediaInput.mappedSensorCropRectNorm
+            } else {
+                cameraGeometryUnavailable = false
+                null
+            }
 
             processedResult = OneClickPreparationCoordinator.autoPreparePhoto(
                 context = context,
@@ -242,7 +250,8 @@ fun PhotoStudioScreen(
                 cropRectNorm = cropRect,
                 removeBackgroundToWhite = autoWhiteBackground,
                 customDpi = customDpi,
-                userPreviewAccepted = userPreviewAccepted
+                requiresUserPreviewApproval = true,
+                userPreviewAccepted = false
             )
             isProcessing = false
         }
@@ -623,9 +632,56 @@ fun PhotoStudioScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 3. Immediate Results, 1-Click Download to Gallery, Save As, Share & Student Power Tools
+            // 3. Explicit User Preview Approval Gate & Immediate Results Card
             processedResult?.let { res ->
-                val isSuccess = res.status == PreparationStatus.SUCCESS_PREPARED
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainer
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = userPreviewAccepted,
+                            onCheckedChange = { accepted ->
+                                userPreviewAccepted = accepted
+                                processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(res, accepted)
+                            },
+                            modifier = Modifier.testTag("photo_preview_acceptance_checkbox")
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "I have reviewed the processed photo preview and approve it for export",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            if (res.segmentationExecuted) {
+                                Text(
+                                    text = "Mask Confidence: ${(res.subjectMaskConfidence * 100).toInt()}% • Edge Uncertainty: ${(res.edgeUncertaintyRatio * 100).toInt()}%",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            if (cameraGeometryUnavailable) {
+                                Text(
+                                    text = "Camera viewport geometry was unavailable; framed using portrait face detection. Verify crop or retake.",
+                                    fontSize = 11.sp,
+                                    color = SaffronSecondary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                val isSuccess = res.isExportReady && res.status == PreparationStatus.SUCCESS_PREPARED
                 val cardBg = if (isSuccess) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
                 val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
 
@@ -752,6 +808,7 @@ fun PhotoStudioScreen(
                             onClick = {
                                 autoWhiteBackground = false
                                 colorMode = ColorMode.COLOUR
+                                userPreviewAccepted = false
                                 sourceBitmap?.let { bmp ->
                                     val w = customWidthPx.toIntOrNull()?.coerceAtLeast(50) ?: 350
                                     val h = customHeightPx.toIntOrNull()?.coerceAtLeast(50) ?: 450
@@ -772,7 +829,7 @@ fun PhotoStudioScreen(
                                             colorMode = ColorMode.COLOUR
                                         )
                                         val cropRect = if (currentMediaInput?.isFromCamera == true) {
-                                            CameraCaptureMode.PASSPORT_PHOTO.guideCropRectNorm
+                                            currentMediaInput?.mappedSensorCropRectNorm
                                         } else null
                                         processedResult = OneClickPreparationCoordinator.autoPreparePhoto(
                                             context = context,
@@ -787,7 +844,9 @@ fun PhotoStudioScreen(
                                             enforceProportional = lockAspectRatio,
                                             cropRectNorm = cropRect,
                                             removeBackgroundToWhite = false,
-                                            customDpi = customDpi
+                                            customDpi = customDpi,
+                                            requiresUserPreviewApproval = true,
+                                            userPreviewAccepted = false
                                         )
                                         isProcessing = false
                                         Toast.makeText(context, PHOTO_FALLBACK_TOAST_MESSAGE, Toast.LENGTH_SHORT).show()

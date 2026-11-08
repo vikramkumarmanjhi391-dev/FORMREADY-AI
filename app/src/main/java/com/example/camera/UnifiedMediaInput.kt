@@ -93,8 +93,13 @@ data class UnifiedMediaInput(
     val fileSizeBytes: Long get() = privateFile?.length() ?: 0L
     val isFromCamera: Boolean
         get() = origin == MediaInputOrigin.CAMERA || origin == MediaInputOrigin.IN_APP_CAMERA
-    val effectiveGuideCropRectNorm: RectF
-        get() = mappedSensorCropRectNorm ?: mode.guideCropRectNorm
+
+    @Deprecated(
+        "Use mappedSensorCropRectNorm directly; returns null when live PreviewView or sensor geometry was unknown so no silent guesswork crop occurs.",
+        ReplaceWith("mappedSensorCropRectNorm")
+    )
+    val effectiveGuideCropRectNorm: RectF?
+        get() = mappedSensorCropRectNorm
 
     /**
      * Resolves a working Bitmap safely with EXIF orientation correction and memory bounds protection.
@@ -243,6 +248,81 @@ data class UnifiedMediaInput(
                 rotationDegrees = rotationDegrees,
                 displayName = file.name,
                 mappedSensorCropRectNorm = mappedSensorCropRectNorm,
+                captureIntent = captureIntent
+            )
+        }
+
+        /**
+         * Builds a camera [UnifiedMediaInput] using actual measured `PreviewView` dimensions,
+         * measured guide overlay normalized bounds (`PreviewViewSpace`), and decoded sensor/EXIF
+         * dimensions (`UprightBitmapSpace`).
+         *
+         * Strictly enforces the Unknown-Geometry Gate: if any dimension (`previewWidth`, `previewHeight`,
+         * `rawWidth`, `rawHeight`) is `<= 0` or `measuredGuideRectNorm == null`, sets
+         * `mappedSensorCropRectNorm = null` instead of guessing fallback constants.
+         */
+        fun buildMappedMediaInputFromGeometry(
+            file: File,
+            mode: CameraCaptureMode,
+            previewWidth: Int,
+            previewHeight: Int,
+            measuredGuideRectNorm: RectF?,
+            isFrontCamera: Boolean = false,
+            captureIntent: CaptureIntent? = null
+        ): UnifiedMediaInput {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            if (file.exists() && file.length() >= 4L) {
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+            }
+            val rawW = bounds.outWidth
+            val rawH = bounds.outHeight
+            val exifOrientation = try {
+                if (file.exists()) {
+                    val exif = ExifInterface(file.absolutePath)
+                    exif.getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION,
+                        ExifInterface.ORIENTATION_NORMAL
+                    )
+                } else {
+                    ExifInterface.ORIENTATION_NORMAL
+                }
+            } catch (_: Exception) {
+                ExifInterface.ORIENTATION_NORMAL
+            }
+            val exifRotDegrees = CameraViewportMapper.exifOrientationToDegrees(exifOrientation)
+            val (uprightW, uprightH) = CameraViewportMapper.resolveUprightDimensions(rawW, rawH, exifOrientation)
+
+            val mappedRect: RectF? = if (
+                previewWidth > 0 &&
+                previewHeight > 0 &&
+                uprightW > 0 &&
+                uprightH > 0 &&
+                measuredGuideRectNorm != null &&
+                measuredGuideRectNorm.width() > 0f &&
+                measuredGuideRectNorm.height() > 0f
+            ) {
+                CameraViewportMapper.mapPreviewRectToSensorNormalizedRect(
+                    previewRectNorm = measuredGuideRectNorm,
+                    config = CameraViewportMapper.ViewportMappingConfig(
+                        rawSensorWidth = rawW,
+                        rawSensorHeight = rawH,
+                        rotationDegrees = exifRotDegrees,
+                        previewWidth = previewWidth,
+                        previewHeight = previewHeight,
+                        isFrontCamera = isFrontCamera,
+                        isSavedOutputMirrored = false,
+                        exifOrientation = exifOrientation
+                    )
+                )
+            } else {
+                null
+            }
+
+            return fromCameraFile(
+                file = file,
+                mode = mode,
+                rotationDegrees = exifRotDegrees,
+                mappedSensorCropRectNorm = mappedRect,
                 captureIntent = captureIntent
             )
         }

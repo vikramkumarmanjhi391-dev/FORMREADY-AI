@@ -221,7 +221,9 @@ object ImageProcessor {
         maskConfidencePassed: Boolean = true,
         subjectMaskConfidence: Float = if (backgroundMask != null) 1.0f else 0f,
         edgeUncertaintyRatio: Float = 0f,
-        userPreviewAccepted: Boolean = true
+        requiresUserPreviewApproval: Boolean = true,
+        userPreviewAccepted: Boolean = false,
+        signatureExtractionResult: SignatureVisionProcessor.SignatureExtractionResult? = null
     ): ProcessedFileResult = withContext(Dispatchers.Default) {
         var workingBitmap: Bitmap = originalBitmap
         var scaled: Bitmap? = null
@@ -427,6 +429,17 @@ object ImageProcessor {
             null
         }
 
+        val isSignatureOrThumbRule = SignatureVisionProcessor.isSignatureOrThumbType(rule.documentType)
+        val signatureEvidence = if (decodedSavedBitmap != null && isSignatureOrThumbRule) {
+            SignatureVisionProcessor.validateSavedSignatureOrThumbImage(
+                savedBitmap = decodedSavedBitmap,
+                documentType = rule.documentType,
+                extractionResult = signatureExtractionResult
+            )
+        } else {
+            null
+        }
+
         val whitenessReport = try {
             if (decodedSavedBitmap != null) {
                 measureBackgroundWhiteness(
@@ -439,6 +452,7 @@ object ImageProcessor {
             } else {
                 BackgroundWhitenessReport(
                     measuredNearWhite = false,
+                    technicalBackgroundCompliant = false,
                     verifiedBackgroundCompliance = false,
                     whitePixelRatio = 0f,
                     exactWhitePixelRatio = 0f,
@@ -454,7 +468,27 @@ object ImageProcessor {
         }
 
         val measuredNearWhite = whitenessReport.measuredNearWhite
-        val verifiedBackgroundCompliance = whitenessReport.verifiedBackgroundCompliance
+        val technicalBackgroundCompliant: Boolean = when {
+            !decodeSucceeded -> false
+            isSignatureOrThumbRule && signatureEvidence != null -> {
+                signatureEvidence.inkPresenceVerified &&
+                    signatureEvidence.inkRatioWithinBounds &&
+                    signatureEvidence.strokeBoundingBoxFound &&
+                    signatureEvidence.paperWhitenessRatio >= SignatureVisionProcessor.MIN_PAPER_WHITENESS_RATIO &&
+                    signatureEvidence.paperMeanLuminance >= SignatureVisionProcessor.MIN_PAPER_MEAN_LUMINANCE
+            }
+            !isSigOrDoc -> {
+                // Portrait photo: requires explicit verified segmentation mask + confidence + pixel whiteness
+                whitenessReport.technicalBackgroundCompliant
+            }
+            else -> {
+                // Document / ID card
+                whitenessReport.technicalBackgroundCompliant ||
+                    (effectiveMaskForSaved == null && whitenessReport.measuredNearWhite)
+            }
+        }
+        val legacyVerifiedBackgroundCompliance =
+            technicalBackgroundCompliant && (!requiresUserPreviewApproval || userPreviewAccepted)
 
         // 11b. Format-specific DPI Metadata Verification from the saved file on disk
         val isJpegOutput = compressFormat == Bitmap.CompressFormat.JPEG
@@ -538,14 +572,32 @@ object ImageProcessor {
             validationMessages.add("Dimensions ($finalWidth x $finalHeight px) fall outside rule bounds.")
         }
 
-        // Strict Background Compliance: when rule requires a white background, only verifiedBackgroundCompliance
-        // (backed by an explicit reliable segmentation mask, passing confidence & preview acceptance) satisfies strict compliance.
-        val whiteBgMet = !rule.requiresWhiteBackground || verifiedBackgroundCompliance
+        if (signatureEvidence != null) {
+            val inkPct = String.format(Locale.US, "%.1f", signatureEvidence.inkPixelRatio * 100f)
+            val minPct = String.format(Locale.US, "%.1f", signatureEvidence.minRequiredInkRatio * 100f)
+            val maxPct = String.format(Locale.US, "%.1f", signatureEvidence.maxAllowedInkRatio * 100f)
+            val paperWhitePct = (signatureEvidence.paperWhitenessRatio * 100f).toInt()
+            if (signatureEvidence.usedGentleFallback) {
+                validationMessages.add("Note: Processed via gentle contrast fallback; verify stroke legibility.")
+            }
+            if (!signatureEvidence.inkPresenceVerified || !signatureEvidence.inkRatioWithinBounds || !signatureEvidence.strokeBoundingBoxFound) {
+                validationMessages.add(
+                    "Signature/Thumb Validation Warning: Ink coverage is $inkPct% (Allowed: $minPct%–$maxPct%, pixels=${signatureEvidence.verifiedInkPixelCount}, bboxFound=${signatureEvidence.strokeBoundingBoxFound})."
+                )
+            } else {
+                validationMessages.add(
+                    "Signature/Thumb Verified (${signatureEvidence.processingMethod.name}): Ink coverage $inkPct% ($minPct%–$maxPct%), Paper whiteness $paperWhitePct% (Avg lum ${signatureEvidence.paperMeanLuminance}/255)."
+                )
+            }
+        }
+
+        // Strict Technical Background Compliance (independent of userPreviewAccepted)
+        val whiteBgMet = !rule.requiresWhiteBackground || technicalBackgroundCompliant
         if (rule.requiresWhiteBackground || shouldApplyWhiteBg) {
             val nearWhitePct = (whitenessReport.whitePixelRatio * 100).toInt()
             val exactWhitePct = (whitenessReport.exactWhitePixelRatio * 100).toInt()
             when {
-                verifiedBackgroundCompliance -> {
+                technicalBackgroundCompliant -> {
                     validationMessages.add(
                         "Background Verified (${whitenessReport.verificationState}): Near-white (>=240): $nearWhitePct%, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255."
                     )
@@ -553,8 +605,7 @@ object ImageProcessor {
                 measuredNearWhite -> {
                     val reasonDetail = when (whitenessReport.verificationState) {
                         "LOW_MASK_CONFIDENCE" -> "Segmentation mask confidence (${String.format(Locale.US, "%.2f", subjectMaskConfidence)}) or edge uncertainty (${String.format(Locale.US, "%.2f", edgeUncertaintyRatio)}) requires manual review."
-                        "PREVIEW_NOT_ACCEPTED" -> "User preview confirmation is pending."
-                        else -> "No reliable segmentation mask is available to verify full background compliance."
+                        else -> "No reliable segmentation or ink mask is available to verify full background compliance."
                     }
                     validationMessages.add(
                         "Background Unverified (${whitenessReport.verificationState}): Near-white ($nearWhitePct% >=240, Exact #FFFFFF: $exactWhitePct%, Avg lum: ${whitenessReport.meanLuminance}/255). $reasonDetail"
@@ -593,6 +644,21 @@ object ImageProcessor {
             whiteBgMet &&
             dpiVerified
 
+        val approvalStatus = when {
+            !requiresUserPreviewApproval -> com.example.data.model.PreviewApprovalStatus.NOT_REQUIRED
+            userPreviewAccepted -> com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER
+            else -> com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL
+        }
+
+        val isExportReady =
+            isCompliant &&
+            (!rule.requiresWhiteBackground || technicalBackgroundCompliant) &&
+            (!requiresUserPreviewApproval || userPreviewAccepted)
+
+        if (isCompliant && requiresUserPreviewApproval && !userPreviewAccepted) {
+            validationMessages.add("Preview Approval Pending: Please review the processed preview and accept it to mark export-ready.")
+        }
+
         val status = when {
             !decodeSucceeded -> PreparationStatus.FAILED
             hasConflict -> PreparationStatus.CONFLICT_LIMITS
@@ -601,6 +667,7 @@ object ImageProcessor {
             !exactDimsMet || !boundedDimsMet -> PreparationStatus.DIMENSIONS_MISMATCH
             !whiteBgMet -> if (!measuredNearWhite) PreparationStatus.BACKGROUND_NOT_WHITE else PreparationStatus.BACKGROUND_UNVERIFIED
             !dpiVerified -> PreparationStatus.DPI_MISMATCH
+            requiresUserPreviewApproval && !userPreviewAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
             else -> PreparationStatus.SUCCESS_PREPARED
         }
 
@@ -624,18 +691,24 @@ object ImageProcessor {
             dpi = finalReportedDpi,
             wasPaddedToMinKb = false,
             measuredNearWhite = measuredNearWhite,
-            verifiedBackgroundCompliance = verifiedBackgroundCompliance,
-            hasWhiteBackground = verifiedBackgroundCompliance,
+            requiresWhiteBackground = rule.requiresWhiteBackground,
+            technicalBackgroundCompliant = technicalBackgroundCompliant,
+            requiresUserPreviewApproval = requiresUserPreviewApproval,
+            userPreviewAccepted = userPreviewAccepted,
+            approvalStatus = approvalStatus,
+            isExportReady = isExportReady,
+            verifiedBackgroundCompliance = legacyVerifiedBackgroundCompliance,
+            hasWhiteBackground = technicalBackgroundCompliant,
             backgroundVerificationState = whitenessReport.verificationState,
             nearWhitePixelRatio = whitenessReport.whitePixelRatio,
             exactWhitePixelRatio = whitenessReport.exactWhitePixelRatio,
             backgroundMeanLuminance = whitenessReport.meanLuminance,
-            segmentationExecuted = segmentationExecuted || (backgroundMask != null),
+            segmentationExecuted = if (isSignatureOrThumbRule) false else (segmentationExecuted || (backgroundMask != null)),
             backgroundReplacementApplied = shouldApplyWhiteBg || backgroundReplacementApplied || alreadyBackgroundReplaced,
             outputBackgroundPixelChecksPassed = measuredNearWhite,
-            subjectMaskConfidence = subjectMaskConfidence,
-            edgeUncertaintyRatio = edgeUncertaintyRatio,
-            userPreviewAccepted = userPreviewAccepted
+            subjectMaskConfidence = if (isSignatureOrThumbRule) 0f else subjectMaskConfidence,
+            edgeUncertaintyRatio = if (isSignatureOrThumbRule) 0f else edgeUncertaintyRatio,
+            signatureEvidence = signatureEvidence
         )
     }
 
@@ -670,8 +743,9 @@ object ImageProcessor {
 
     data class BackgroundWhitenessReport(
         val measuredNearWhite: Boolean,
+        val technicalBackgroundCompliant: Boolean = false,
         val verifiedBackgroundCompliance: Boolean,
-        val isWhiteBackground: Boolean = verifiedBackgroundCompliance,
+        val isWhiteBackground: Boolean = technicalBackgroundCompliant,
         val whitePixelRatio: Float,
         val exactWhitePixelRatio: Float = 0f,
         val meanLuminance: Int,
@@ -681,13 +755,11 @@ object ImageProcessor {
 
     /**
      * Evaluates background pixels on the decoded saved image.
-     * - Separates [BackgroundWhitenessReport.measuredNearWhite] (informational perimeter/mask pixel statistics)
-     *   from [BackgroundWhitenessReport.verifiedBackgroundCompliance] (strict 5-signal compliance).
-     * - An unverified perimeter or margin sample ([backgroundMask] == null) NEVER produces
-     *   [BackgroundWhitenessReport.verifiedBackgroundCompliance] = true.
-     * - Only when an explicit, valid [backgroundMask] (size == width * height with >= 1 background pixel)
-     *   is provided, meets the whiteness threshold, AND passes [maskConfidencePassed] and [userPreviewAccepted]
-     *   does [verifiedBackgroundCompliance] become true.
+     * - [BackgroundWhitenessReport.technicalBackgroundCompliant] depends strictly on objective
+     *   processing and saved-pixel evidence ([backgroundMask], [measuredNearWhite], [maskConfidencePassed])
+     *   and NEVER depends on [userPreviewAccepted].
+     * - [BackgroundWhitenessReport.verifiedBackgroundCompliance] is retained only for legacy callers
+     *   that combined technical verification with [userPreviewAccepted].
      */
     fun measureBackgroundWhiteness(
         bitmap: Bitmap,
@@ -701,6 +773,7 @@ object ImageProcessor {
         if (width <= 0 || height <= 0) {
             return BackgroundWhitenessReport(
                 measuredNearWhite = false,
+                technicalBackgroundCompliant = false,
                 verifiedBackgroundCompliance = false,
                 whitePixelRatio = 0f,
                 exactWhitePixelRatio = 0f,
@@ -720,7 +793,6 @@ object ImageProcessor {
         val verificationState = when {
             !hasExplicitMask -> if (isSignatureOrDocument) "UNVERIFIED_DOCUMENT_MARGIN" else "UNVERIFIED_PERIMETER_SAMPLE"
             !maskConfidencePassed -> "LOW_MASK_CONFIDENCE"
-            !userPreviewAccepted -> "PREVIEW_NOT_ACCEPTED"
             else -> "VERIFIED_MASK"
         }
 
@@ -777,6 +849,7 @@ object ImageProcessor {
         if (bgCount == 0) {
             return BackgroundWhitenessReport(
                 measuredNearWhite = false,
+                technicalBackgroundCompliant = false,
                 verifiedBackgroundCompliance = false,
                 whitePixelRatio = 0f,
                 exactWhitePixelRatio = 0f,
@@ -790,11 +863,13 @@ object ImageProcessor {
         val exactWhiteRatio = exactWhiteCount.toFloat() / bgCount.toFloat()
         val meanLum = (lumSum / bgCount).toInt()
         val measuredNearWhite = nearWhiteRatio >= 0.85f && meanLum >= 242
-        val verifiedCompliance = hasExplicitMask && measuredNearWhite && maskConfidencePassed && userPreviewAccepted
+        val technicalCompliance = hasExplicitMask && measuredNearWhite && maskConfidencePassed
+        val legacyVerifiedCompliance = technicalCompliance && userPreviewAccepted
         return BackgroundWhitenessReport(
             measuredNearWhite = measuredNearWhite,
-            verifiedBackgroundCompliance = verifiedCompliance,
-            isWhiteBackground = verifiedCompliance,
+            technicalBackgroundCompliant = technicalCompliance,
+            verifiedBackgroundCompliance = legacyVerifiedCompliance,
+            isWhiteBackground = technicalCompliance,
             whitePixelRatio = nearWhiteRatio,
             exactWhitePixelRatio = exactWhiteRatio,
             meanLuminance = meanLum,

@@ -60,6 +60,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -150,43 +152,45 @@ fun UniversalCameraScreen(
     val multiPageCaptures = remember { mutableStateListOf<File>() }
     var sessionTransferredOwnership by remember { mutableStateOf(false) }
 
+    // Live measured bounds in window coordinates for PreviewViewSpace mapping
+    var previewBoundsInWindow by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+    var cutoutBoundsInWindow by remember(activeMode) { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+
     val buildMappedMediaInput: (File) -> UnifiedMediaInput = { file ->
         val pv = previewView
-        val pvW = pv?.width?.takeIf { it > 0 } ?: 1080
-        val pvH = pv?.height?.takeIf { it > 0 } ?: 1920
-        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
-        val exifRot = try {
-            val exif = android.media.ExifInterface(file.absolutePath)
-            when (exif.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, android.media.ExifInterface.ORIENTATION_NORMAL)) {
-                android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90
-                android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180
-                android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270
-                else -> 0
+        val pvW = pv?.width ?: 0
+        val pvH = pv?.height ?: 0
+        val pBounds = previewBoundsInWindow
+        val cBounds = cutoutBoundsInWindow
+
+        val measuredGuideRectNorm: android.graphics.RectF? = if (
+            pBounds != null &&
+            cBounds != null &&
+            pBounds.width > 0f &&
+            pBounds.height > 0f &&
+            cBounds.width > 0f &&
+            cBounds.height > 0f
+        ) {
+            val left = ((cBounds.left - pBounds.left) / pBounds.width).coerceIn(0f, 1f)
+            val top = ((cBounds.top - pBounds.top) / pBounds.height).coerceIn(0f, 1f)
+            val right = ((cBounds.right - pBounds.left) / pBounds.width).coerceIn(left, 1f)
+            val bottom = ((cBounds.bottom - pBounds.top) / pBounds.height).coerceIn(top, 1f)
+            if (right > left && bottom > top) {
+                android.graphics.RectF(left, top, right, bottom)
+            } else {
+                null
             }
-        } catch (_: Exception) {
-            0
+        } else {
+            null
         }
-        val rawW = bounds.outWidth.takeIf { it > 0 } ?: 1200
-        val rawH = bounds.outHeight.takeIf { it > 0 } ?: 1600
-        val guideRect = CaptureIntent.resolveGuideRectNorm(activeMode, captureIntent.targetAspectRatio)
-        val mappedRect = CameraViewportMapper.mapPreviewRectToSensorNormalizedRect(
-            previewRectNorm = guideRect,
-            config = CameraViewportMapper.ViewportMappingConfig(
-                rawSensorWidth = rawW,
-                rawSensorHeight = rawH,
-                rotationDegrees = exifRot,
-                previewWidth = pvW,
-                previewHeight = pvH,
-                isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT,
-                isSavedOutputMirrored = false
-            )
-        )
-        UnifiedMediaInput.fromCameraFile(
+
+        UnifiedMediaInput.buildMappedMediaInputFromGeometry(
             file = file,
             mode = activeMode,
-            rotationDegrees = exifRot,
-            mappedSensorCropRectNorm = mappedRect,
+            previewWidth = pvW,
+            previewHeight = pvH,
+            measuredGuideRectNorm = measuredGuideRectNorm,
+            isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT,
             captureIntent = captureIntent
         )
     }
@@ -339,7 +343,11 @@ fun UniversalCameraScreen(
                     previewView = pv
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { coords ->
+                    previewBoundsInWindow = coords.boundsInWindow()
+                }
         )
 
         // Tap-to-Focus visual ring
@@ -359,7 +367,12 @@ fun UniversalCameraScreen(
         }
 
         // Mode-Specific Visual Guidance Overlay (with darkened outer mask)
-        CameraModeGuidanceOverlay(mode = activeMode)
+        CameraModeGuidanceOverlay(
+            mode = activeMode,
+            onCutoutPositioned = { bounds ->
+                cutoutBoundsInWindow = bounds
+            }
+        )
 
         // Top Control Bar
         Row(
@@ -690,7 +703,10 @@ fun UniversalCameraScreen(
 }
 
 @Composable
-private fun CameraModeGuidanceOverlay(mode: CameraCaptureMode) {
+private fun CameraModeGuidanceOverlay(
+    mode: CameraCaptureMode,
+    onCutoutPositioned: (androidx.compose.ui.geometry.Rect) -> Unit = {}
+) {
     Box(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
@@ -702,6 +718,9 @@ private fun CameraModeGuidanceOverlay(mode: CameraCaptureMode) {
                     Box(
                         modifier = Modifier
                             .size(width = 230.dp, height = 300.dp)
+                            .onGloballyPositioned { coords ->
+                                onCutoutPositioned(coords.boundsInWindow())
+                            }
                             .border(2.5.dp, Color(0xFF38BDF8), RoundedCornerShape(150.dp)),
                         contentAlignment = Alignment.Center
                     ) {
@@ -772,6 +791,9 @@ private fun CameraModeGuidanceOverlay(mode: CameraCaptureMode) {
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxSize()
+                                .onGloballyPositioned { coords ->
+                                    onCutoutPositioned(coords.boundsInWindow())
+                                }
                                 .border(2.5.dp, Color(0xFFEC4899), RoundedCornerShape(10.dp))
                         )
                         Box(
@@ -794,6 +816,9 @@ private fun CameraModeGuidanceOverlay(mode: CameraCaptureMode) {
                 Box(
                     modifier = Modifier
                         .size(width = 160.dp, height = 200.dp)
+                        .onGloballyPositioned { coords ->
+                            onCutoutPositioned(coords.boundsInWindow())
+                        }
                         .border(2.5.dp, Color(0xFF4CAF50), RoundedCornerShape(16.dp))
                 )
             }
@@ -803,6 +828,9 @@ private fun CameraModeGuidanceOverlay(mode: CameraCaptureMode) {
                     Box(
                         modifier = Modifier
                             .size(width = 290.dp, height = 395.dp)
+                            .onGloballyPositioned { coords ->
+                                onCutoutPositioned(coords.boundsInWindow())
+                            }
                             .border(2.5.dp, Color(0xFF00E5FF), RoundedCornerShape(12.dp))
                     )
                     Spacer(modifier = Modifier.height(6.dp))

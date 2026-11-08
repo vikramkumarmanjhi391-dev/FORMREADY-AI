@@ -242,10 +242,11 @@ fun PortalDetailScreen(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
+                val exportReadyCount = preparedResults.values.count { it.isExportReady }
                 Text(
-                    text = "${preparedResults.values.count { it.isCompliant }} / ${portal.documents.size} Verified",
+                    text = "$exportReadyCount / ${portal.documents.size} Export-Ready",
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (preparedResults.values.count { it.isCompliant } == portal.documents.size) VerifiedGreen else MaterialTheme.colorScheme.primary,
+                    color = if (exportReadyCount == portal.documents.size) VerifiedGreen else MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.Bold
                 )
             }
@@ -255,7 +256,7 @@ fun PortalDetailScreen(
 
         items(portal.documents, key = { it.id }) { rule ->
             val result = preparedResults[rule.id]
-            val isCompliant = result?.isCompliant == true
+            val isExportReady = result?.isExportReady == true
 
             Card(
                 modifier = Modifier
@@ -266,7 +267,7 @@ fun PortalDetailScreen(
                 colors = CardDefaults.cardColors(
                     containerColor = when {
                         result == null -> MaterialTheme.colorScheme.surface
-                        isCompliant -> Color(0xFFE8F5E9)
+                        isExportReady -> Color(0xFFE8F5E9)
                         else -> Color(0xFFFFF3E0)
                     }
                 ),
@@ -274,7 +275,7 @@ fun PortalDetailScreen(
                     1.dp,
                     when {
                         result == null -> MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)
-                        isCompliant -> EmeraldTertiary
+                        isExportReady -> EmeraldTertiary
                         else -> SaffronSecondary
                     }
                 )
@@ -321,7 +322,7 @@ fun PortalDetailScreen(
                             onClick = { onSelectRuleToPrepare(rule) },
                             shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isCompliant) EmeraldTertiary else MaterialTheme.colorScheme.primary
+                                containerColor = if (isExportReady) EmeraldTertiary else MaterialTheme.colorScheme.primary
                             ),
                             modifier = Modifier
                                 .height(48.dp)
@@ -347,9 +348,9 @@ fun PortalDetailScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = if (isCompliant) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                imageVector = if (isExportReady) Icons.Default.CheckCircle else Icons.Default.Warning,
                                 contentDescription = null,
-                                tint = if (isCompliant) VerifiedGreen else SaffronSecondary,
+                                tint = if (isExportReady) VerifiedGreen else SaffronSecondary,
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
@@ -357,7 +358,7 @@ fun PortalDetailScreen(
                                 text = "${result.status.label}: ${result.widthPx}×${result.heightPx} px • ${String.format(Locale.US, "%.1f", result.fileSizeKb)} KB • ${result.dpi} DPI",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = if (isCompliant) VerifiedGreen else SaffronSecondary
+                                color = if (isExportReady) VerifiedGreen else SaffronSecondary
                             )
                         }
                     }

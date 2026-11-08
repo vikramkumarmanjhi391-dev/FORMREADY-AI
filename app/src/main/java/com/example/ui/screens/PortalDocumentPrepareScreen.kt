@@ -131,7 +131,7 @@ fun PortalDocumentPrepareScreen(
     var showAdjustSheet by remember { mutableStateOf(false) }
     var showCornerOverlay by remember { mutableStateOf(false) }
 
-    var userPreviewAccepted by remember { mutableStateOf(true) }
+    var userPreviewAccepted by remember { mutableStateOf(false) }
     var detectedCornersNorm by remember { mutableStateOf<List<PointF>>(emptyList()) }
     var detectedCornerConfidence by remember { mutableFloatStateOf(0f) }
 
@@ -193,6 +193,7 @@ fun PortalDocumentPrepareScreen(
                         enforceProportional = lockAspectRatio,
                         removeBackgroundToWhite = autoWhiteBackground,
                         customDpi = customDpi,
+                        requiresUserPreviewApproval = true,
                         userPreviewAccepted = previewAccepted
                     )
                     if (res != null) {
@@ -215,6 +216,7 @@ fun PortalDocumentPrepareScreen(
                         customTargetKb = targetMaxKb,
                         enforceProportional = true,
                         customDpi = customDpi,
+                        requiresUserPreviewApproval = true,
                         userPreviewAccepted = previewAccepted
                     )
                     if (res != null) {
@@ -255,7 +257,14 @@ fun PortalDocumentPrepareScreen(
                         val pdfStatus = when {
                             !pdfReport.metTarget -> PreparationStatus.SIZE_EXCEEDED
                             pdfReport.actualSizeKb < targetMinKb -> PreparationStatus.SIZE_BELOW_MIN
+                            !previewAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
                             else -> PreparationStatus.SUCCESS_PREPARED
+                        }
+                        val pdfMessages = mutableListOf(
+                            "PDF Verified: ${String.format(Locale.US, "%.1f", pdfReport.actualSizeKb)} KB (Allowed: $targetMinKb–$targetMaxKb KB), Pages: ${pdfReport.outputPageCount}"
+                        )
+                        if (pdfCompliant && !previewAccepted) {
+                            pdfMessages.add("Preview Approval Pending: Please review the processed preview and accept it to mark export-ready.")
                         }
                         val pdfRes = ProcessedFileResult(
                             ruleId = rule.id,
@@ -269,11 +278,12 @@ fun PortalDocumentPrepareScreen(
                             heightPx = cleanedBmp.height,
                             pageCount = pdfReport.outputPageCount,
                             isCompliant = pdfCompliant,
-                            validationMessages = listOf(
-                                "PDF Verified: ${String.format(Locale.US, "%.1f", pdfReport.actualSizeKb)} KB (Allowed: $targetMinKb–$targetMaxKb KB), Pages: ${pdfReport.outputPageCount}"
-                            ),
+                            validationMessages = pdfMessages,
                             status = pdfStatus,
                             dpi = customDpi,
+                            requiresWhiteBackground = autoWhiteBackground,
+                            technicalBackgroundCompliant = pdfCompliant,
+                            requiresUserPreviewApproval = true,
                             userPreviewAccepted = previewAccepted
                         )
                         processedResult = pdfRes
@@ -285,6 +295,7 @@ fun PortalDocumentPrepareScreen(
                             rule = effectiveRule,
                             customTargetKb = targetMaxKb,
                             customDpi = customDpi,
+                            requiresUserPreviewApproval = true,
                             userPreviewAccepted = previewAccepted
                         )
                         processedResult = res
@@ -312,8 +323,8 @@ fun PortalDocumentPrepareScreen(
                     previous?.cleanupPrivateCameraFileIfTemporary()
                     currentMediaInput = mediaInput
                     sourceBitmap = bmp
-                    userPreviewAccepted = true
-                    runPreparationPipeline(bmp, mediaInput, null, true)
+                    userPreviewAccepted = false
+                    runPreparationPipeline(bmp, mediaInput, null, false)
                 } else {
                     Toast.makeText(context, "Could not decode selected image.", Toast.LENGTH_SHORT).show()
                 }
@@ -334,8 +345,8 @@ fun PortalDocumentPrepareScreen(
                     if (bmp != null) {
                         previous?.cleanupPrivateCameraFileIfTemporary()
                         sourceBitmap = bmp
-                        userPreviewAccepted = true
-                        runPreparationPipeline(bmp, input, null, true)
+                        userPreviewAccepted = false
+                        runPreparationPipeline(bmp, input, null, false)
                     } else {
                         input.cleanupPrivateCameraFileIfTemporary()
                         Toast.makeText(context, "Failed to decode camera capture.", Toast.LENGTH_SHORT).show()
@@ -368,7 +379,8 @@ fun PortalDocumentPrepareScreen(
                 inkThreshold = inkThreshold,
                 onInkThresholdChange = { inkThreshold = it },
                 onApplyAndReprocess = {
-                    sourceBitmap?.let { runPreparationPipeline(it, currentMediaInput, null, userPreviewAccepted) }
+                    userPreviewAccepted = false
+                    sourceBitmap?.let { runPreparationPipeline(it, currentMediaInput, null, false) }
                 },
                 onDismiss = { showAdjustSheet = false }
             )
@@ -398,7 +410,8 @@ fun PortalDocumentPrepareScreen(
                 showFaceGuideOverlay = showFaceGuideOverlay,
                 onToggleFaceGuide = { showFaceGuideOverlay = it },
                 onApplyAndReprocess = {
-                    sourceBitmap?.let { runPreparationPipeline(it, currentMediaInput, null, userPreviewAccepted) }
+                    userPreviewAccepted = false
+                    sourceBitmap?.let { runPreparationPipeline(it, currentMediaInput, null, false) }
                 },
                 onDismiss = { showAdjustSheet = false }
             )
@@ -575,17 +588,19 @@ fun PortalDocumentPrepareScreen(
                         confidence = detectedCornerConfidence,
                         onApplyCorners = { corners ->
                             showCornerOverlay = false
-                            runPreparationPipeline(sourceBitmap!!, currentMediaInput, corners, userPreviewAccepted)
+                            userPreviewAccepted = false
+                            runPreparationPipeline(sourceBitmap!!, currentMediaInput, corners, false)
                         },
                         onResetCorners = {
-                            runPreparationPipeline(sourceBitmap!!, currentMediaInput, null, userPreviewAccepted)
+                            userPreviewAccepted = false
+                            runPreparationPipeline(sourceBitmap!!, currentMediaInput, null, false)
                         }
                     )
                 }
             }
 
-            // 6-Part Background Verification: User Preview Confirmation Checkbox
-            if (sourceBitmap != null && (rule.requiresWhiteBackground || autoWhiteBackground)) {
+            // Explicit User Preview Approval Gate (Independent of Technical Compliance)
+            if (sourceBitmap != null && processedResult != null) {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -605,15 +620,17 @@ fun PortalDocumentPrepareScreen(
                             checked = userPreviewAccepted,
                             onCheckedChange = { accepted ->
                                 userPreviewAccepted = accepted
-                                sourceBitmap?.let { bmp ->
-                                    runPreparationPipeline(bmp, currentMediaInput, null, accepted)
+                                processedResult?.let { currentRes ->
+                                    val updated = OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, accepted)
+                                    processedResult = updated
+                                    onDocumentPrepared(updated)
                                 }
                             },
                             modifier = Modifier.testTag("preview_acceptance_checkbox")
                         )
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "I have reviewed the subject edges and accept this preview",
+                                text = "I have reviewed the processed preview and approve it for export",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
@@ -621,6 +638,12 @@ fun PortalDocumentPrepareScreen(
                                 if (res.segmentationExecuted) {
                                     Text(
                                         text = "Mask Confidence: ${(res.subjectMaskConfidence * 100).toInt()}% • Edge Uncertainty: ${(res.edgeUncertaintyRatio * 100).toInt()}%",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                } else if (res.signatureEvidence != null) {
+                                    Text(
+                                        text = "Ink Ratio: ${String.format(Locale.US, "%.1f", res.signatureEvidence.inkPixelRatio * 100f)}% • Paper White: ${(res.signatureEvidence.paperWhitenessRatio * 100f).toInt()}%",
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -634,7 +657,7 @@ fun PortalDocumentPrepareScreen(
             // Processed Result Status & Actions Card
             processedResult?.let { res ->
                 Spacer(modifier = Modifier.height(10.dp))
-                val isSuccess = res.status == PreparationStatus.SUCCESS_PREPARED
+                val isSuccess = res.isExportReady && res.status == PreparationStatus.SUCCESS_PREPARED
                 val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
 
                 Card(

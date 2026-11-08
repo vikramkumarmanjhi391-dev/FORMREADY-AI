@@ -8,16 +8,25 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
- * Auditable governance validator for official government examination and citizen service portals.
+ * Auditable governance validator for official government examination and citizen service portals (Phase 0.4C).
  *
- * Key rules:
- * 1. An `https://` URL alone is NEVER sufficient for [VerificationStatus.OFFICIALLY_VERIFIED].
- * 2. The hostname must match an explicitly audited government/statutory agency domain in
- *    [VERIFIED_OFFICIAL_DOMAINS] or a verified `.gov.in` / `.nic.in` domain with non-blank
- *    official notification provenance.
- * 3. The 180-day freshness check (`isReviewDue`) is strictly an internal maintenance review policy,
- *    NOT a claim that official government rules automatically expire after 180 days. It never
- *    invalidates or alters the portal's actual [com.example.data.model.DocumentRule] values.
+ * Strict Governance Rules:
+ * 1. An `https://` URL or generic `.gov.in` / `.nic.in` suffix is NEVER sufficient for
+ *    [VerificationStatus.OFFICIALLY_VERIFIED]. Only hosts matching [VERIFIED_OFFICIAL_DOMAINS]
+ *    return `isVerifiedOfficialUrl == true`.
+ * 2. A preset retains `effectiveStatus == VerificationStatus.OFFICIALLY_VERIFIED` ONLY when:
+ *    - `isVerifiedOfficialUrl(portal.officialUrl)` is `true`,
+ *    - `portal.sourceDocumentTitle.isNotBlank()`,
+ *    - `!portal.sourceIdentifier.isNullOrBlank()` (or `!portal.notificationNumber.isNullOrBlank()`),
+ *    - `portal.applicableWorkflow.isNotBlank()`,
+ *    - `daysSinceLastCheck != null && daysSinceLastCheck in 0..INTERNAL_REVIEW_FRESHNESS_DAYS`, AND
+ *    - Every [com.example.data.model.DocumentRule] in `portal.documents` has
+ *      `!rule.sourceClauseRef.isNullOrBlank() && rule.isRuleIndividuallyVerified`.
+ * 3. Whenever any provenance field is missing (`null`/blank), unrecorded, or stale (`> 180` days),
+ *    `evaluatePortalProvenance()` downgrades `effectiveStatus` to
+ *    [VerificationStatus.OFFICIAL_SOURCE_REVIEW] (or [VerificationStatus.UNVERIFIED_RULE] if the
+ *    domain is not in [VERIFIED_OFFICIAL_DOMAINS]), without altering or deleting the portal's
+ *    underlying [com.example.data.model.DocumentRule] parameters.
  */
 object OfficialDomainAllowlist {
 
@@ -62,12 +71,13 @@ object OfficialDomainAllowlist {
         val isOfficialDomainVerified: Boolean,
         val extractedHost: String,
         val hasRequiredProvenanceMetadata: Boolean,
+        val allRulesIndividuallyVerified: Boolean = false,
         val daysSinceLastCheck: Long?,
         val isInternalReviewDue: Boolean,
         val effectiveStatus: VerificationStatus,
         val provenanceSummary: String,
         val isOfficialDomain: Boolean = isOfficialDomainVerified,
-        val reviewNote: String? = if (isInternalReviewDue) provenanceSummary else null
+        val reviewNote: String? = if (isInternalReviewDue || !hasRequiredProvenanceMetadata) provenanceSummary else null
     )
 
     fun extractHost(url: String): String {
@@ -84,8 +94,8 @@ object OfficialDomainAllowlist {
     }
 
     /**
-     * Checks whether [url] uses HTTPS and belongs to an auditable official government or
-     * statutory examination authority domain.
+     * Checks whether [url] uses HTTPS and belongs to an explicitly allowlisted official domain in
+     * [VERIFIED_OFFICIAL_DOMAINS]. Wildcard `.gov.in` / `.nic.in` suffixes are strictly rejected.
      */
     fun isVerifiedOfficialUrl(url: String): Boolean {
         val host = extractHost(url)
@@ -93,10 +103,7 @@ object OfficialDomainAllowlist {
         if (host == "custom.gov.in" || host.startsWith("example.") || host.contains("localhost")) {
             return false
         }
-        if (VERIFIED_OFFICIAL_DOMAINS.any { host == it || host.endsWith(".$it") }) {
-            return true
-        }
-        return host.endsWith(".gov.in") || host.endsWith(".nic.in")
+        return VERIFIED_OFFICIAL_DOMAINS.any { host == it || host.endsWith(".$it") }
     }
 
     /**
@@ -104,7 +111,9 @@ object OfficialDomainAllowlist {
      */
     fun parseVerifiedDateEpochMs(dateStr: String): Long? {
         val cleaned = dateStr.trim()
-        if (cleaned.isEmpty() || cleaned.equals("Today", ignoreCase = true)) return null
+        if (cleaned.isEmpty() || cleaned.equals("Today", ignoreCase = true) || cleaned.equals("Synced", ignoreCase = true)) {
+            return null
+        }
         val patterns = listOf(
             "yyyy-MM-dd",
             "dd-MM-yyyy",
@@ -124,13 +133,7 @@ object OfficialDomainAllowlist {
     }
 
     /**
-     * Evaluates a [PortalSpec]'s source evidence and returns a truthful [PortalProvenanceReport].
-     *
-     * - Only portals with a verified official domain, non-blank source document title, non-blank
-     *   verification date, and `verificationStatus == OFFICIALLY_VERIFIED` retain the green
-     *   [VerificationStatus.OFFICIALLY_VERIFIED] badge.
-     * - If `daysSinceLastCheck > INTERNAL_REVIEW_FRESHNESS_DAYS`, `isInternalReviewDue` is set to
-     *   `true` as an internal review note without invalidating the portal's document rules.
+     * Evaluates a [PortalSpec]'s source evidence and returns a conservative [PortalProvenanceReport].
      */
     fun evaluatePortalProvenance(
         portal: PortalSpec,
@@ -140,9 +143,24 @@ object OfficialDomainAllowlist {
         val effectiveNowMs = if (nowEpochMs != referenceEpochMs) nowEpochMs else referenceEpochMs
         val host = extractHost(portal.officialUrl)
         val domainVerified = isVerifiedOfficialUrl(portal.officialUrl)
-        val hasMetadata = portal.sourceDocumentTitle.isNotBlank() &&
+
+        val effectiveSourceId = portal.sourceIdentifier?.takeIf { it.isNotBlank() }
+            ?: portal.notificationNumber?.takeIf { it.isNotBlank() }
+
+        val hasPortalMetadata = portal.sourceDocumentTitle.isNotBlank() &&
             !portal.sourceDocumentTitle.contains("User Configured", ignoreCase = true) &&
+            !portal.sourceDocumentTitle.contains("GitHub JSON", ignoreCase = true) &&
+            !effectiveSourceId.isNullOrBlank() &&
+            !effectiveSourceId.equals("UNRECORDED", ignoreCase = true) &&
+            !effectiveSourceId.equals("None", ignoreCase = true) &&
+            portal.applicableWorkflow.isNotBlank() &&
             portal.lastVerifiedDate.isNotBlank()
+
+        val allRulesVerified = portal.documents.isNotEmpty() && portal.documents.all { rule ->
+            !rule.sourceClauseRef.isNullOrBlank() &&
+                !rule.sourceClauseRef.equals("UNRECORDED", ignoreCase = true) &&
+                rule.isRuleIndividuallyVerified
+        }
 
         val verifiedEpoch = parseVerifiedDateEpochMs(portal.lastVerifiedDate)
         val daysElapsed = if (verifiedEpoch != null && effectiveNowMs >= verifiedEpoch) {
@@ -151,31 +169,41 @@ object OfficialDomainAllowlist {
             null
         }
         val reviewDue = daysElapsed == null || daysElapsed > INTERNAL_REVIEW_FRESHNESS_DAYS
+        val hasRequiredProvenance = hasPortalMetadata && allRulesVerified && daysElapsed != null
 
-        val effectiveStatus = when {
-            portal.verificationStatus == VerificationStatus.OFFICIALLY_VERIFIED -> {
-                if (domainVerified && hasMetadata) {
-                    VerificationStatus.OFFICIALLY_VERIFIED
-                } else if (domainVerified) {
-                    VerificationStatus.OFFICIAL_SOURCE_REVIEW
-                } else {
-                    VerificationStatus.UNVERIFIED_RULE
+        val effectiveStatus = when (portal.verificationStatus) {
+            VerificationStatus.USER_SUPPLIED,
+            VerificationStatus.NEEDS_REVERIFICATION,
+            VerificationStatus.UNVERIFIED_RULE,
+            VerificationStatus.OUTDATED -> portal.verificationStatus
+            VerificationStatus.OFFICIAL_SOURCE_REVIEW -> {
+                if (domainVerified) VerificationStatus.OFFICIAL_SOURCE_REVIEW else VerificationStatus.UNVERIFIED_RULE
+            }
+            VerificationStatus.OFFICIALLY_VERIFIED -> {
+                when {
+                    !domainVerified -> VerificationStatus.UNVERIFIED_RULE
+                    hasRequiredProvenance && !reviewDue -> VerificationStatus.OFFICIALLY_VERIFIED
+                    else -> VerificationStatus.OFFICIAL_SOURCE_REVIEW
                 }
             }
-            else -> portal.verificationStatus
         }
 
         val summary = buildString {
             append(portal.sourceDocumentTitle.ifBlank { "Unspecified Source" })
-            if (!portal.notificationNumber.isNullOrBlank()) {
-                append(" (${portal.notificationNumber})")
+            if (!effectiveSourceId.isNullOrBlank()) {
+                append(" ($effectiveSourceId)")
+            } else {
+                append(" (Source ID unrecorded)")
+            }
+            if (portal.applicableWorkflow.isNotBlank()) {
+                append(" • Workflow: ${portal.applicableWorkflow}")
             }
             if (host.isNotBlank()) {
                 append(" • $host")
             }
             append(" • Checked: ${portal.lastVerifiedDate.ifBlank { "Unrecorded" }}")
-            if (reviewDue && effectiveStatus == VerificationStatus.OFFICIALLY_VERIFIED) {
-                append(" • Periodic Notification Review Recommended")
+            if (reviewDue || !hasRequiredProvenance) {
+                append(" • Official Source Review Required")
             }
         }
 
@@ -183,7 +211,8 @@ object OfficialDomainAllowlist {
             portalId = portal.id,
             isOfficialDomainVerified = domainVerified,
             extractedHost = host,
-            hasRequiredProvenanceMetadata = hasMetadata,
+            hasRequiredProvenanceMetadata = hasRequiredProvenance,
+            allRulesIndividuallyVerified = allRulesVerified,
             daysSinceLastCheck = daysElapsed,
             isInternalReviewDue = reviewDue,
             effectiveStatus = effectiveStatus,

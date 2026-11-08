@@ -3,21 +3,50 @@ package com.example.processing
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
+import com.example.data.model.DocumentType
+import com.example.data.model.SignatureProcessingMethod
+import com.example.data.model.SignatureValidationEvidence
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * Phase 3A: On-Device Signature & Thumb Impression Vision Processor.
+ * Phase 3A & Phase 0.4A: On-Device Signature & Thumb Impression Vision Processor.
  *
  * Uses Integral-Image Sauvola Local Adaptive Thresholding ($O(1)$ per pixel) to separate
  * genuine handwriting strokes and thumbprint ridges from uneven paper illumination and mobile
- * phone shadows, followed by density-filtered bounding-box extraction.
+ * phone shadows, followed by density-filtered bounding-box extraction and saved-output validation.
  *
- * Includes safe fallback to gentle contrast adjustment when stroke coverage is too low.
+ * Distinguishes Sauvola adaptive thresholding from gentle contrast fallback and applies
+ * separate calibrated validation thresholds for Handwritten Signatures vs. Thumb Impressions.
  */
 object SignatureVisionProcessor {
+
+    const val SIGNATURE_MIN_INK_PIXELS = 25
+    const val SIGNATURE_MIN_INK_RATIO = 0.008f
+    const val SIGNATURE_MAX_INK_RATIO = 0.28f
+    const val SIGNATURE_MIN_BOX_WIDTH_RATIO = 0.15f
+    const val SIGNATURE_MIN_BOX_HEIGHT_RATIO = 0.08f
+
+    const val THUMB_MIN_INK_PIXELS = 80
+    const val THUMB_MIN_INK_RATIO = 0.060f
+    const val THUMB_MAX_INK_RATIO = 0.58f
+    const val THUMB_MIN_BOX_WIDTH_RATIO = 0.20f
+    const val THUMB_MIN_BOX_HEIGHT_RATIO = 0.20f
+
+    const val MIN_PAPER_WHITENESS_RATIO = 0.85f
+    const val MIN_PAPER_MEAN_LUMINANCE = 242
+
+    fun isThumbImpressionType(type: DocumentType): Boolean =
+        type == DocumentType.THUMB_IMPRESSION_LEFT ||
+            type == DocumentType.THUMB_IMPRESSION_RIGHT
+
+    fun isSignatureOrThumbType(type: DocumentType): Boolean =
+        type == DocumentType.SIGNATURE_ENGLISH ||
+            type == DocumentType.SIGNATURE_HINDI ||
+            type == DocumentType.DECLARATION_HANDWRITTEN ||
+            isThumbImpressionType(type)
 
     data class SignatureExtractionResult(
         val processedBitmap: Bitmap,
@@ -25,7 +54,11 @@ object SignatureVisionProcessor {
         val inkPixelRatio: Float,
         val backgroundMask: BooleanArray,
         val usedAdaptiveSauvola: Boolean,
-        val fallbackReason: String? = null
+        val fallbackReason: String? = null,
+        val verifiedInkPixelCount: Int = 0,
+        val strokeBoundingBoxFound: Boolean = false,
+        val strokeBoxWidthRatio: Float = 0f,
+        val strokeBoxHeightRatio: Float = 0f
     ) {
         val cleanedBitmap: Bitmap
             get() = processedBitmap
@@ -79,7 +112,11 @@ object SignatureVisionProcessor {
                 inkPixelRatio = 0f,
                 backgroundMask = BooleanArray((width * height).coerceAtLeast(1)) { true },
                 usedAdaptiveSauvola = false,
-                fallbackReason = "Image too small for adaptive thresholding"
+                fallbackReason = "Image too small for adaptive thresholding",
+                verifiedInkPixelCount = 0,
+                strokeBoundingBoxFound = false,
+                strokeBoxWidthRatio = 0f,
+                strokeBoxHeightRatio = 0f
             )
         }
 
@@ -166,7 +203,11 @@ object SignatureVisionProcessor {
                 inkPixelRatio = inkRatio,
                 backgroundMask = fallbackBgMask,
                 usedAdaptiveSauvola = false,
-                fallbackReason = "Insufficient local stroke contrast — applied gentle ink processing fallback."
+                fallbackReason = "Insufficient local stroke contrast — applied gentle ink processing fallback.",
+                verifiedInkPixelCount = rawInkCount,
+                strokeBoundingBoxFound = false,
+                strokeBoxWidthRatio = 0f,
+                strokeBoxHeightRatio = 0f
             )
         }
 
@@ -240,13 +281,20 @@ object SignatureVisionProcessor {
             (maxX - minX) >= (width * 0.06f).toInt() &&
             (maxY - minY) >= (height * 0.05f).toInt()
 
+        val rawBoxWidthRatio = if (maxX > minX) (maxX - minX + 1).toFloat() / width.toFloat() else 0f
+        val rawBoxHeightRatio = if (maxY > minY) (maxY - minY + 1).toFloat() / height.toFloat() else 0f
+
         if (!trimMargins || !validBoundsFound) {
             return@measureStage SignatureExtractionResult(
                 processedBitmap = fullProcessed,
                 inkBoundingBoxPx = Rect(0, 0, width, height),
                 inkPixelRatio = verifiedStrokeCount.toFloat() / totalPixels.toFloat(),
                 backgroundMask = cleanBgMask,
-                usedAdaptiveSauvola = true
+                usedAdaptiveSauvola = true,
+                verifiedInkPixelCount = verifiedStrokeCount,
+                strokeBoundingBoxFound = validBoundsFound,
+                strokeBoxWidthRatio = rawBoxWidthRatio,
+                strokeBoxHeightRatio = rawBoxHeightRatio
             )
         }
 
@@ -265,20 +313,187 @@ object SignatureVisionProcessor {
         }
 
         val croppedMask = BooleanArray(cropW * cropH)
+        var croppedInkCount = 0
         for (cy in 0 until cropH) {
             val srcRow = (cropTop + cy) * width + cropLeft
             val dstRow = cy * cropW
             for (cx in 0 until cropW) {
-                croppedMask[dstRow + cx] = cleanBgMask[srcRow + cx]
+                val isBg = cleanBgMask[srcRow + cx]
+                croppedMask[dstRow + cx] = isBg
+                if (!isBg) croppedInkCount++
             }
         }
+
+        val croppedBoxW = (maxX - minX + 1).toFloat() / cropW.toFloat()
+        val croppedBoxH = (maxY - minY + 1).toFloat() / cropH.toFloat()
 
         SignatureExtractionResult(
             processedBitmap = croppedBmp,
             inkBoundingBoxPx = Rect(cropLeft, cropTop, cropRight, cropBottom),
-            inkPixelRatio = verifiedStrokeCount.toFloat() / totalPixels.toFloat(),
+            inkPixelRatio = croppedInkCount.toFloat() / (cropW * cropH).toFloat(),
             backgroundMask = croppedMask,
-            usedAdaptiveSauvola = true
+            usedAdaptiveSauvola = true,
+            verifiedInkPixelCount = croppedInkCount,
+            strokeBoundingBoxFound = true,
+            strokeBoxWidthRatio = croppedBoxW.coerceIn(0f, 1f),
+            strokeBoxHeightRatio = croppedBoxH.coerceIn(0f, 1f)
+        )
+    }
+
+    /**
+     * Validates the actual saved signature or thumb-impression bitmap on disk.
+     *
+     * Important architectural invariants:
+     * 1. Never uses portrait segmentation fields (`segmentationExecuted`, `subjectMaskConfidence`,
+     *    `edgeUncertaintyRatio`).
+     * 2. Distinguishes `sauvolaExecuted` from `usedGentleFallback`; `usedGentleFallback == true`
+     *    NEVER acts as proof of compliance or bypasses ink/whiteness bounds.
+     * 3. Enforces separate calibrated bounds for Handwritten Signatures vs. Thumb Impressions.
+     */
+    fun validateSavedSignatureOrThumbImage(
+        savedBitmap: Bitmap,
+        documentType: DocumentType,
+        extractionResult: SignatureExtractionResult? = null
+    ): SignatureValidationEvidence {
+        val isThumb = isThumbImpressionType(documentType)
+        val minRequiredPixels = if (isThumb) THUMB_MIN_INK_PIXELS else SIGNATURE_MIN_INK_PIXELS
+        val minRequiredRatio = if (isThumb) THUMB_MIN_INK_RATIO else SIGNATURE_MIN_INK_RATIO
+        val maxAllowedRatio = if (isThumb) THUMB_MAX_INK_RATIO else SIGNATURE_MAX_INK_RATIO
+        val minBoxWidthRatio = if (isThumb) THUMB_MIN_BOX_WIDTH_RATIO else SIGNATURE_MIN_BOX_WIDTH_RATIO
+        val minBoxHeightRatio = if (isThumb) THUMB_MIN_BOX_HEIGHT_RATIO else SIGNATURE_MIN_BOX_HEIGHT_RATIO
+
+        val width = savedBitmap.width
+        val height = savedBitmap.height
+        val totalPixels = (width * height).coerceAtLeast(1)
+
+        val sauvolaExecuted = extractionResult?.usedAdaptiveSauvola ?: false
+        val usedGentleFallback = extractionResult?.usedGentleFallback ?: false
+        val method = if (sauvolaExecuted && !usedGentleFallback) {
+            SignatureProcessingMethod.SAUVOLA_ADAPTIVE_THRESHOLD
+        } else {
+            SignatureProcessingMethod.GENTLE_CONTRAST_FALLBACK
+        }
+
+        if (width < 8 || height < 8) {
+            return SignatureValidationEvidence(
+                processingMethod = method,
+                sauvolaExecuted = sauvolaExecuted,
+                usedGentleFallback = usedGentleFallback,
+                fallbackReason = extractionResult?.fallbackReason ?: "Saved image dimensions too small",
+                verifiedInkPixelCount = 0,
+                inkPixelRatio = 0f,
+                minRequiredInkRatio = minRequiredRatio,
+                maxAllowedInkRatio = maxAllowedRatio,
+                inkPresenceVerified = false,
+                inkRatioWithinBounds = false,
+                strokeBoundingBoxFound = false,
+                strokeBoxWidthRatio = 0f,
+                strokeBoxHeightRatio = 0f,
+                paperWhitenessRatio = 0f,
+                paperMeanLuminance = 0
+            )
+        }
+
+        val pixels = IntArray(totalPixels)
+        savedBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val rawInkMask = BooleanArray(totalPixels)
+        for (idx in 0 until totalPixels) {
+            val c = pixels[idx]
+            val r = Color.red(c)
+            val g = Color.green(c)
+            val b = Color.blue(c)
+            val lum = (r * 299 + g * 587 + b * 114) / 1000
+            val isBlueInk = b > r + 18 && b > g + 10 && lum < 228
+            if (lum < 210 || isBlueInk) {
+                rawInkMask[idx] = true
+            }
+        }
+
+        var verifiedInkCount = 0
+        var minX = width
+        var minY = height
+        var maxX = -1
+        var maxY = -1
+
+        var paperCount = 0
+        var nearWhitePaperCount = 0
+        var paperLumSum = 0L
+
+        for (y in 0 until height) {
+            val rowOffset = y * width
+            for (x in 0 until width) {
+                val idx = rowOffset + x
+                var isVerifiedInk = false
+                if (rawInkMask[idx]) {
+                    var neighbors = 0
+                    val y0 = max(0, y - 1)
+                    val y1 = min(height - 1, y + 1)
+                    val x0 = max(0, x - 1)
+                    val x1 = min(width - 1, x + 1)
+                    for (ny in y0..y1) {
+                        val nRow = ny * width
+                        for (nx in x0..x1) {
+                            if (rawInkMask[nRow + nx]) neighbors++
+                        }
+                    }
+                    if (neighbors >= 2) {
+                        isVerifiedInk = true
+                    }
+                }
+
+                if (isVerifiedInk) {
+                    verifiedInkCount++
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                } else {
+                    val c = pixels[idx]
+                    val r = Color.red(c)
+                    val g = Color.green(c)
+                    val b = Color.blue(c)
+                    val lum = (r * 299 + g * 587 + b * 114) / 1000
+                    val chromaDiff = maxOf(r, g, b) - minOf(r, g, b)
+                    paperCount++
+                    paperLumSum += lum
+                    if (r >= 240 && g >= 240 && b >= 240 && chromaDiff <= 15) {
+                        nearWhitePaperCount++
+                    }
+                }
+            }
+        }
+
+        val inkRatio = verifiedInkCount.toFloat() / totalPixels.toFloat()
+        val boxWidthRatio = if (maxX >= minX) (maxX - minX + 1).toFloat() / width.toFloat() else 0f
+        val boxHeightRatio = if (maxY >= minY) (maxY - minY + 1).toFloat() / height.toFloat() else 0f
+
+        val paperWhitenessRatio = if (paperCount > 0) nearWhitePaperCount.toFloat() / paperCount.toFloat() else 0f
+        val paperMeanLum = if (paperCount > 0) (paperLumSum / paperCount).toInt() else 0
+
+        val inkPresenceVerified = verifiedInkCount >= minRequiredPixels
+        val inkRatioWithinBounds = inkRatio in minRequiredRatio..maxAllowedRatio
+        val strokeBoundingBoxFound = inkPresenceVerified &&
+            boxWidthRatio >= minBoxWidthRatio &&
+            boxHeightRatio >= minBoxHeightRatio
+
+        return SignatureValidationEvidence(
+            processingMethod = method,
+            sauvolaExecuted = sauvolaExecuted,
+            usedGentleFallback = usedGentleFallback,
+            fallbackReason = extractionResult?.fallbackReason,
+            verifiedInkPixelCount = verifiedInkCount,
+            inkPixelRatio = inkRatio,
+            minRequiredInkRatio = minRequiredRatio,
+            maxAllowedInkRatio = maxAllowedRatio,
+            inkPresenceVerified = inkPresenceVerified,
+            inkRatioWithinBounds = inkRatioWithinBounds,
+            strokeBoundingBoxFound = strokeBoundingBoxFound,
+            strokeBoxWidthRatio = boxWidthRatio,
+            strokeBoxHeightRatio = boxHeightRatio,
+            paperWhitenessRatio = paperWhitenessRatio,
+            paperMeanLuminance = paperMeanLum
         )
     }
 }
+

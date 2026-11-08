@@ -8,6 +8,8 @@ import com.example.camera.UnifiedMediaInput
 import com.example.data.model.DocumentRule
 import com.example.data.model.DocumentType
 import com.example.data.model.FileFormat
+import com.example.data.model.PreparationStatus
+import com.example.data.model.PreviewApprovalStatus
 import com.example.data.model.ProcessedFileResult
 import java.io.File
 
@@ -21,14 +23,59 @@ import java.io.File
 object OneClickPreparationCoordinator {
 
     /**
+     * Updates explicit user preview acceptance on a [ProcessedFileResult] without re-running
+     * vision inference and without allowing user acceptance to override technical compliance failures.
+     */
+    fun updateUserPreviewAcceptance(
+        result: ProcessedFileResult,
+        userPreviewAccepted: Boolean
+    ): ProcessedFileResult {
+        val requiresApproval = result.requiresUserPreviewApproval
+        val approvalStatus = when {
+            !requiresApproval -> PreviewApprovalStatus.NOT_REQUIRED
+            userPreviewAccepted -> PreviewApprovalStatus.APPROVED_BY_USER
+            else -> PreviewApprovalStatus.PENDING_USER_APPROVAL
+        }
+        val isExportReady =
+            result.isCompliant &&
+            (!result.requiresWhiteBackground || result.technicalBackgroundCompliant) &&
+            (!requiresApproval || userPreviewAccepted)
+        val updatedStatus = when {
+            !result.isCompliant -> result.status
+            requiresApproval && !userPreviewAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
+            else -> PreparationStatus.SUCCESS_PREPARED
+        }
+        val filteredMessages = result.validationMessages.filterNot {
+            it.startsWith("Preview Approval Pending:") || it.startsWith("Preview Approved:")
+        }.toMutableList()
+        if (result.isCompliant && requiresApproval) {
+            if (userPreviewAccepted) {
+                filteredMessages.add("Preview Approved: User reviewed and accepted the processed preview.")
+            } else {
+                filteredMessages.add("Preview Approval Pending: Please review the processed preview and accept it to mark export-ready.")
+            }
+        }
+        @Suppress("DEPRECATION")
+        val legacyVerifiedBg = result.technicalBackgroundCompliant && (!requiresApproval || userPreviewAccepted)
+        return result.copy(
+            userPreviewAccepted = userPreviewAccepted,
+            approvalStatus = approvalStatus,
+            isExportReady = isExportReady,
+            status = updatedStatus,
+            validationMessages = filteredMessages,
+            verifiedBackgroundCompliance = legacyVerifiedBg
+        )
+    }
+
+    /**
      * Executes the complete One-Click Auto Prepare workflow for a photo input:
      * 1. Resolves unified input bitmap safely (or uses pre-resolved [preDecodedBitmap] from the same [UnifiedMediaInput]).
      * 2. Uses camera-mapped guide crop ([UnifiedMediaInput.mappedSensorCropRectNorm]) or [cropRectNorm],
      *    or runs [PortraitVisionProcessor] for face landmark framing and probabilistic background segmentation.
-     * 3. Propagates all 5 background verification signals ([ProcessedFileResult.segmentationExecuted],
+     * 3. Propagates technical background verification signals ([ProcessedFileResult.segmentationExecuted],
      *    [ProcessedFileResult.backgroundReplacementApplied], [ProcessedFileResult.outputBackgroundPixelChecksPassed],
-     *    [ProcessedFileResult.subjectMaskConfidence] / [ProcessedFileResult.edgeUncertaintyRatio], and
-     *    [ProcessedFileResult.userPreviewAccepted]) into [ImageProcessor.processImageForRule].
+     *    [ProcessedFileResult.subjectMaskConfidence] / [ProcessedFileResult.edgeUncertaintyRatio])
+     *    independently from [ProcessedFileResult.userPreviewAccepted] into [ImageProcessor.processImageForRule].
      * 4. Resizes to exact prescribed dimensions, adds optional Name & DOP strip, and verifies disk output.
      */
     suspend fun autoPreparePhoto(
@@ -45,7 +92,8 @@ object OneClickPreparationCoordinator {
         cropRectNorm: RectF? = null,
         removeBackgroundToWhite: Boolean = false,
         customDpi: Int? = null,
-        userPreviewAccepted: Boolean = true,
+        requiresUserPreviewApproval: Boolean = true,
+        userPreviewAccepted: Boolean = false,
         faceEngine: PortraitVisionProcessor.FaceDetectionEngine = PortraitVisionProcessor.mlKitFaceDetectionEngine,
         segmentationEngine: PortraitVisionProcessor.SelfieSegmentationEngine = PortraitVisionProcessor.mlKitSelfieSegmentationEngine
     ): ProcessedFileResult? {
@@ -89,6 +137,7 @@ object OneClickPreparationCoordinator {
             maskConfidencePassed = visionResult.maskConfidencePassed,
             subjectMaskConfidence = visionResult.subjectMaskConfidence,
             edgeUncertaintyRatio = visionResult.edgeUncertaintyRatio,
+            requiresUserPreviewApproval = requiresUserPreviewApproval,
             userPreviewAccepted = userPreviewAccepted
         )
     }
@@ -106,7 +155,8 @@ object OneClickPreparationCoordinator {
         dateOfPhoto: String = "",
         enforceProportional: Boolean = true,
         removeBackgroundToWhite: Boolean = false,
-        userPreviewAccepted: Boolean = true
+        requiresUserPreviewApproval: Boolean = true,
+        userPreviewAccepted: Boolean = false
     ): Result<ProcessedFileResult> {
         val result = autoPreparePhoto(
             context = context,
@@ -118,6 +168,7 @@ object OneClickPreparationCoordinator {
             enforceProportional = enforceProportional,
             removeBackgroundToWhite = removeBackgroundToWhite,
             customDpi = customDpi,
+            requiresUserPreviewApproval = requiresUserPreviewApproval,
             userPreviewAccepted = userPreviewAccepted
         )
         return if (result != null) {
@@ -132,7 +183,8 @@ object OneClickPreparationCoordinator {
      * 1. Resolves unified input bitmap (or uses pre-resolved [preDecodedBitmap]).
      * 2. Crops to the camera signature cutout box coordinates ([cropRectNorm] or [UnifiedMediaInput.mappedSensorCropRectNorm]).
      * 3. Applies [SignatureVisionProcessor] integral-image Sauvola adaptive shadow removal and connected-stroke trimming.
-     * 4. Resizes to exact prescribed dimensions and compresses with verified JFIF/EXIF DPI metadata.
+     * 4. Resizes to exact prescribed dimensions, validates saved ink & paper pixels via [SignatureValidationEvidence]
+     *    without spoofing portrait segmentation metrics, and compresses with verified JFIF/EXIF DPI metadata.
      */
     suspend fun autoPrepareSignature(
         context: Context,
@@ -150,7 +202,8 @@ object OneClickPreparationCoordinator {
         enforceProportional: Boolean = false,
         cropRectNorm: RectF? = null,
         customDpi: Int? = null,
-        userPreviewAccepted: Boolean = true
+        requiresUserPreviewApproval: Boolean = true,
+        userPreviewAccepted: Boolean = false
     ): ProcessedFileResult? {
         val rawBitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
 
@@ -191,12 +244,14 @@ object OneClickPreparationCoordinator {
             backgroundMask = sauvolaResult.backgroundMask,
             backgroundMaskWidth = sauvolaResult.cleanedBitmap.width,
             backgroundMaskHeight = sauvolaResult.cleanedBitmap.height,
-            segmentationExecuted = true,
+            segmentationExecuted = false,
             backgroundReplacementApplied = true,
-            maskConfidencePassed = !sauvolaResult.usedGentleFallback,
-            subjectMaskConfidence = if (sauvolaResult.usedGentleFallback) 0.65f else 0.94f,
-            edgeUncertaintyRatio = if (sauvolaResult.usedGentleFallback) 0.20f else 0.04f,
-            userPreviewAccepted = userPreviewAccepted
+            maskConfidencePassed = false,
+            subjectMaskConfidence = 0f,
+            edgeUncertaintyRatio = 0f,
+            requiresUserPreviewApproval = requiresUserPreviewApproval,
+            userPreviewAccepted = userPreviewAccepted,
+            signatureExtractionResult = sauvolaResult
         )
     }
 
@@ -213,7 +268,9 @@ object OneClickPreparationCoordinator {
         preserveInkColor: Boolean = true,
         trimBlankMargins: Boolean = true,
         cropRectNorm: RectF? = null,
-        customDpi: Int? = null
+        customDpi: Int? = null,
+        requiresUserPreviewApproval: Boolean = true,
+        userPreviewAccepted: Boolean = false
     ): Result<ProcessedFileResult> {
         val result = autoPrepareSignature(
             context = context,
@@ -225,7 +282,9 @@ object OneClickPreparationCoordinator {
             trimBlankMargins = trimBlankMargins,
             customTargetKb = targetSizeKb,
             cropRectNorm = cropRectNorm,
-            customDpi = customDpi
+            customDpi = customDpi,
+            requiresUserPreviewApproval = requiresUserPreviewApproval,
+            userPreviewAccepted = userPreviewAccepted
         )
         return if (result != null) {
             Result.success(result)
@@ -247,7 +306,7 @@ object OneClickPreparationCoordinator {
     /**
      * Executes the 1-Click Auto-Processing Pipeline for a Document / ID Card:
      * 1. Runs 4-corner quadrilateral detection & homography perspective warp when [customQuadNorm] is provided
-     *    or when [DocumentCornerProcessor.detectDocumentCorners] confidence >= 0.75f; otherwise crops to
+     *    or when [DocumentCornerProcessor.detectDocumentCorners] autoWarpEligible is true; otherwise crops to
      *    [cropRectNorm] / [UnifiedMediaInput.mappedSensorCropRectNorm].
      * 2. Applies Clear Scan / Magic Scan enhancement filter (shadow removal + high-contrast text).
      * 3. Generates both a compressed JPG and a single-page PDF strictly under [maxKb].
@@ -261,7 +320,9 @@ object OneClickPreparationCoordinator {
         dpi: Int = 200,
         applyClearScanFilter: Boolean = true,
         cropRectNorm: RectF? = null,
-        customQuadNorm: List<PointF>? = null
+        customQuadNorm: List<PointF>? = null,
+        requiresUserPreviewApproval: Boolean = true,
+        userPreviewAccepted: Boolean = false
     ): OneClickDocumentBundle? {
         val rawBitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
         val effectiveCropRectNorm = cropRectNorm ?: input?.mappedSensorCropRectNorm
@@ -306,7 +367,9 @@ object OneClickPreparationCoordinator {
             rule = docRule,
             customTargetKb = maxKb,
             enforceProportional = true,
-            customDpi = dpi
+            customDpi = dpi,
+            requiresUserPreviewApproval = requiresUserPreviewApproval,
+            userPreviewAccepted = userPreviewAccepted
         )
 
         val rawPdf = PdfProcessor.createPdfFromBitmaps(
@@ -331,3 +394,4 @@ object OneClickPreparationCoordinator {
         )
     }
 }
+

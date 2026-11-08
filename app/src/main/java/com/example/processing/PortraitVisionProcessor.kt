@@ -13,7 +13,13 @@ import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
 import com.google.mlkit.vision.segmentation.Segmentation
 import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
@@ -22,27 +28,18 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * On-Device Portrait Intelligence Engine (Phase 2).
+ * On-Device Portrait Intelligence Engine (Phase 2 / Phase 0.4E).
  *
  * Responsibilities:
- * 1. Face & landmark detection via bundled Google ML Kit Face Detection (with injectable
- *    [FaceDetectionEngine] for deterministic JVM/Robolectric unit testing).
- * 2. Adjustable portrait framing ([PortraitFramingProfile]): uses portal-specific head-height
- *    and headroom rules ONLY when defined on [DocumentRule]; otherwise applies balanced adjustable
- *    defaults (`DEFAULT_BALANCED`) and permits manual crop adjustment.
- * 3. Foreground/background confidence mask extraction via bundled Google ML Kit Selfie Segmentation
- *    (`SINGLE_IMAGE_MODE`), with injectable [SelfieSegmentationEngine] for unit testing.
- * 4. 5-Signal Background Verification Model:
- *    - `segmentationExecuted`: Did the segmenter return a valid confidence map?
- *    - `subjectMaskConfidence` & `edgeUncertaintyRatio`: Are foreground coverage (`12%..82%`),
- *      mean core foreground confidence (`>= 0.80f`), and transition-band uncertainty (`<= 0.18f`)
- *      within reliable tolerances?
- *    - `backgroundReplacementApplied`: Alpha-compositing onto pure `#FFFFFF` white while keeping
- *      core subject pixels (`>= 0.80f`) untouched.
- *    - `backgroundMask`: Exact `BooleanArray` (`true` where confidence `< 0.20f`) supplied to
- *      [ImageProcessor.processImageForRule] to verify saved pixels on disk.
- *    - `userPreviewAccepted`: Explicit preview confirmation flag required before claiming
- *      `verifiedBackgroundCompliance = true`.
+ * 1. Face & landmark detection via bundled Google ML Kit Face Detection with cached client reuse
+ *    guarded by [faceDetectorMutex].
+ * 2. Foreground/background confidence mask extraction via bundled Google ML Kit Selfie Segmentation
+ *    (`SINGLE_IMAGE_MODE`) with cached client reuse guarded by an independent [segmenterMutex].
+ * 3. Single Lifecycle Owner (`MainActivity` only): [releaseEngines] safely closes cached native
+ *    ML Kit clients under their respective mutex locks when the activity stops or receives memory trim,
+ *    guaranteeing `.close()` never races with an in-flight `.process()` call.
+ * 4. Separate timing of `CLIENT_CONSTRUCTION`, `*_COLD_FIRST_INFERENCE`, and `*_WARM_INFERENCE`
+ *    via [VisionBenchmarkRecorder].
  */
 object PortraitVisionProcessor {
 
@@ -89,6 +86,190 @@ object PortraitVisionProcessor {
 
     fun interface SelfieSegmentationEngine {
         suspend fun segmentPortrait(bitmap: Bitmap): SegmentationConfidenceMask?
+    }
+
+    /**
+     * Closeable client abstraction so both real ML Kit native clients and deterministic
+     * unit tests share the exact same dual-mutex caching, cold/warm telemetry, and release lifecycle.
+     */
+    interface ManagedFaceDetectorClient : AutoCloseable {
+        suspend fun processBitmap(bitmap: Bitmap): List<DetectedFaceInfo>
+        override fun close()
+    }
+
+    interface ManagedSelfieSegmenterClient : AutoCloseable {
+        suspend fun processBitmap(bitmap: Bitmap): SegmentationConfidenceMask?
+        override fun close()
+    }
+
+    private val faceDetectorMutex = Mutex()
+    private var cachedFaceDetector: ManagedFaceDetectorClient? = null
+    private var faceDetectorFirstInferenceDone = false
+
+    private val segmenterMutex = Mutex()
+    private var cachedSelfieSegmenter: ManagedSelfieSegmenterClient? = null
+    private var segmenterFirstInferenceDone = false
+
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    val defaultFaceDetectorClientFactory: () -> ManagedFaceDetectorClient = {
+        val options = FaceDetectorOptions.Builder()
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+            .setMinFaceSize(0.15f)
+            .build()
+        val detector = FaceDetection.getClient(options)
+        object : ManagedFaceDetectorClient {
+            override suspend fun processBitmap(bitmap: Bitmap): List<DetectedFaceInfo> {
+                val inputImage = InputImage.fromBitmap(bitmap, 0)
+                val faces = detector.process(inputImage).awaitTask()
+                val w = bitmap.width.toFloat().coerceAtLeast(1f)
+                val h = bitmap.height.toFloat().coerceAtLeast(1f)
+                return faces.map { face ->
+                    val box = face.boundingBox
+                    val normBox = RectF(
+                        (box.left / w).coerceIn(0f, 1f),
+                        (box.top / h).coerceIn(0f, 1f),
+                        (box.right / w).coerceIn(0f, 1f),
+                        (box.bottom / h).coerceIn(0f, 1f)
+                    )
+                    val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position?.let {
+                        PointF((it.x / w).coerceIn(0f, 1f), (it.y / h).coerceIn(0f, 1f))
+                    }
+                    val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position?.let {
+                        PointF((it.x / w).coerceIn(0f, 1f), (it.y / h).coerceIn(0f, 1f))
+                    }
+                    DetectedFaceInfo(
+                        boundingBoxNorm = normBox,
+                        leftEyeNorm = leftEye,
+                        rightEyeNorm = rightEye,
+                        eulerZDegrees = face.headEulerAngleZ
+                    )
+                }
+            }
+
+            override fun close() {
+                try {
+                    detector.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    val defaultSelfieSegmenterClientFactory: () -> ManagedSelfieSegmenterClient = {
+        val options = SelfieSegmenterOptions.Builder()
+            .setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE)
+            .enableRawSizeMask()
+            .build()
+        val segmenter = Segmentation.getClient(options)
+        object : ManagedSelfieSegmenterClient {
+            override suspend fun processBitmap(bitmap: Bitmap): SegmentationConfidenceMask? {
+                val inputImage = InputImage.fromBitmap(bitmap, 0)
+                val mask = segmenter.process(inputImage).awaitTask()
+                val maskW = mask.width
+                val maskH = mask.height
+                if (maskW <= 0 || maskH <= 0) return null
+                val buffer = mask.buffer
+                buffer.rewind()
+                val rawFloats = FloatArray(maskW * maskH)
+                for (i in rawFloats.indices) {
+                    rawFloats[i] = buffer.float.coerceIn(0f, 1f)
+                }
+                return if (maskW == bitmap.width && maskH == bitmap.height) {
+                    SegmentationConfidenceMask(maskW, maskH, rawFloats)
+                } else {
+                    upsampleConfidenceMaskBilinear(rawFloats, maskW, maskH, bitmap.width, bitmap.height)
+                }
+            }
+
+            override fun close() {
+                try {
+                    segmenter.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    @Volatile
+    var faceDetectorClientFactory: () -> ManagedFaceDetectorClient = defaultFaceDetectorClientFactory
+
+    @Volatile
+    var selfieSegmenterClientFactory: () -> ManagedSelfieSegmenterClient = defaultSelfieSegmenterClientFactory
+
+    fun isFaceDetectorCached(): Boolean = cachedFaceDetector != null
+    fun isSelfieSegmenterCached(): Boolean = cachedSelfieSegmenter != null
+    fun isFaceDetectorWarm(): Boolean = cachedFaceDetector != null && faceDetectorFirstInferenceDone
+    fun isSelfieSegmenterWarm(): Boolean = cachedSelfieSegmenter != null && segmenterFirstInferenceDone
+
+    /**
+     * Releases cached ML Kit FaceDetector and SelfieSegmenter clients safely under their
+     * respective mutex locks so `.close()` can never race with an in-flight `.process()` call.
+     *
+     * Owned exclusively by `MainActivity` (`onStop` when `!isChangingConfigurations` and
+     * `onTrimMemory(TRIM_MEMORY_UI_HIDDEN)`).
+     */
+    suspend fun releaseEngines() {
+        faceDetectorMutex.withLock {
+            try {
+                cachedFaceDetector?.close()
+            } catch (_: Throwable) {
+            } finally {
+                cachedFaceDetector = null
+                faceDetectorFirstInferenceDone = false
+            }
+        }
+        segmenterMutex.withLock {
+            try {
+                cachedSelfieSegmenter?.close()
+            } catch (_: Throwable) {
+            } finally {
+                cachedSelfieSegmenter = null
+                segmenterFirstInferenceDone = false
+            }
+        }
+    }
+
+    /**
+     * Non-blocking entry point for `MainActivity.onStop()` and `MainActivity.onTrimMemory()`.
+     * Immediately closes any idle client via `tryLock()`, and dispatches a coroutine to await
+     * completion of any in-flight inference before closing.
+     */
+    fun releaseEnginesFromLifecycleOwner() {
+        var needAsyncFaceRelease = false
+        if (faceDetectorMutex.tryLock()) {
+            try {
+                cachedFaceDetector?.close()
+                cachedFaceDetector = null
+                faceDetectorFirstInferenceDone = false
+            } catch (_: Throwable) {
+            } finally {
+                faceDetectorMutex.unlock()
+            }
+        } else {
+            needAsyncFaceRelease = true
+        }
+
+        var needAsyncSegRelease = false
+        if (segmenterMutex.tryLock()) {
+            try {
+                cachedSelfieSegmenter?.close()
+                cachedSelfieSegmenter = null
+                segmenterFirstInferenceDone = false
+            } catch (_: Throwable) {
+            } finally {
+                segmenterMutex.unlock()
+            }
+        } else {
+            needAsyncSegRelease = true
+        }
+
+        if (needAsyncFaceRelease || needAsyncSegRelease) {
+            cleanupScope.launch {
+                releaseEngines()
+            }
+        }
     }
 
     /**
@@ -144,71 +325,47 @@ object PortraitVisionProcessor {
             get() = croppedPortraitBitmap
     }
 
-    @Volatile
-    private var faceDetectorInitialized = false
-
-    @Volatile
-    private var selfieSegmenterInitialized = false
-
     /**
-     * Default on-device Google ML Kit Face Detection implementation.
-     * Governed by Google ML Kit Terms of Service (https://developers.google.com/ml-kit/terms).
+     * Default on-device Google ML Kit Face Detection implementation with `faceDetectorMutex`-guarded
+     * client caching and separate `CLIENT_CONSTRUCTION`, `FACE_DETECTION_COLD_FIRST_INFERENCE`, and
+     * `FACE_DETECTION_WARM_INFERENCE` telemetry.
      */
-    val mlKitFaceDetectionEngine: FaceDetectionEngine = object : FaceDetectionEngine {
-        override suspend fun detectFaces(bitmap: Bitmap): List<DetectedFaceInfo> {
-            return try {
-                val initStage = if (!faceDetectorInitialized) {
-                    VisionBenchmarkRecorder.Stage.MODEL_INIT_COLD
+    val mlKitFaceDetectionEngine: FaceDetectionEngine = FaceDetectionEngine { bitmap ->
+        faceDetectorMutex.withLock {
+            try {
+                val client = cachedFaceDetector ?: VisionBenchmarkRecorder.measureStage(
+                    stage = VisionBenchmarkRecorder.Stage.CLIENT_CONSTRUCTION,
+                    imageWidth = bitmap.width,
+                    imageHeight = bitmap.height
+                ) {
+                    faceDetectorClientFactory()
+                }.also {
+                    cachedFaceDetector = it
+                    faceDetectorFirstInferenceDone = false
+                }
+
+                val inferenceStage = if (!faceDetectorFirstInferenceDone) {
+                    VisionBenchmarkRecorder.Stage.FACE_DETECTION_COLD_FIRST_INFERENCE
                 } else {
-                    VisionBenchmarkRecorder.Stage.MODEL_INIT_WARM
-                }
-                val detector = VisionBenchmarkRecorder.measureStage(initStage, bitmap.width, bitmap.height) {
-                    val options = FaceDetectorOptions.Builder()
-                        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-                        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
-                        .setMinFaceSize(0.15f)
-                        .build()
-                    FaceDetection.getClient(options).also { faceDetectorInitialized = true }
+                    VisionBenchmarkRecorder.Stage.FACE_DETECTION_WARM_INFERENCE
                 }
 
+                val preSnap = VisionBenchmarkRecorder.captureHeapSnapshot()
                 val startNs = System.nanoTime()
-                val inputImage = InputImage.fromBitmap(bitmap, 0)
-                val faces = try {
-                    detector.process(inputImage).awaitTask()
-                } finally {
-                    detector.close()
-                }
+                val detected = client.processBitmap(bitmap)
                 val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                VisionBenchmarkRecorder.recordSample(
-                    VisionBenchmarkRecorder.Stage.FACE_DETECTION,
-                    elapsedMs,
-                    bitmap.width,
-                    bitmap.height
-                )
+                val postSnap = VisionBenchmarkRecorder.captureHeapSnapshot()
 
-                val w = bitmap.width.toFloat().coerceAtLeast(1f)
-                val h = bitmap.height.toFloat().coerceAtLeast(1f)
-                faces.map { face ->
-                    val box = face.boundingBox
-                    val normBox = RectF(
-                        (box.left / w).coerceIn(0f, 1f),
-                        (box.top / h).coerceIn(0f, 1f),
-                        (box.right / w).coerceIn(0f, 1f),
-                        (box.bottom / h).coerceIn(0f, 1f)
-                    )
-                    val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position?.let {
-                        PointF((it.x / w).coerceIn(0f, 1f), (it.y / h).coerceIn(0f, 1f))
-                    }
-                    val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position?.let {
-                        PointF((it.x / w).coerceIn(0f, 1f), (it.y / h).coerceIn(0f, 1f))
-                    }
-                    DetectedFaceInfo(
-                        boundingBoxNorm = normBox,
-                        leftEyeNorm = leftEye,
-                        rightEyeNorm = rightEye,
-                        eulerZDegrees = face.headEulerAngleZ
-                    )
-                }
+                faceDetectorFirstInferenceDone = true
+                VisionBenchmarkRecorder.recordSample(
+                    stage = inferenceStage,
+                    durationMs = elapsedMs,
+                    imageWidth = bitmap.width,
+                    imageHeight = bitmap.height,
+                    preSnapshot = preSnap,
+                    postSnapshot = postSnap
+                )
+                detected
             } catch (_: Throwable) {
                 emptyList()
             }
@@ -216,54 +373,46 @@ object PortraitVisionProcessor {
     }
 
     /**
-     * Default on-device Google ML Kit Selfie Segmentation implementation (`SINGLE_IMAGE_MODE`).
-     * Governed by Google ML Kit Terms of Service (https://developers.google.com/ml-kit/terms).
+     * Default on-device Google ML Kit Selfie Segmentation implementation (`SINGLE_IMAGE_MODE`)
+     * with independent `segmenterMutex`-guarded client caching and separate `CLIENT_CONSTRUCTION`,
+     * `SELFIE_SEGMENTATION_COLD_FIRST_INFERENCE`, and `SELFIE_SEGMENTATION_WARM_INFERENCE` telemetry.
      */
-    val mlKitSelfieSegmentationEngine: SelfieSegmentationEngine = object : SelfieSegmentationEngine {
-        override suspend fun segmentPortrait(bitmap: Bitmap): SegmentationConfidenceMask? {
-            return try {
-                val initStage = if (!selfieSegmenterInitialized) {
-                    VisionBenchmarkRecorder.Stage.MODEL_INIT_COLD
-                } else {
-                    VisionBenchmarkRecorder.Stage.MODEL_INIT_WARM
-                }
-                val segmenter = VisionBenchmarkRecorder.measureStage(initStage, bitmap.width, bitmap.height) {
-                    val options = SelfieSegmenterOptions.Builder()
-                        .setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE)
-                        .enableRawSizeMask()
-                        .build()
-                    Segmentation.getClient(options).also { selfieSegmenterInitialized = true }
+    val mlKitSelfieSegmentationEngine: SelfieSegmentationEngine = SelfieSegmentationEngine { bitmap ->
+        segmenterMutex.withLock {
+            try {
+                val client = cachedSelfieSegmenter ?: VisionBenchmarkRecorder.measureStage(
+                    stage = VisionBenchmarkRecorder.Stage.CLIENT_CONSTRUCTION,
+                    imageWidth = bitmap.width,
+                    imageHeight = bitmap.height
+                ) {
+                    selfieSegmenterClientFactory()
+                }.also {
+                    cachedSelfieSegmenter = it
+                    segmenterFirstInferenceDone = false
                 }
 
+                val inferenceStage = if (!segmenterFirstInferenceDone) {
+                    VisionBenchmarkRecorder.Stage.SELFIE_SEGMENTATION_COLD_FIRST_INFERENCE
+                } else {
+                    VisionBenchmarkRecorder.Stage.SELFIE_SEGMENTATION_WARM_INFERENCE
+                }
+
+                val preSnap = VisionBenchmarkRecorder.captureHeapSnapshot()
                 val startNs = System.nanoTime()
-                val inputImage = InputImage.fromBitmap(bitmap, 0)
-                val mask = try {
-                    segmenter.process(inputImage).awaitTask()
-                } finally {
-                    segmenter.close()
-                }
+                val mask = client.processBitmap(bitmap)
                 val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                VisionBenchmarkRecorder.recordSample(
-                    VisionBenchmarkRecorder.Stage.SELFIE_SEGMENTATION,
-                    elapsedMs,
-                    bitmap.width,
-                    bitmap.height
-                )
+                val postSnap = VisionBenchmarkRecorder.captureHeapSnapshot()
 
-                val maskW = mask.width
-                val maskH = mask.height
-                if (maskW <= 0 || maskH <= 0) return null
-                val buffer = mask.buffer
-                buffer.rewind()
-                val rawFloats = FloatArray(maskW * maskH)
-                for (i in rawFloats.indices) {
-                    rawFloats[i] = buffer.float.coerceIn(0f, 1f)
-                }
-                if (maskW == bitmap.width && maskH == bitmap.height) {
-                    SegmentationConfidenceMask(maskW, maskH, rawFloats)
-                } else {
-                    upsampleConfidenceMaskBilinear(rawFloats, maskW, maskH, bitmap.width, bitmap.height)
-                }
+                segmenterFirstInferenceDone = true
+                VisionBenchmarkRecorder.recordSample(
+                    stage = inferenceStage,
+                    durationMs = elapsedMs,
+                    imageWidth = bitmap.width,
+                    imageHeight = bitmap.height,
+                    preSnapshot = preSnap,
+                    postSnapshot = postSnap
+                )
+                mask
             } catch (_: Throwable) {
                 null
             }
@@ -297,7 +446,6 @@ object PortraitVisionProcessor {
             face.boundingBoxNorm.right * imgW,
             face.boundingBoxNorm.bottom * imgH
         )
-        // ML Kit face bounding box covers forehead-to-chin; estimate full head (crown-to-chin) as 1.18x
         val estimatedHeadHeightPx = (faceBoxPx.height() * 1.18f).coerceAtLeast(imgH * 0.15f)
         val desiredCropHeightPx = (estimatedHeadHeightPx / framingProfile.targetHeadHeightRatio)
             .coerceIn(faceBoxPx.height() * 1.35f, imgH)
@@ -376,7 +524,6 @@ object PortraitVisionProcessor {
                     if (conf >= 0.50f) totalForegroundLikeCount++
                     backgroundMask[i] = false
                     if (applyWhiteBackground) {
-                        // Smoothly alpha-composite transition boundary onto pure #FFFFFF white
                         val alpha = ((conf - BACKGROUND_CONFIDENT_THRESHOLD) /
                             (FOREGROUND_CORE_THRESHOLD - BACKGROUND_CONFIDENT_THRESHOLD)).coerceIn(0f, 1f)
                         val c = pixels[i]
@@ -434,10 +581,7 @@ object PortraitVisionProcessor {
     )
 
     /**
-     * Full on-device portrait analysis and segmentation pipeline:
-     * 1. Detects faces (and attempts +/-90° orientation recovery if 0 faces are found upright).
-     * 2. Computes portrait framing crop rectangle (or uses explicit user `manualCropRectNorm`).
-     * 3. Runs Selfie Segmentation and evaluates the 5-signal confidence metrics.
+     * Full on-device portrait analysis and segmentation pipeline.
      */
     suspend fun analyzeAndPreparePortrait(
         sourceBitmap: Bitmap,
@@ -461,7 +605,6 @@ object PortraitVisionProcessor {
         var workingBitmap = sourceBitmap
         var faces = faceEngine.detectFaces(workingBitmap)
 
-        // If no face detected upright, check 90° and 270° rotated orientations (e.g. sideways gallery scans)
         if (faces.isEmpty() && min(sourceBitmap.width, sourceBitmap.height) >= 120) {
             for (angle in listOf(90f, 270f)) {
                 val rotated = rotateBitmap(sourceBitmap, angle)
@@ -482,7 +625,6 @@ object PortraitVisionProcessor {
         val primaryFace = faces.maxByOrNull { it.boundingBoxNorm.width() * it.boundingBoxNorm.height() }
         val requiresManualConfirmation = faces.size != 1
 
-        // Minor head-tilt deskew if 1 face has Euler Z between 2.5° and 18°
         if (primaryFace != null && faces.size == 1 && abs(primaryFace.eulerZDegrees) in 2.5f..18f && manualCropRectNorm == null) {
             val leveled = rotateBitmap(workingBitmap, -primaryFace.eulerZDegrees)
             if (workingBitmap !== sourceBitmap && workingBitmap !== leveled && !workingBitmap.isRecycled) {

@@ -67,6 +67,7 @@ enum class VerificationStatus(val label: String, val isOfficiallyVerified: Boole
 
 enum class PreparationStatus(val label: String) {
     SUCCESS_PREPARED("Successfully Prepared"),
+    PENDING_PREVIEW_APPROVAL("Technically Compliant — Pending Preview Approval"),
     SIZE_EXCEEDED("File Size Exceeded"),
     SIZE_BELOW_MIN("File Size Too Small"),
     DIMENSIONS_MISMATCH("Dimensions Mismatch"),
@@ -76,6 +77,35 @@ enum class PreparationStatus(val label: String) {
     CONFLICT_LIMITS("Requirements Conflict"),
     FAILED("Processing Failed")
 }
+
+enum class PreviewApprovalStatus {
+    NOT_REQUIRED,
+    PENDING_USER_APPROVAL,
+    APPROVED_BY_USER
+}
+
+enum class SignatureProcessingMethod {
+    SAUVOLA_ADAPTIVE_THRESHOLD,
+    GENTLE_CONTRAST_FALLBACK
+}
+
+data class SignatureValidationEvidence(
+    val processingMethod: SignatureProcessingMethod,
+    val sauvolaExecuted: Boolean,
+    val usedGentleFallback: Boolean,
+    val fallbackReason: String? = null,
+    val verifiedInkPixelCount: Int,
+    val inkPixelRatio: Float,
+    val minRequiredInkRatio: Float,
+    val maxAllowedInkRatio: Float,
+    val inkPresenceVerified: Boolean,
+    val inkRatioWithinBounds: Boolean,
+    val strokeBoundingBoxFound: Boolean,
+    val strokeBoxWidthRatio: Float,
+    val strokeBoxHeightRatio: Float,
+    val paperWhitenessRatio: Float,
+    val paperMeanLuminance: Int
+)
 
 data class DocumentRule(
     val id: String,
@@ -101,7 +131,9 @@ data class DocumentRule(
     val minHeadHeightRatio: Float? = null,
     val maxHeadHeightRatio: Float? = null,
     val topHeadroomRatio: Float? = null,
-    val instructions: String = ""
+    val instructions: String = "",
+    val sourceClauseRef: String? = null,
+    val isRuleIndividuallyVerified: Boolean = false
 )
 
 data class PortalSpec(
@@ -118,6 +150,8 @@ data class PortalSpec(
     val lastVerifiedDate: String,
     val version: String = "v1.4",
     val notificationNumber: String? = null,
+    val sourceIdentifier: String? = notificationNumber,
+    val applicableWorkflow: String = "",
     val recruitmentCycle: String = year,
     val sourceRevisionDate: String? = null,
     val documents: List<DocumentRule>
@@ -143,8 +177,25 @@ data class ProcessedFileResult(
     val dpi: Int = 0,
     val wasPaddedToMinKb: Boolean = false,
     val measuredNearWhite: Boolean = false,
-    val verifiedBackgroundCompliance: Boolean = false,
-    val hasWhiteBackground: Boolean = verifiedBackgroundCompliance,
+    val requiresWhiteBackground: Boolean = false,
+    val technicalBackgroundCompliant: Boolean = false,
+    val requiresUserPreviewApproval: Boolean = true,
+    val userPreviewAccepted: Boolean = false,
+    val approvalStatus: PreviewApprovalStatus = when {
+        !requiresUserPreviewApproval -> PreviewApprovalStatus.NOT_REQUIRED
+        userPreviewAccepted -> PreviewApprovalStatus.APPROVED_BY_USER
+        else -> PreviewApprovalStatus.PENDING_USER_APPROVAL
+    },
+    val isExportReady: Boolean =
+        isCompliant &&
+        (!requiresWhiteBackground || technicalBackgroundCompliant) &&
+        (!requiresUserPreviewApproval || userPreviewAccepted),
+    @Deprecated(
+        message = "Legacy combined field retained for backward compatibility. Use technicalBackgroundCompliant, approvalStatus, and isExportReady in all new code."
+    )
+    val verifiedBackgroundCompliance: Boolean =
+        technicalBackgroundCompliant && (!requiresUserPreviewApproval || userPreviewAccepted),
+    val hasWhiteBackground: Boolean = technicalBackgroundCompliant,
     val backgroundVerificationState: String = "UNVERIFIED",
     val nearWhitePixelRatio: Float = 0f,
     val exactWhitePixelRatio: Float = 0f,
@@ -154,7 +205,7 @@ data class ProcessedFileResult(
     val outputBackgroundPixelChecksPassed: Boolean = measuredNearWhite,
     val subjectMaskConfidence: Float = 0f,
     val edgeUncertaintyRatio: Float = 0f,
-    val userPreviewAccepted: Boolean = false
+    val signatureEvidence: SignatureValidationEvidence? = null
 )
 
 data class ValidationIssue(

@@ -1,6 +1,6 @@
 {
-  "summary":  "Phase 0.4 Critical Remediation Architecture & Safe Implementation Plan covering all 6 Phase 0.3 audit issues (Preview Approval & Signature Validation, Camera Geometry & EXIF/ViewPort Alignment, Official Portal Governance & Preset Audit, Connected-Contour Document Detection, ML Kit Lifecycle & Sampled Memory Telemetry, and Regression Test Strategy) plus Empirical APK Size Investigation and Phased Rollback Plan.",
-  "updatedAt":  "2026-11-07T15:16:44.883814394Z",
+  "summary":  "Corrected Phase 0.4 Remediation Architecture & Safe Implementation Plan resolving all 9 architectural contradictions: (1) unambiguous isExportReady formula & truth table, (2) independent technicalBackgroundCompliant vs userPreviewAccepted & PENDING_PREVIEW_APPROVAL status, (3) separate Sauvola vs fallback signature/thumb validation thresholds, (4) single-point EXIF & CameraX coordinate pipeline without double-transformation, (5) conservative official portal provenance table, (6) heuristic document detector limitations & manual fallback, (7) separate FaceDetector/Segmenter locks owned solely by MainActivity, (8) unverified APK/AAB size labels, and (9) Blocker-First 5-batch implementation schedule.",
+  "updatedAt":  "2026-11-07T15:31:28.390907563Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
