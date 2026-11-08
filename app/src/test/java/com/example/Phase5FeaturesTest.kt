@@ -25,6 +25,17 @@ import com.example.storage.DocumentEncryptionManager
 import com.example.storage.DocumentValidationManager
 import com.example.storage.TestSoftwareKeyProvider
 import kotlinx.coroutines.runBlocking
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -32,6 +43,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -2272,6 +2284,351 @@ class Phase5FeaturesTest {
         assertEquals(8_000_000L, summary.maxSampledNativeHeapDeltaBytes)
     }
 }
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36])
+class Phase05AExportReadinessGateUiTest {
+
+    @get:Rule
+    val composeTestRule = createComposeRule()
+
+    private lateinit var context: Context
+    private lateinit var testDir: File
+
+    @Before
+    fun setup() {
+        context = ApplicationProvider.getApplicationContext<Context>()
+        testDir = File(context.cacheDir, "phase05a_ui_test_${System.currentTimeMillis()}").apply { mkdirs() }
+    }
+
+    @After
+    fun tearDown() {
+        testDir.deleteRecursively()
+    }
+
+    private fun createDummyProcessedFile(name: String = "prepared.jpg"): File {
+        val file = File(testDir, name)
+        val bmp = Bitmap.createBitmap(350, 450, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        FileOutputStream(file).use { out ->
+            bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        }
+        return file
+    }
+
+    @Test
+    fun testPortalDocumentPrepareScreenPendingApprovalBlocksSaveAndShareUntilApproved() {
+        val dummyFile = createDummyProcessedFile("portal_photo.jpg")
+        val sampleBmp = Bitmap.createBitmap(350, 450, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        val portal = com.example.data.portal.PortalDatabase.findPortalById("ssc_cgl")!!
+        val photoRule = portal.documents.first { it.documentType == DocumentType.PASSPORT_PHOTO }
+
+        val pendingResult = com.example.data.model.ProcessedFileResult(
+            ruleId = photoRule.id,
+            documentType = photoRule.documentType,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = dummyFile.length(),
+            fileSizeKb = dummyFile.length() / 1024.0,
+            widthPx = 200,
+            heightPx = 230,
+            isCompliant = true,
+            validationMessages = listOf("Compliant"),
+            status = com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false
+        )
+        assertFalse("Initial pending result must have isExportReady = false", pendingResult.isExportReady)
+
+        var latestCallbackResult: com.example.data.model.ProcessedFileResult = pendingResult
+
+        composeTestRule.setContent {
+            com.example.ui.screens.PortalDocumentPrepareScreen(
+                portal = portal,
+                rule = photoRule,
+                initialCandidateName = "",
+                initialDateOfPhoto = "01-01-2026",
+                onDocumentPrepared = { latestCallbackResult = it },
+                onBack = {},
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = pendingResult
+            )
+        }
+
+        // 1. Pending approval blocks Save and Share buttons in Compose UI
+        composeTestRule.onNodeWithTag("preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("portal_doc_save_gallery_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("portal_doc_share_btn").assertIsNotEnabled()
+
+        // 2. Explicit user approval enables Save and Share without rerunning ML inference
+        var mlInferenceTriggered = false
+        val origFaceFactory = com.example.processing.PortraitVisionProcessor.faceDetectorClientFactory
+        try {
+            com.example.processing.PortraitVisionProcessor.faceDetectorClientFactory = {
+                mlInferenceTriggered = true
+                origFaceFactory()
+            }
+            composeTestRule.onNodeWithTag("preview_acceptance_checkbox").performScrollTo().performClick()
+            composeTestRule.waitForIdle()
+        } finally {
+            com.example.processing.PortraitVisionProcessor.faceDetectorClientFactory = origFaceFactory
+        }
+
+        assertFalse("Toggling approval checkbox must NOT rerun ML inference", mlInferenceTriggered)
+        composeTestRule.onNodeWithTag("preview_acceptance_checkbox").assertIsOn()
+        assertTrue("Approved compliant result must be export-ready", latestCallbackResult.isExportReady)
+        composeTestRule.onNodeWithTag("portal_doc_save_gallery_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("portal_doc_share_btn").assertIsEnabled()
+    }
+
+    @Test
+    fun testPhotoStudioPendingApprovalBlocksGallerySaveShareAndLockerAndTechnicalFailureCannotBeOverridden() {
+        val dummyFile = createDummyProcessedFile("studio_photo.jpg")
+        val sampleBmp = Bitmap.createBitmap(350, 450, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+
+        // Case A: Technically compliant photo with userPreviewAccepted = false -> all 4 export controls disabled
+        val compliantPendingResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "photo_studio_test",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = dummyFile.length(),
+            fileSizeKb = dummyFile.length() / 1024.0,
+            widthPx = 350,
+            heightPx = 450,
+            isCompliant = true,
+            validationMessages = listOf("Compliant"),
+            status = com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false
+        )
+
+        composeTestRule.setContent {
+            com.example.ui.screens.PhotoStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = compliantPendingResult
+            )
+        }
+
+        composeTestRule.onNodeWithTag("instant_gallery_download_photo_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_photo_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_photo_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_photo_to_locker_btn").assertIsNotEnabled()
+
+        // Approve preview -> all 4 export controls become enabled
+        composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("instant_gallery_download_photo_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("save_photo_device_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_photo_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("add_photo_to_locker_btn").assertIsEnabled()
+    }
+
+    @Test
+    fun testUserApprovalCannotOverrideTechnicalFailureInUi() {
+        val dummyFile = createDummyProcessedFile("failed_photo.jpg")
+        val sampleBmp = Bitmap.createBitmap(350, 450, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.BLUE)
+        }
+
+        // Technically failed result (background not white / size exceeded)
+        val technicallyFailedResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "failed_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = dummyFile.length(),
+            fileSizeKb = dummyFile.length() / 1024.0,
+            widthPx = 350,
+            heightPx = 450,
+            isCompliant = false,
+            validationMessages = listOf("Background Warning: Non-white background"),
+            status = com.example.data.model.PreparationStatus.BACKGROUND_NOT_WHITE,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = false,
+            outputBackgroundPixelChecksPassed = false,
+            backgroundReplacementApplied = false,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false
+        )
+
+        composeTestRule.setContent {
+            com.example.ui.screens.PhotoStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = technicallyFailedResult
+            )
+        }
+
+        // Check the preview approval checkbox
+        composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        // Checkbox is checked, but export buttons MUST remain disabled because technical compliance failed!
+        composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").assertIsOn()
+        composeTestRule.onNodeWithTag("instant_gallery_download_photo_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_photo_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_photo_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_photo_to_locker_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testSignatureStudioPendingApprovalBlocksExportAndChangingAdjustmentResetsApproval() {
+        val dummyFile = createDummyProcessedFile("signature.jpg")
+        val sampleBmp = Bitmap.createBitmap(300, 120, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+            for (x in 40 until 260) {
+                for (y in 55..58) {
+                    setPixel(x, y, Color.BLACK)
+                }
+            }
+        }
+
+        val approvedSignResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "sign_rule",
+            documentType = DocumentType.SIGNATURE_ENGLISH,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = 14 * 1024L,
+            fileSizeKb = 14.0,
+            widthPx = 140,
+            heightPx = 60,
+            isCompliant = true,
+            validationMessages = listOf("Compliant"),
+            status = com.example.data.model.PreparationStatus.SUCCESS_PREPARED,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = true
+        )
+        assertTrue(approvedSignResult.isExportReady)
+
+        composeTestRule.setContent {
+            com.example.ui.screens.SignatureStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = approvedSignResult
+            )
+        }
+
+        // Initially approved -> all export buttons enabled
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").assertIsOn()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsEnabled()
+
+        // Uncheck approval -> immediately disables all export buttons
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsNotEnabled()
+
+        // Re-approve -> enabled again
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsEnabled()
+
+        // Trigger Gentle Ink Processing fallback adjustment -> resets userPreviewAccepted to false and blocks export again
+        composeTestRule.onNodeWithTag("restore_original_signature_btn").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testPortalDetailScreenShareAllBlockedWhenAnyPreparedDocumentNotExportReadyAndNonWhiteBgRuleAllowed() {
+        val dummyFile = createDummyProcessedFile("doc_non_white.jpg")
+        val portal = com.example.data.portal.PortalDatabase.findPortalById("ssc_cgl")!!
+        val rule = portal.documents.first()
+
+        // Rule that does NOT require white background (requiresWhiteBackground = false)
+        // Even with technicalBackgroundCompliant = false, once approved it must become export-ready
+        val nonWhiteBgPending = com.example.data.model.ProcessedFileResult(
+            ruleId = rule.id,
+            documentType = rule.documentType,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = 25 * 1024L,
+            fileSizeKb = 25.0,
+            widthPx = 200,
+            heightPx = 230,
+            isCompliant = true,
+            validationMessages = listOf("Compliant"),
+            status = com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL,
+            dpi = 300,
+            requiresWhiteBackground = false,
+            technicalBackgroundCompliant = false,
+            outputBackgroundPixelChecksPassed = false,
+            backgroundReplacementApplied = false,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false
+        )
+        assertFalse("Pending approval must block export even when white bg is not required", nonWhiteBgPending.isExportReady)
+
+        val nonWhiteBgApproved = OneClickPreparationCoordinator.updateUserPreviewAcceptance(nonWhiteBgPending, true)
+        assertTrue(
+            "Rules that do not require white background must NOT be blocked by white-background checks once approved",
+            nonWhiteBgApproved.isExportReady
+        )
+
+        val preparedMapState = androidx.compose.runtime.mutableStateOf(mapOf(rule.id to nonWhiteBgPending))
+
+        composeTestRule.setContent {
+            com.example.ui.screens.PortalDetailScreen(
+                portal = portal,
+                preparedResults = preparedMapState.value,
+                candidateName = "",
+                onCandidateNameChange = {},
+                dateOfPhoto = "01-01-2026",
+                onDateOfPhotoChange = {},
+                onSelectRuleToPrepare = {},
+                onBack = {}
+            )
+        }
+
+        // While pending approval, share_all_portal_docs_btn MUST be disabled
+        composeTestRule.onNodeWithTag("portal_detail_screen")
+            .performScrollToNode(hasTestTag("share_all_portal_docs_btn"))
+        composeTestRule.onNodeWithTag("share_all_portal_docs_btn").assertIsNotEnabled()
+
+        // Update map with approved result -> share_all_portal_docs_btn becomes enabled
+        preparedMapState.value = mapOf(rule.id to nonWhiteBgApproved)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("portal_detail_screen")
+            .performScrollToNode(hasTestTag("share_all_portal_docs_btn"))
+        composeTestRule.onNodeWithTag("share_all_portal_docs_btn").assertIsEnabled()
+    }
+}
+
 
 
 

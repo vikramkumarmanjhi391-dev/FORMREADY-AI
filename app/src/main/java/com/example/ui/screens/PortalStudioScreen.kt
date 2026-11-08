@@ -581,10 +581,25 @@ fun OneClickPreparationDialog(
         },
         dismissButton = {
             if (processedResultsMap.isNotEmpty()) {
+                val allExportReady = processedResultsMap.values.all { it.isExportReady }
                 OutlinedButton(
                     onClick = {
-                        sharePreparedFiles(context, processedResultsMap.values.map { File(it.processedFilePath) })
+                        if (!allExportReady) {
+                            Toast.makeText(
+                                context,
+                                "Please review and accept the processed preview before exporting.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@OutlinedButton
+                        }
+                        sharePreparedFiles(
+                            context,
+                            processedResultsMap.values
+                                .filter { it.isExportReady }
+                                .map { File(it.processedFilePath) }
+                        )
                     },
+                    enabled = allExportReady,
                     shape = RoundedCornerShape(10.dp)
                 ) {
                     Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))

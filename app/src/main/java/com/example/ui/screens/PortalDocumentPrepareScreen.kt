@@ -101,7 +101,9 @@ fun PortalDocumentPrepareScreen(
     initialCandidateName: String,
     initialDateOfPhoto: String,
     onDocumentPrepared: (ProcessedFileResult) -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    initialSourceBitmap: Bitmap? = null,
+    initialProcessedResult: ProcessedFileResult? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -123,15 +125,15 @@ fun PortalDocumentPrepareScreen(
     }
 
     var isCameraOpen by remember { mutableStateOf(false) }
-    var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var sourceBitmap by remember { mutableStateOf(initialSourceBitmap) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
-    var processedResult by remember { mutableStateOf<ProcessedFileResult?>(null) }
+    var processedResult by remember { mutableStateOf(initialProcessedResult) }
     var isProcessing by remember { mutableStateOf(false) }
     var showOriginalBefore by remember { mutableStateOf(false) }
     var showAdjustSheet by remember { mutableStateOf(false) }
     var showCornerOverlay by remember { mutableStateOf(false) }
 
-    var userPreviewAccepted by remember { mutableStateOf(false) }
+    var userPreviewAccepted by remember { mutableStateOf(initialProcessedResult?.userPreviewAccepted ?: false) }
     var detectedCornersNorm by remember { mutableStateOf<List<PointF>>(emptyList()) }
     var detectedCornerConfidence by remember { mutableFloatStateOf(0f) }
 
@@ -163,6 +165,12 @@ fun PortalDocumentPrepareScreen(
     BackHandler(onBack = onBack)
 
     val runPreparationPipeline: (Bitmap, UnifiedMediaInput?, List<PointF>?, Boolean) -> Unit = { bmp, mediaInput, customQuad, previewAccepted ->
+        if (!previewAccepted) {
+            userPreviewAccepted = false
+            processedResult = processedResult?.let { currentRes ->
+                OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, false)
+            }
+        }
         coroutineScope.launch {
             isProcessing = true
             val w = customWidthPx.toIntOrNull()?.coerceAtLeast(30) ?: (rule.exactWidthPx ?: 350)
@@ -704,20 +712,38 @@ fun PortalDocumentPrepareScreen(
                         ) {
                             Button(
                                 onClick = {
+                                    if (!res.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@Button
+                                    }
                                     coroutineScope.launch {
-                                        val srcFile = File(res.processedFilePath)
-                                        val fileName = "FormReady_${portal.id}_${rule.documentType.name.lowercase()}_${System.currentTimeMillis()}.${res.fileFormat.extension}"
+                                        val currentRes = processedResult
+                                        if (currentRes == null || !currentRes.isExportReady) {
+                                            Toast.makeText(
+                                                context,
+                                                "Please review and accept the processed preview before exporting.",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                            return@launch
+                                        }
+                                        val srcFile = File(currentRes.processedFilePath)
+                                        val fileName = "FormReady_${portal.id}_${rule.documentType.name.lowercase()}_${System.currentTimeMillis()}.${currentRes.fileFormat.extension}"
                                         val saveRes = ImageProcessor.saveFileToGalleryMediaStore(
                                             context = context,
                                             sourceFile = srcFile,
                                             displayName = fileName,
-                                            mimeType = res.fileFormat.mimeType
+                                            mimeType = currentRes.fileFormat.mimeType
                                         )
                                         if (saveRes.isSuccess) {
                                             Toast.makeText(context, "Saved: ${saveRes.getOrNull()}", Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 },
+                                enabled = res.isExportReady,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(48.dp)
@@ -732,11 +758,21 @@ fun PortalDocumentPrepareScreen(
 
                             OutlinedButton(
                                 onClick = {
+                                    if (!res.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@OutlinedButton
+                                    }
                                     sharePreparedFiles(context, listOf(File(res.processedFilePath)))
                                 },
+                                enabled = res.isExportReady,
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(48.dp),
+                                    .height(48.dp)
+                                    .testTag("portal_doc_share_btn"),
                                 shape = RoundedCornerShape(10.dp)
                             ) {
                                 Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))

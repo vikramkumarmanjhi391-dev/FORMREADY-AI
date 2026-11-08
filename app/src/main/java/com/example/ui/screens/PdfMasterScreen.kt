@@ -47,6 +47,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -214,6 +215,7 @@ fun ImagesToPdfSection(
     var showOneClickOriginalPreview by remember { mutableStateOf(false) }
     var showSingleDocCamera by remember { mutableStateOf(false) }
     var oneClickSaveMessage by remember { mutableStateOf<String?>(null) }
+    var oneClickPreviewAccepted by remember { mutableStateOf(false) }
 
     // Multi-page PDF state
     val pickedBitmaps = remember { mutableStateListOf<Bitmap>() }
@@ -224,6 +226,7 @@ fun ImagesToPdfSection(
     var generatedPageCount by remember { mutableIntStateOf(0) }
 
     fun triggerOneClickDocumentPrepare(sourceBmp: Bitmap, useGuideCrop: Boolean) {
+        oneClickPreviewAccepted = false
         coroutineScope.launch {
             isOneClickProcessing = true
             oneClickSaveMessage = null
@@ -301,10 +304,30 @@ fun ImagesToPdfSection(
     val saveOneClickPdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { destUri: Uri? ->
-        val pdfFile = oneClickBundle?.pdfFile
-        if (destUri != null && pdfFile != null) {
+        val currentBundle = oneClickBundle
+        val pdfFile = currentBundle?.pdfFile
+        if (destUri != null) {
+            if (currentBundle == null || pdfFile == null || !currentBundle.jpgResult.isExportReady) {
+                Toast.makeText(
+                    context,
+                    "Please review and accept the processed preview before exporting.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@rememberLauncherForActivityResult
+            }
             coroutineScope.launch(Dispatchers.IO) {
                 try {
+                    val latestBundle = oneClickBundle
+                    if (latestBundle == null || !latestBundle.jpgResult.isExportReady) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                context,
+                                "Please review and accept the processed preview before exporting.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        return@launch
+                    }
                     context.contentResolver.openOutputStream(destUri)?.use { out ->
                         FileInputStream(pdfFile).use { inStream ->
                             inStream.copyTo(out)
@@ -576,7 +599,36 @@ fun ImagesToPdfSection(
                             )
                         }
 
-                        Spacer(modifier = Modifier.height(10.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = oneClickPreviewAccepted,
+                                onCheckedChange = { accepted ->
+                                    oneClickPreviewAccepted = accepted
+                                    oneClickBundle?.let { currentBundle ->
+                                        oneClickBundle = currentBundle.copy(
+                                            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                                                currentBundle.jpgResult,
+                                                accepted
+                                            )
+                                        )
+                                    }
+                                },
+                                modifier = Modifier.testTag("pdf_one_click_preview_acceptance_checkbox")
+                            )
+                            Text(
+                                text = "I have reviewed the processed preview and approve it for export",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = NavyPrimary
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -584,20 +636,38 @@ fun ImagesToPdfSection(
                         ) {
                             Button(
                                 onClick = {
+                                    if (!bundle.jpgResult.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@Button
+                                    }
                                     coroutineScope.launch {
-                                        val jpgFile = File(bundle.jpgResult.processedFilePath)
+                                        val latestBundle = oneClickBundle
+                                        if (latestBundle == null || !latestBundle.jpgResult.isExportReady) {
+                                            Toast.makeText(
+                                                context,
+                                                "Please review and accept the processed preview before exporting.",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                            return@launch
+                                        }
+                                        val jpgFile = File(latestBundle.jpgResult.processedFilePath)
                                         val uri = ImageProcessor.saveFileToGalleryMediaStore(
                                             context = context,
                                             sourceFile = jpgFile,
                                             displayName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg",
                                             mimeType = "image/jpeg"
                                         )
-                                        if (uri != null) {
+                                        if (uri.isSuccess) {
                                             oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", jpgKb)} KB)"
                                             Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 },
+                                enabled = bundle.jpgResult.isExportReady,
                                 colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.weight(1f).testTag("download_doc_jpg_btn")
@@ -609,9 +679,18 @@ fun ImagesToPdfSection(
 
                             Button(
                                 onClick = {
+                                    if (!bundle.jpgResult.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@Button
+                                    }
                                     val suggestedName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
                                     saveOneClickPdfLauncher.launch(suggestedName)
                                 },
+                                enabled = bundle.jpgResult.isExportReady,
                                 colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.weight(1f).testTag("download_doc_pdf_btn")
@@ -623,12 +702,22 @@ fun ImagesToPdfSection(
 
                             OutlinedButton(
                                 onClick = {
+                                    if (!bundle.jpgResult.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@OutlinedButton
+                                    }
                                     sharePreparedFiles(
                                         context,
                                         listOf(File(bundle.jpgResult.processedFilePath), bundle.pdfFile)
                                     )
                                 },
-                                shape = RoundedCornerShape(8.dp)
+                                enabled = bundle.jpgResult.isExportReady,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.testTag("share_doc_bundle_btn")
                             ) {
                                 Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(15.dp))
                             }

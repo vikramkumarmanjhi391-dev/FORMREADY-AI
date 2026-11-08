@@ -149,13 +149,15 @@ val ASPECT_RATIO_OPTIONS = listOf(
 
 @Composable
 fun PhotoStudioScreen(
-    initialRule: DocumentRule? = null
+    initialRule: DocumentRule? = null,
+    initialSourceBitmap: Bitmap? = null,
+    initialProcessedResult: ProcessedFileResult? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var processedResult by remember { mutableStateOf<ProcessedFileResult?>(null) }
+    var sourceBitmap by remember { mutableStateOf(initialSourceBitmap) }
+    var processedResult by remember { mutableStateOf(initialProcessedResult) }
     var isProcessing by remember { mutableStateOf(false) }
     var showOriginalBefore by remember { mutableStateOf(false) }
 
@@ -186,7 +188,7 @@ fun PhotoStudioScreen(
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
     var showAdjustSheet by remember { mutableStateOf(false) }
-    var userPreviewAccepted by remember { mutableStateOf(false) }
+    var userPreviewAccepted by remember { mutableStateOf(initialProcessedResult?.userPreviewAccepted ?: false) }
     var cameraGeometryUnavailable by remember { mutableStateOf(false) }
 
     // Apply initialRule if navigated from Portals tab
@@ -206,6 +208,9 @@ fun PhotoStudioScreen(
         val w = customWidthPx.toIntOrNull()?.coerceAtLeast(50) ?: 350
         val h = customHeightPx.toIntOrNull()?.coerceAtLeast(50) ?: 450
         userPreviewAccepted = false
+        processedResult = processedResult?.let { currentRes ->
+            OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, false)
+        }
         coroutineScope.launch {
             isProcessing = true
             saveStatusMessage = null
@@ -284,6 +289,7 @@ fun PhotoStudioScreen(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { signUri: Uri? ->
         if (signUri != null && sourceBitmap != null) {
+            userPreviewAccepted = false
             coroutineScope.launch {
                 isProcessing = true
                 val signInput = UnifiedMediaInput.fromGalleryUri(signUri, CameraCaptureMode.SIGNATURE)
@@ -291,7 +297,7 @@ fun PhotoStudioScreen(
                 if (signBmp != null) {
                     val w = customWidthPx.toIntOrNull() ?: 350
                     val h = ((customHeightPx.toIntOrNull() ?: 450) * 1.25f).toInt()
-                    processedResult = ImageProcessor.createJointPhotoAndSignature(
+                    val jointRes = ImageProcessor.createJointPhotoAndSignature(
                         context = context,
                         photoBitmap = sourceBitmap!!,
                         signatureBitmap = signBmp,
@@ -303,7 +309,11 @@ fun PhotoStudioScreen(
                         candidateName = if (addNameDateStrip) candidateName else "",
                         dateOfPhoto = if (addNameDateStrip) dateOfPhoto else ""
                     )
-                    Toast.makeText(context, "Joint Photo + Signature created!", Toast.LENGTH_SHORT).show()
+                    processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                        jointRes.copy(requiresUserPreviewApproval = true),
+                        false
+                    )
+                    Toast.makeText(context, "Joint Photo + Signature created! Review preview to approve.", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(context, "Could not read signature image.", Toast.LENGTH_SHORT).show()
                 }
@@ -341,10 +351,30 @@ fun PhotoStudioScreen(
     val saveDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument(selectedFormat.mimeType)
     ) { destinationUri: Uri? ->
-        if (destinationUri != null && processedResult != null) {
+        val currentRes = processedResult
+        if (destinationUri != null) {
+            if (currentRes == null || !currentRes.isExportReady) {
+                Toast.makeText(
+                    context,
+                    "Please review and accept the processed preview before exporting.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@rememberLauncherForActivityResult
+            }
             coroutineScope.launch(Dispatchers.IO) {
                 try {
-                    val srcFile = File(processedResult!!.processedFilePath)
+                    val latestRes = processedResult
+                    if (latestRes == null || !latestRes.isExportReady) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                context,
+                                "Please review and accept the processed preview before exporting.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        return@launch
+                    }
+                    val srcFile = File(latestRes.processedFilePath)
                     if (srcFile.exists()) {
                         context.contentResolver.openOutputStream(destinationUri)?.use { outStream ->
                             FileInputStream(srcFile).use { inStream ->
@@ -352,7 +382,7 @@ fun PhotoStudioScreen(
                             }
                         }
                         withContext(Dispatchers.Main) {
-                            saveStatusMessage = "Successfully saved to device (${String.format(Locale.US, "%.1f", processedResult!!.fileSizeKb)} KB)"
+                            saveStatusMessage = "Successfully saved to device (${String.format(Locale.US, "%.1f", latestRes.fileSizeKb)} KB)"
                             Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                         }
                     } else {
@@ -742,23 +772,41 @@ fun PhotoStudioScreen(
                         // Primary 1-Click Instant Download to Gallery Button (Zero Watermark)
                         Button(
                             onClick = {
+                                if (!res.isExportReady) {
+                                    Toast.makeText(
+                                        context,
+                                        "Please review and accept the processed preview before exporting.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    return@Button
+                                }
                                 coroutineScope.launch {
-                                    val srcFile = File(res.processedFilePath)
-                                    val fileName = "FormReady_${selectedPortalId}_${res.widthPx}x${res.heightPx}_${System.currentTimeMillis()}.${res.fileFormat.extension}"
+                                    val currentRes = processedResult
+                                    if (currentRes == null || !currentRes.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@launch
+                                    }
+                                    val srcFile = File(currentRes.processedFilePath)
+                                    val fileName = "FormReady_${selectedPortalId}_${currentRes.widthPx}x${currentRes.heightPx}_${System.currentTimeMillis()}.${currentRes.fileFormat.extension}"
                                     val saveRes = ImageProcessor.saveFileToGalleryMediaStore(
                                         context = context,
                                         sourceFile = srcFile,
                                         displayName = fileName,
-                                        mimeType = res.fileFormat.mimeType
+                                        mimeType = currentRes.fileFormat.mimeType
                                     )
                                     if (saveRes.isSuccess) {
-                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB)"
+                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", currentRes.fileSizeKb)} KB)"
                                         Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                                     } else {
                                         Toast.makeText(context, "Save failed: ${saveRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             },
+                            enabled = res.isExportReady,
                             shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
                             modifier = Modifier.fillMaxWidth().height(46.dp).testTag("instant_gallery_download_photo_btn")
@@ -777,9 +825,18 @@ fun PhotoStudioScreen(
                         ) {
                             OutlinedButton(
                                 onClick = {
+                                    if (!res.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@OutlinedButton
+                                    }
                                     val suggestedName = "photo_${res.widthPx}x${res.heightPx}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.${res.fileFormat.extension}"
                                     saveDocumentLauncher.launch(suggestedName)
                                 },
+                                enabled = res.isExportReady,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.weight(1f).testTag("save_photo_device_btn")
                             ) {
@@ -790,8 +847,17 @@ fun PhotoStudioScreen(
 
                             OutlinedButton(
                                 onClick = {
+                                    if (!res.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@OutlinedButton
+                                    }
                                     sharePreparedFiles(context, listOf(File(res.processedFilePath)))
                                 },
+                                enabled = res.isExportReady,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.weight(1f).testTag("share_photo_btn")
                             ) {
@@ -865,14 +931,33 @@ fun PhotoStudioScreen(
 
                         OutlinedButton(
                             onClick = {
+                                if (!res.isExportReady) {
+                                    Toast.makeText(
+                                        context,
+                                        "Please review and accept the processed preview before exporting.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    return@OutlinedButton
+                                }
                                 coroutineScope.launch(Dispatchers.IO) {
                                     try {
+                                        val currentRes = processedResult
+                                        if (currentRes == null || !currentRes.isExportReady) {
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Please review and accept the processed preview before exporting.",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                            return@launch
+                                        }
                                         val repo = DocumentLockerRepository(context)
-                                        val file = File(res.processedFilePath)
+                                        val file = File(currentRes.processedFilePath)
                                         if (file.exists()) {
                                             val importRes = repo.importFile(
                                                 file = file,
-                                                title = "Passport Photo (${res.widthPx}x${res.heightPx})",
+                                                title = "Passport Photo (${currentRes.widthPx}x${currentRes.heightPx})",
                                                 documentType = DocumentType.PASSPORT_PHOTO,
                                                 originalFileName = file.name,
                                                 notes = "Generated in Photo Studio for ${selectedPreset.name}"
@@ -892,6 +977,7 @@ fun PhotoStudioScreen(
                                     }
                                 }
                             },
+                            enabled = res.isExportReady,
                             modifier = Modifier.fillMaxWidth().testTag("add_photo_to_locker_btn"),
                             shape = RoundedCornerShape(10.dp)
                         ) {
@@ -944,17 +1030,22 @@ fun PhotoStudioScreen(
 
                             OutlinedButton(
                                 onClick = {
+                                    userPreviewAccepted = false
                                     coroutineScope.launch {
                                         isProcessing = true
                                         val baseBmp = processedResult?.processedFilePath?.let { BitmapFactory.decodeFile(it) } ?: sourceBitmap!!
-                                        processedResult = ImageProcessor.createPrintablePassportSheet(
+                                        val sheetRes = ImageProcessor.createPrintablePassportSheet(
                                             context = context,
                                             photoBitmap = baseBmp,
                                             photoCount = 8,
                                             dpi = 300
                                         )
+                                        processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                                            sheetRes.copy(requiresUserPreviewApproval = true),
+                                            false
+                                        )
                                         isProcessing = false
-                                        Toast.makeText(context, "4x6 Printable Sheet (8 Photos) Ready!", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "4x6 Printable Sheet (8 Photos) Ready! Review preview to approve.", Toast.LENGTH_SHORT).show()
                                     }
                                 },
                                 modifier = Modifier.weight(1f).testTag("print_sheet_8_btn"),
@@ -968,17 +1059,22 @@ fun PhotoStudioScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         OutlinedButton(
                             onClick = {
+                                userPreviewAccepted = false
                                 coroutineScope.launch {
                                     isProcessing = true
                                     val baseBmp = processedResult?.processedFilePath?.let { BitmapFactory.decodeFile(it) } ?: sourceBitmap!!
-                                    processedResult = ImageProcessor.createPrintablePassportSheet(
+                                    val sheetRes = ImageProcessor.createPrintablePassportSheet(
                                         context = context,
                                         photoBitmap = baseBmp,
                                         photoCount = 12,
                                         dpi = 300
                                     )
+                                    processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                                        sheetRes.copy(requiresUserPreviewApproval = true),
+                                        false
+                                    )
                                     isProcessing = false
-                                    Toast.makeText(context, "Printable Sheet (12 Photos) Ready!", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Printable Sheet (12 Photos) Ready! Review preview to approve.", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             modifier = Modifier.fillMaxWidth().testTag("print_sheet_12_btn"),
@@ -1081,6 +1177,13 @@ fun PhotoStudioScreen(
                             opt.ratio?.let { r ->
                                 val w = customWidthPx.toIntOrNull() ?: 350
                                 customHeightPx = (w / r).toInt().toString()
+                            }
+                            userPreviewAccepted = false
+                            processedResult?.let { currentRes ->
+                                processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, false)
+                            }
+                            if (sourceBitmap != null) {
+                                triggerOneClickAutoPrepare(sourceBitmap!!, currentMediaInput)
                             }
                         },
                         label = { Text(opt.label, fontSize = 12.sp) },

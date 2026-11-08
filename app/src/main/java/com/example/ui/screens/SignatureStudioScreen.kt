@@ -127,13 +127,15 @@ val SIGNATURE_PRESETS = listOf(
 
 @Composable
 fun SignatureStudioScreen(
-    initialRule: DocumentRule? = null
+    initialRule: DocumentRule? = null,
+    initialSourceBitmap: Bitmap? = null,
+    initialProcessedResult: ProcessedFileResult? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var processedResult by remember { mutableStateOf<ProcessedFileResult?>(null) }
+    var sourceBitmap by remember { mutableStateOf(initialSourceBitmap) }
+    var processedResult by remember { mutableStateOf(initialProcessedResult) }
     var isProcessing by remember { mutableStateOf(false) }
     var showOriginalBefore by remember { mutableStateOf(false) }
 
@@ -156,7 +158,7 @@ fun SignatureStudioScreen(
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
     var showAdjustSheet by remember { mutableStateOf(false) }
-    var userPreviewAccepted by remember { mutableStateOf(false) }
+    var userPreviewAccepted by remember { mutableStateOf(initialProcessedResult?.userPreviewAccepted ?: false) }
     var cameraGeometryUnavailable by remember { mutableStateOf(false) }
 
     LaunchedEffect(initialRule) {
@@ -174,6 +176,9 @@ fun SignatureStudioScreen(
         val w = customWidthPx.toIntOrNull()?.coerceAtLeast(30) ?: 140
         val h = customHeightPx.toIntOrNull()?.coerceAtLeast(20) ?: 60
         userPreviewAccepted = false
+        processedResult = processedResult?.let { currentRes ->
+            OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, false)
+        }
         coroutineScope.launch {
             isProcessing = true
             saveStatusMessage = null
@@ -283,10 +288,30 @@ fun SignatureStudioScreen(
     val saveDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument(selectedFormat.mimeType)
     ) { destinationUri: Uri? ->
-        if (destinationUri != null && processedResult != null) {
+        val currentRes = processedResult
+        if (destinationUri != null) {
+            if (currentRes == null || !currentRes.isExportReady) {
+                Toast.makeText(
+                    context,
+                    "Please review and accept the processed preview before exporting.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@rememberLauncherForActivityResult
+            }
             coroutineScope.launch(Dispatchers.IO) {
                 try {
-                    val srcFile = File(processedResult!!.processedFilePath)
+                    val latestRes = processedResult
+                    if (latestRes == null || !latestRes.isExportReady) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                context,
+                                "Please review and accept the processed preview before exporting.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        return@launch
+                    }
+                    val srcFile = File(latestRes.processedFilePath)
                     if (srcFile.exists()) {
                         context.contentResolver.openOutputStream(destinationUri)?.use { outStream ->
                             FileInputStream(srcFile).use { inStream ->
@@ -294,7 +319,7 @@ fun SignatureStudioScreen(
                             }
                         }
                         withContext(Dispatchers.Main) {
-                            saveStatusMessage = "Successfully saved signature to device (${String.format(Locale.US, "%.1f", processedResult!!.fileSizeKb)} KB)"
+                            saveStatusMessage = "Successfully saved signature to device (${String.format(Locale.US, "%.1f", latestRes.fileSizeKb)} KB)"
                             Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                         }
                     } else {
@@ -650,23 +675,41 @@ fun SignatureStudioScreen(
                         // 1-Click Direct Download to Gallery Button
                         Button(
                             onClick = {
+                                if (!res.isExportReady) {
+                                    Toast.makeText(
+                                        context,
+                                        "Please review and accept the processed preview before exporting.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    return@Button
+                                }
                                 coroutineScope.launch {
-                                    val srcFile = File(res.processedFilePath)
-                                    val fileName = "FormReady_Sign_${selectedPortalId}_${res.widthPx}x${res.heightPx}_${System.currentTimeMillis()}.${res.fileFormat.extension}"
+                                    val currentRes = processedResult
+                                    if (currentRes == null || !currentRes.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@launch
+                                    }
+                                    val srcFile = File(currentRes.processedFilePath)
+                                    val fileName = "FormReady_Sign_${selectedPortalId}_${currentRes.widthPx}x${currentRes.heightPx}_${System.currentTimeMillis()}.${currentRes.fileFormat.extension}"
                                     val saveRes = ImageProcessor.saveFileToGalleryMediaStore(
                                         context = context,
                                         sourceFile = srcFile,
                                         displayName = fileName,
-                                        mimeType = res.fileFormat.mimeType
+                                        mimeType = currentRes.fileFormat.mimeType
                                     )
                                     if (saveRes.isSuccess) {
-                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB)"
+                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", currentRes.fileSizeKb)} KB)"
                                         Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                                     } else {
                                         Toast.makeText(context, "Save failed: ${saveRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             },
+                            enabled = res.isExportReady,
                             shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
                             modifier = Modifier.fillMaxWidth().height(46.dp).testTag("instant_gallery_download_sign_btn")
@@ -685,9 +728,18 @@ fun SignatureStudioScreen(
                         ) {
                             OutlinedButton(
                                 onClick = {
+                                    if (!res.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@OutlinedButton
+                                    }
                                     val suggestedName = "signature_${res.widthPx}x${res.heightPx}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.${res.fileFormat.extension}"
                                     saveDocumentLauncher.launch(suggestedName)
                                 },
+                                enabled = res.isExportReady,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.weight(1f).testTag("save_signature_device_btn")
                             ) {
@@ -698,8 +750,17 @@ fun SignatureStudioScreen(
 
                             OutlinedButton(
                                 onClick = {
+                                    if (!res.isExportReady) {
+                                        Toast.makeText(
+                                            context,
+                                            "Please review and accept the processed preview before exporting.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@OutlinedButton
+                                    }
                                     sharePreparedFiles(context, listOf(File(res.processedFilePath)))
                                 },
+                                enabled = res.isExportReady,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.weight(1f).testTag("share_signature_btn")
                             ) {
@@ -717,6 +778,7 @@ fun SignatureStudioScreen(
                                 preserveInkColor = true
                                 contrastFactor = 1.0f
                                 inkThreshold = 245
+                                userPreviewAccepted = false
                                 sourceBitmap?.let { bmp ->
                                     triggerOneClickSignaturePrepare(bmp, currentMediaInput)
                                     Toast.makeText(context, SIGNATURE_FALLBACK_TOAST_MESSAGE, Toast.LENGTH_SHORT).show()
@@ -734,14 +796,33 @@ fun SignatureStudioScreen(
 
                         OutlinedButton(
                             onClick = {
+                                if (!res.isExportReady) {
+                                    Toast.makeText(
+                                        context,
+                                        "Please review and accept the processed preview before exporting.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    return@OutlinedButton
+                                }
                                 coroutineScope.launch(Dispatchers.IO) {
                                     try {
+                                        val currentRes = processedResult
+                                        if (currentRes == null || !currentRes.isExportReady) {
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Please review and accept the processed preview before exporting.",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                            return@launch
+                                        }
                                         val repo = DocumentLockerRepository(context)
-                                        val file = File(res.processedFilePath)
+                                        val file = File(currentRes.processedFilePath)
                                         if (file.exists()) {
                                             val importRes = repo.importFile(
                                                 file = file,
-                                                title = "${selectedPreset.title} (${res.widthPx}x${res.heightPx})",
+                                                title = "${selectedPreset.title} (${currentRes.widthPx}x${currentRes.heightPx})",
                                                 documentType = selectedPreset.type,
                                                 originalFileName = file.name,
                                                 notes = "Generated in Signature Studio"
@@ -761,6 +842,7 @@ fun SignatureStudioScreen(
                                     }
                                 }
                             },
+                            enabled = res.isExportReady,
                             modifier = Modifier.fillMaxWidth().testTag("add_signature_to_locker_btn"),
                             shape = RoundedCornerShape(10.dp)
                         ) {

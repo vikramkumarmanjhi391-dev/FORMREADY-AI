@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
@@ -368,16 +369,27 @@ fun PortalDetailScreen(
 
         if (preparedResults.isNotEmpty()) {
             item {
+                val exportReadyResults = preparedResults.values.filter { it.isExportReady }
+                val allPreparedAreExportReady = preparedResults.values.all { it.isExportReady } && exportReadyResults.isNotEmpty()
                 Spacer(modifier = Modifier.height(14.dp))
                 OutlinedButton(
                     onClick = {
-                        val files = preparedResults.values
+                        if (!allPreparedAreExportReady) {
+                            Toast.makeText(
+                                context,
+                                "Please review and accept the processed preview before exporting.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@OutlinedButton
+                        }
+                        val files = exportReadyResults
                             .map { File(it.processedFilePath) }
                             .filter { it.exists() }
                         if (files.isNotEmpty()) {
                             sharePreparedFiles(context, files)
                         }
                     },
+                    enabled = allPreparedAreExportReady,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(48.dp)
@@ -386,7 +398,7 @@ fun PortalDetailScreen(
                 ) {
                     Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Share All Prepared Documents (${preparedResults.size})", fontWeight = FontWeight.Bold)
+                    Text("Share All Prepared Documents (${exportReadyResults.size}/${preparedResults.size})", fontWeight = FontWeight.Bold)
                 }
             }
         }
