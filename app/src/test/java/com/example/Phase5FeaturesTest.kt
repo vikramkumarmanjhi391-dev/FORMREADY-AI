@@ -2148,6 +2148,425 @@ class Phase5FeaturesTest {
         assertFalse("Scene 8 (blank surface) must NEVER be autoWarpEligible", det8.autoWarpEligible)
     }
 
+    private fun assertQuadInvariantsAndDeterminism(
+        bmp: Bitmap,
+        det: com.example.processing.DocumentCornerProcessor.DocumentQuadNorm
+    ) {
+        val corners = det.cornersNorm
+        assertEquals(4, corners.size)
+        for ((idx, pt) in corners.withIndex()) {
+            assertTrue("Corner $idx x=${pt.x} must be in [0,1]", pt.x in 0f..1f)
+            assertTrue("Corner $idx y=${pt.y} must be in [0,1]", pt.y in 0f..1f)
+        }
+        // Verify clockwise convexity and non-self-intersection
+        for (i in 0 until 4) {
+            val a = corners[i]
+            val b = corners[(i + 1) % 4]
+            val c = corners[(i + 2) % 4]
+            val cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+            assertTrue("Quad must be strictly clockwise convex at vertex $i (cross=$cross)", cross > 0f)
+        }
+        // Verify canonical ordering: TL and BL on left half relative to TR and BR, TL and TR above BL and BR
+        assertTrue(det.topLeft.x < det.topRight.x)
+        assertTrue(det.bottomLeft.x < det.bottomRight.x)
+        assertTrue(det.topLeft.y < det.bottomLeft.y)
+        assertTrue(det.topRight.y < det.bottomRight.y)
+
+        // Determinism check
+        val repeatDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(bmp)
+        assertEquals(det.confidence, repeatDet.confidence, 1e-6f)
+        assertEquals(det.autoWarpEligible, repeatDet.autoWarpEligible)
+        assertEquals(det.requiresUserConfirmation, repeatDet.requiresUserConfirmation)
+        for (i in 0 until 4) {
+            assertEquals(corners[i].x, repeatDet.cornersNorm[i].x, 1e-6f)
+            assertEquals(corners[i].y, repeatDet.cornersNorm[i].y, 1e-6f)
+        }
+    }
+
+    private fun buildQuadBitmapScene(
+        w: Int,
+        h: Int,
+        tl: android.graphics.PointF,
+        tr: android.graphics.PointF,
+        br: android.graphics.PointF,
+        bl: android.graphics.PointF,
+        bgFn: (Int, Int) -> Int,
+        fgFn: (Int, Int) -> Int
+    ): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val verts = arrayOf(
+            android.graphics.PointF(tl.x * (w - 1), tl.y * (h - 1)),
+            android.graphics.PointF(tr.x * (w - 1), tr.y * (h - 1)),
+            android.graphics.PointF(br.x * (w - 1), br.y * (h - 1)),
+            android.graphics.PointF(bl.x * (w - 1), bl.y * (h - 1))
+        )
+        val pixels = IntArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                var inside = true
+                for (i in 0 until 4) {
+                    val a = verts[i]
+                    val b = verts[(i + 1) % 4]
+                    val cross = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+                    if (cross < 0f) {
+                        inside = false
+                        break
+                    }
+                }
+                pixels[y * w + x] = if (inside) fgFn(x, y) else bgFn(x, y)
+            }
+        }
+        bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+        return bmp
+    }
+
+    @Test
+    fun testPhase3B1RotatedAndStronglyPerspectiveSkewedDocuments() {
+        val w = 360
+        val h = 440
+
+        // 1. Rotated rectangular document (24 degrees clockwise rotation in pixel space)
+        val rad = Math.toRadians(24.0)
+        val cosA = kotlin.math.cos(rad).toFloat()
+        val sinA = kotlin.math.sin(rad).toFloat()
+        val cx = w * 0.50f
+        val cy = h * 0.50f
+        val halfW = w * 0.25f
+        val halfH = h * 0.28f
+
+        fun rotCorner(lx: Float, ly: Float): android.graphics.PointF {
+            val rx = cx + lx * cosA - ly * sinA
+            val ry = cy + lx * sinA + ly * cosA
+            return android.graphics.PointF(rx / (w - 1), ry / (h - 1))
+        }
+
+        val rotTl = rotCorner(-halfW, -halfH)
+        val rotTr = rotCorner(halfW, -halfH)
+        val rotBr = rotCorner(halfW, halfH)
+        val rotBl = rotCorner(-halfW, halfH)
+
+        val rotatedBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = rotTl,
+            tr = rotTr,
+            br = rotBr,
+            bl = rotBl,
+            bgFn = { _, _ -> Color.rgb(34, 38, 44) },
+            fgFn = { _, _ -> Color.rgb(246, 246, 244) }
+        )
+        val origPixels = IntArray(w * h)
+        rotatedBmp.getPixels(origPixels, 0, w, 0, 0, w, h)
+
+        val rotDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(rotatedBmp)
+        assertFalse("Original bitmap must never be recycled", rotatedBmp.isRecycled)
+        val afterPixels = IntArray(w * h)
+        rotatedBmp.getPixels(afterPixels, 0, w, 0, 0, w, h)
+        org.junit.Assert.assertArrayEquals("Original bitmap pixels must never be modified", origPixels, afterPixels)
+
+        assertQuadInvariantsAndDeterminism(rotatedBmp, rotDet)
+        assertTrue(
+            "Rotated rectangular document must be autoWarpEligible (conf=${rotDet.confidence}, minEdge=${rotDet.minEdgeSupport})",
+            rotDet.autoWarpEligible
+        )
+        val tol = 0.035f
+        assertEquals(rotTl.x, rotDet.topLeft.x, tol)
+        assertEquals(rotTl.y, rotDet.topLeft.y, tol)
+        assertEquals(rotTr.x, rotDet.topRight.x, tol)
+        assertEquals(rotTr.y, rotDet.topRight.y, tol)
+        assertEquals(rotBr.x, rotDet.bottomRight.x, tol)
+        assertEquals(rotBr.y, rotDet.bottomRight.y, tol)
+        assertEquals(rotBl.x, rotDet.bottomLeft.x, tol)
+        assertEquals(rotBl.y, rotDet.bottomLeft.y, tol)
+
+        // Verify homography perspective rectification works with contour-detected corners
+        val warpedRot = com.example.processing.DocumentCornerProcessor.warpDocumentPerspective(
+            sourceBitmap = rotatedBmp,
+            quadNorm = rotDet,
+            targetWidthPx = 280,
+            targetHeightPx = 360
+        )
+        assertEquals(280, warpedRot.width)
+        assertEquals(360, warpedRot.height)
+        assertTrue(Color.red(warpedRot.getPixel(140, 180)) >= 235)
+
+        // 2. Strongly perspective-skewed trapezoidal document
+        val trapTl = android.graphics.PointF(0.24f, 0.16f)
+        val trapTr = android.graphics.PointF(0.76f, 0.18f)
+        val trapBr = android.graphics.PointF(0.88f, 0.84f)
+        val trapBl = android.graphics.PointF(0.12f, 0.82f)
+        val trapBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = trapTl,
+            tr = trapTr,
+            br = trapBr,
+            bl = trapBl,
+            bgFn = { _, _ -> Color.rgb(32, 36, 42) },
+            fgFn = { _, _ -> Color.rgb(245, 245, 242) }
+        )
+        val trapDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(trapBmp)
+        assertQuadInvariantsAndDeterminism(trapBmp, trapDet)
+        assertTrue(
+            "Strongly perspective-skewed trapezoid must be autoWarpEligible (conf=${trapDet.confidence})",
+            trapDet.autoWarpEligible
+        )
+        assertEquals(trapTl.x, trapDet.topLeft.x, tol)
+        assertEquals(trapTl.y, trapDet.topLeft.y, tol)
+        assertEquals(trapTr.x, trapDet.topRight.x, tol)
+        assertEquals(trapTr.y, trapDet.topRight.y, tol)
+        assertEquals(trapBr.x, trapDet.bottomRight.x, tol)
+        assertEquals(trapBr.y, trapDet.bottomRight.y, tol)
+        assertEquals(trapBl.x, trapDet.bottomLeft.x, tol)
+        assertEquals(trapBl.y, trapDet.bottomLeft.y, tol)
+    }
+
+    @Test
+    fun testPhase3B1UnevenIlluminationInternalMarkingsNoisyBgAndRoundedCorners() {
+        val w = 360
+        val h = 440
+        val tol = 0.04f
+
+        // 3. Uneven diagonal illumination on skewed document
+        val illumTl = android.graphics.PointF(0.17f, 0.15f)
+        val illumTr = android.graphics.PointF(0.84f, 0.18f)
+        val illumBr = android.graphics.PointF(0.82f, 0.85f)
+        val illumBl = android.graphics.PointF(0.15f, 0.83f)
+        val illumBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = illumTl,
+            tr = illumTr,
+            br = illumBr,
+            bl = illumBl,
+            bgFn = { x, y ->
+                val bgShade = 32 + ((x + y) % 10)
+                Color.rgb(bgShade, bgShade + 3, bgShade + 6)
+            },
+            fgFn = { x, y ->
+                val diag = ((x.toFloat() / w) * 0.55f + (y.toFloat() / h) * 0.45f).coerceIn(0f, 1f)
+                val paperLum = (248f - diag * 112f).toInt().coerceIn(132, 248)
+                Color.rgb(paperLum, paperLum, (paperLum - 3).coerceAtLeast(125))
+            }
+        )
+        val illumDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(illumBmp)
+        assertQuadInvariantsAndDeterminism(illumBmp, illumDet)
+        assertTrue("Uneven diagonal illumination document must be autoWarpEligible", illumDet.autoWarpEligible)
+        assertEquals(illumTl.x, illumDet.topLeft.x, tol)
+        assertEquals(illumTl.y, illumDet.topLeft.y, tol)
+        assertEquals(illumBr.x, illumDet.bottomRight.x, tol)
+        assertEquals(illumBr.y, illumDet.bottomRight.y, tol)
+
+        // 4. Document with internal printed text, header bar, photo box, and dark markings
+        val textDocTl = android.graphics.PointF(0.16f, 0.14f)
+        val textDocTr = android.graphics.PointF(0.85f, 0.17f)
+        val textDocBr = android.graphics.PointF(0.83f, 0.86f)
+        val textDocBl = android.graphics.PointF(0.14f, 0.83f)
+        val textDocBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = textDocTl,
+            tr = textDocTr,
+            br = textDocBr,
+            bl = textDocBl,
+            bgFn = { _, _ -> Color.rgb(36, 40, 46) },
+            fgFn = { x, y ->
+                // Internal dark header bar, photo box, and horizontal text lines strictly inside the margins
+                val inHeader = x in 95..260 && y in 95..112
+                val inPhotoBox = x in 95..145 && y in 130..195
+                val inTextLines = x in 155..265 && y in 130..310 && (y % 18 in 0..4) && ((x + y) % 7 != 0)
+                val inStamp = kotlin.math.hypot((x - 235).toDouble(), (y - 320).toDouble()) <= 18.0
+                if (inHeader || inPhotoBox || inTextLines || inStamp) {
+                    Color.rgb(25, 28, 35)
+                } else {
+                    Color.rgb(245, 245, 242)
+                }
+            }
+        )
+        val textDocDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(textDocBmp)
+        assertQuadInvariantsAndDeterminism(textDocBmp, textDocDet)
+        assertTrue(
+            "Document with internal printed text and dark markings must be autoWarpEligible (conf=${textDocDet.confidence})",
+            textDocDet.autoWarpEligible
+        )
+        assertEquals(textDocTl.x, textDocDet.topLeft.x, tol)
+        assertEquals(textDocTl.y, textDocDet.topLeft.y, tol)
+        assertEquals(textDocTr.x, textDocDet.topRight.x, tol)
+        assertEquals(textDocTr.y, textDocDet.topRight.y, tol)
+        assertEquals(textDocBr.x, textDocDet.bottomRight.x, tol)
+        assertEquals(textDocBr.y, textDocDet.bottomRight.y, tol)
+        assertEquals(textDocBl.x, textDocDet.bottomLeft.x, tol)
+        assertEquals(textDocBl.y, textDocDet.bottomLeft.y, tol)
+
+        // 5. Textured and noisy background
+        val noisyTl = android.graphics.PointF(0.18f, 0.16f)
+        val noisyTr = android.graphics.PointF(0.83f, 0.15f)
+        val noisyBr = android.graphics.PointF(0.85f, 0.84f)
+        val noisyBl = android.graphics.PointF(0.16f, 0.85f)
+        val noisyBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = noisyTl,
+            tr = noisyTr,
+            br = noisyBr,
+            bl = noisyBl,
+            bgFn = { x, y ->
+                val grain = 52 + ((x * 5 + y * 3) % 28)
+                val hash = ((x * 73856093) xor (y * 19349663)) and 0xFF
+                // Deterministic isolated speckle noise + wood texture
+                val noise = if (hash > 248) 45 else (hash % 18) - 9
+                val v = (grain + noise).coerceIn(25, 135)
+                Color.rgb(v, (v - 4).coerceAtLeast(20), (v - 8).coerceAtLeast(18))
+            },
+            fgFn = { _, _ -> Color.rgb(244, 244, 240) }
+        )
+        val noisyDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(noisyBmp)
+        assertQuadInvariantsAndDeterminism(noisyBmp, noisyDet)
+        assertTrue(
+            "Document on textured and noisy background must be autoWarpEligible (conf=${noisyDet.confidence})",
+            noisyDet.autoWarpEligible
+        )
+        assertEquals(noisyTl.x, noisyDet.topLeft.x, tol)
+        assertEquals(noisyTl.y, noisyDet.topLeft.y, tol)
+        assertEquals(noisyBr.x, noisyDet.bottomRight.x, tol)
+        assertEquals(noisyBr.y, noisyDet.bottomRight.y, tol)
+
+        // 6. Rounded-corner ID card / document with slight edge irregularity
+        val roundBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val cardLeft = (w * 0.16f).toInt()
+        val cardRight = (w * 0.84f).toInt()
+        val cardTop = (h * 0.20f).toInt()
+        val cardBottom = (h * 0.80f).toInt()
+        val cornerRadius = 15f
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val jitter = if ((x + y) % 19 == 0) 1 else 0
+                val inRect = x in (cardLeft + jitter)..(cardRight - jitter) &&
+                    y in (cardTop + jitter)..(cardBottom - jitter)
+                var insideRounded = inRect
+                if (inRect) {
+                    val cxCorner = when {
+                        x < cardLeft + cornerRadius -> cardLeft + cornerRadius
+                        x > cardRight - cornerRadius -> cardRight - cornerRadius
+                        else -> x.toFloat()
+                    }
+                    val cyCorner = when {
+                        y < cardTop + cornerRadius -> cardTop + cornerRadius
+                        y > cardBottom - cornerRadius -> cardBottom - cornerRadius
+                        else -> y.toFloat()
+                    }
+                    if (kotlin.math.hypot((x - cxCorner).toDouble(), (y - cyCorner).toDouble()) > cornerRadius) {
+                        insideRounded = false
+                    }
+                }
+                roundBmp.setPixel(
+                    x,
+                    y,
+                    if (insideRounded) Color.rgb(245, 245, 242) else Color.rgb(36, 40, 48)
+                )
+            }
+        }
+        val roundDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(roundBmp)
+        assertQuadInvariantsAndDeterminism(roundBmp, roundDet)
+        assertTrue(
+            "Rounded-corner ID card must be autoWarpEligible via 4-side line intersection (conf=${roundDet.confidence})",
+            roundDet.autoWarpEligible
+        )
+        assertEquals(0.16f, roundDet.topLeft.x, tol)
+        assertEquals(0.20f, roundDet.topLeft.y, tol)
+        assertEquals(0.84f, roundDet.topRight.x, tol)
+        assertEquals(0.20f, roundDet.topRight.y, tol)
+        assertEquals(0.84f, roundDet.bottomRight.x, tol)
+        assertEquals(0.80f, roundDet.bottomRight.y, tol)
+        assertEquals(0.16f, roundDet.bottomLeft.x, tol)
+        assertEquals(0.80f, roundDet.bottomLeft.y, tol)
+    }
+
+    @Test
+    fun testPhase3B1AmbiguousObscuredOverlappingAndLowContrastScenesRejected() {
+        val w = 360
+        val h = 440
+
+        // 7. Partially obscured document (large dark occlusion covering bottom-right quadrant of page)
+        val obscuredBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = android.graphics.PointF(0.16f, 0.16f),
+            tr = android.graphics.PointF(0.84f, 0.16f),
+            br = android.graphics.PointF(0.84f, 0.84f),
+            bl = android.graphics.PointF(0.16f, 0.84f),
+            bgFn = { _, _ -> Color.rgb(35, 38, 45) },
+            fgFn = { x, y ->
+                // Dark object obscuring the lower-right corner region of the document
+                if (x + y > (w * 0.62f + h * 0.62f).toInt()) {
+                    Color.rgb(35, 38, 45)
+                } else {
+                    Color.rgb(245, 245, 245)
+                }
+            }
+        )
+        val obscuredDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(obscuredBmp)
+        assertQuadInvariantsAndDeterminism(obscuredBmp, obscuredDet)
+        assertTrue("Partially obscured document must require user confirmation", obscuredDet.requiresUserConfirmation)
+        assertFalse("Partially obscured document must NOT auto-warp", obscuredDet.autoWarpEligible)
+
+        // 8. Two overlapping document-like objects at offset positions forming an irregular silhouette
+        val overlapBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(35, 38, 45))
+        }
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val inSheetA = x in (w * 0.12).toInt()..(w * 0.58).toInt() &&
+                    y in (h * 0.14).toInt()..(h * 0.62).toInt()
+                val inSheetB = x in (w * 0.42).toInt()..(w * 0.88).toInt() &&
+                    y in (h * 0.38).toInt()..(h * 0.86).toInt()
+                if (inSheetA || inSheetB) {
+                    overlapBmp.setPixel(x, y, Color.rgb(245, 245, 245))
+                }
+            }
+        }
+        val overlapDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(overlapBmp)
+        assertQuadInvariantsAndDeterminism(overlapBmp, overlapDet)
+        assertTrue("Overlapping document sheets must require user confirmation", overlapDet.requiresUserConfirmation)
+        assertFalse("Overlapping document sheets must NOT auto-warp", overlapDet.autoWarpEligible)
+
+        // 9. Low-contrast paper on light surface
+        val lowContrastBmp = buildQuadBitmapScene(
+            w = w,
+            h = h,
+            tl = android.graphics.PointF(0.18f, 0.18f),
+            tr = android.graphics.PointF(0.82f, 0.18f),
+            br = android.graphics.PointF(0.82f, 0.82f),
+            bl = android.graphics.PointF(0.18f, 0.82f),
+            bgFn = { _, _ -> Color.rgb(228, 226, 220) },
+            fgFn = { _, _ -> Color.rgb(241, 240, 237) }
+        )
+        val lowContrastDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(lowContrastBmp)
+        assertQuadInvariantsAndDeterminism(lowContrastBmp, lowContrastDet)
+        assertTrue("Low-contrast document must require user confirmation", lowContrastDet.requiresUserConfirmation)
+        assertFalse("Low-contrast document must NOT auto-warp", lowContrastDet.autoWarpEligible)
+
+        // 10. Disconnected background clutter + blank surface
+        val clutterBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(38, 42, 48))
+        }
+        for (y in 25..95) {
+            for (x in 25..110) {
+                clutterBmp.setPixel(x, y, Color.WHITE)
+                clutterBmp.setPixel(w - 1 - x, h - 1 - y, Color.WHITE)
+            }
+        }
+        for (y in 200..260) {
+            for (x in 40..95) {
+                clutterBmp.setPixel(x, y, Color.WHITE)
+            }
+        }
+        val clutterDet = com.example.processing.DocumentCornerProcessor.detectDocumentCorners(clutterBmp)
+        assertQuadInvariantsAndDeterminism(clutterBmp, clutterDet)
+        assertTrue("Disconnected clutter must require user confirmation", clutterDet.requiresUserConfirmation)
+        assertFalse("Disconnected clutter must NOT auto-warp", clutterDet.autoWarpEligible)
+    }
+
     @Test
     fun testBatch5MlKitClientReuseConcurrentLocksAndLifecycleRelease() = runBlocking {
         com.example.processing.VisionBenchmarkRecorder.clear()
