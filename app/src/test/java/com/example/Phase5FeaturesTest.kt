@@ -2706,7 +2706,7 @@ class Phase5FeaturesTest {
 }
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [36], shadows = [SafeRobolectricPdfDocumentShadow::class])
 class Phase05AExportReadinessGateUiTest {
 
     @get:Rule
@@ -3716,7 +3716,432 @@ class Phase05AExportReadinessGateUiTest {
         assertEquals(0.06f, appliedCorners!![0].x, 1e-4f)
         assertEquals(0.06f, appliedCorners!![0].y, 1e-4f)
     }
+
+    // =========================================================================
+    // PHASE 3B.3 — ONE-CLICK PDF MASTER UNIFIED CAMERA/GALLERY DETECTION &
+    // MANUAL CORNER ADJUSTMENT REGRESSION TESTS
+    // =========================================================================
+
+    private fun createHighContrastAngledDocumentScene(width: Int = 420, height: Int = 560): Bitmap {
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val tl = android.graphics.PointF(0.16f * width, 0.14f * height)
+        val tr = android.graphics.PointF(0.86f * width, 0.18f * height)
+        val br = android.graphics.PointF(0.82f * width, 0.86f * height)
+        val bl = android.graphics.PointF(0.12f * width, 0.82f * height)
+        val verts = arrayOf(tl, tr, br, bl)
+
+        val pixels = IntArray(width * height)
+        val bgColor = Color.rgb(32, 35, 42)
+        val docColor = Color.rgb(248, 248, 248)
+        for (y in 0 until height) {
+            val py = y.toFloat()
+            for (x in 0 until width) {
+                val px = x.toFloat()
+                var inside = true
+                for (i in 0 until 4) {
+                    val a = verts[i]
+                    val b = verts[(i + 1) % 4]
+                    val cross = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x)
+                    if (cross < 0f) {
+                        inside = false
+                        break
+                    }
+                }
+                pixels[y * width + x] = if (inside) docColor else bgColor
+            }
+        }
+        bmp.setPixels(pixels, 0, width, 0, 0, width, height)
+        return bmp
+    }
+
+    @Test
+    fun testPhase3B3UnifiedCameraAndGalleryDocumentDetectionPriorityAndFallbacks() = runBlocking {
+        val angledDocBmp = createHighContrastAngledDocumentScene(420, 560)
+        val uniformLowConfBmp = Bitmap.createBitmap(420, 560, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(185, 185, 185))
+        }
+        val cameraGuideRect = CameraCaptureMode.DOCUMENT_PAGE.guideCropRectNorm
+        val targetMaxKb = 150
+
+        // 1. Camera-style input (cropRectNorm != null) with high-confidence angled document quadrilateral:
+        //    automatic perspective warp MUST execute even though cropRectNorm is non-null!
+        val cameraHighConfBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = angledDocBmp,
+            maxKb = targetMaxKb,
+            cropRectNorm = cameraGuideRect
+        )
+        assertNotNull(cameraHighConfBundle)
+        assertTrue(
+            "Camera input with high-confidence document quad must execute automatic perspective warp",
+            cameraHighConfBundle!!.perspectiveWarped
+        )
+        assertFalse(
+            "Camera input that auto-warped must report guideCropFallbackUsed == false",
+            cameraHighConfBundle.guideCropFallbackUsed
+        )
+        assertFalse(
+            "High-confidence auto-warped camera input must not require manual corner confirmation",
+            cameraHighConfBundle.requiresManualCornerConfirmation
+        )
+        assertTrue(cameraHighConfBundle.cornerConfidence >= 0.72f)
+        assertEquals(4, cameraHighConfBundle.detectedCornersNorm.size)
+        assertTrue(cameraHighConfBundle.jpgResult.fileSizeKb <= targetMaxKb.toDouble())
+        assertTrue(cameraHighConfBundle.pdfSizeKb <= targetMaxKb.toDouble())
+
+        // 2. Camera-style input (cropRectNorm != null) with low-confidence / uniform image:
+        //    automatic warp does NOT execute; conservative rectangular guide crop fallback IS used.
+        val cameraLowConfBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = uniformLowConfBmp,
+            maxKb = targetMaxKb,
+            cropRectNorm = cameraGuideRect
+        )
+        assertNotNull(cameraLowConfBundle)
+        assertFalse(
+            "Low-confidence camera input must NOT claim perspectiveWarped",
+            cameraLowConfBundle!!.perspectiveWarped
+        )
+        assertTrue(
+            "Low-confidence camera input must use conservative guideCropFallbackUsed",
+            cameraLowConfBundle.guideCropFallbackUsed
+        )
+        assertTrue(
+            "Low-confidence camera input must set requiresManualCornerConfirmation == true",
+            cameraLowConfBundle.requiresManualCornerConfirmation
+        )
+        // Overlay corners must initialize from the guide crop rectangle converted to 4 corners
+        assertEquals(4, cameraLowConfBundle.detectedCornersNorm.size)
+        assertEquals(cameraGuideRect.left, cameraLowConfBundle.detectedCornersNorm[0].x, 1e-4f)
+        assertEquals(cameraGuideRect.top, cameraLowConfBundle.detectedCornersNorm[0].y, 1e-4f)
+        assertEquals(cameraGuideRect.right, cameraLowConfBundle.detectedCornersNorm[2].x, 1e-4f)
+        assertEquals(cameraGuideRect.bottom, cameraLowConfBundle.detectedCornersNorm[2].y, 1e-4f)
+        assertTrue(cameraLowConfBundle.jpgResult.fileSizeKb <= targetMaxKb.toDouble())
+        assertTrue(cameraLowConfBundle.pdfSizeKb <= targetMaxKb.toDouble())
+
+        // 3. Gallery-style input (cropRectNorm == null) with high-confidence document quadrilateral:
+        //    automatic perspective warp executes.
+        val galleryHighConfBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = angledDocBmp,
+            maxKb = targetMaxKb,
+            cropRectNorm = null
+        )
+        assertNotNull(galleryHighConfBundle)
+        assertTrue(
+            "Gallery input with high-confidence document quad must execute automatic perspective warp",
+            galleryHighConfBundle!!.perspectiveWarped
+        )
+        assertFalse(galleryHighConfBundle.guideCropFallbackUsed)
+        assertFalse(galleryHighConfBundle.requiresManualCornerConfirmation)
+        assertTrue(galleryHighConfBundle.jpgResult.fileSizeKb <= targetMaxKb.toDouble())
+        assertTrue(galleryHighConfBundle.pdfSizeKb <= targetMaxKb.toDouble())
+
+        // 4. Gallery-style input (cropRectNorm == null) with low-confidence image:
+        //    automatic warp does NOT execute and requiresManualCornerConfirmation == true.
+        val galleryLowConfBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = uniformLowConfBmp,
+            maxKb = targetMaxKb,
+            cropRectNorm = null
+        )
+        assertNotNull(galleryLowConfBundle)
+        assertFalse(galleryLowConfBundle!!.perspectiveWarped)
+        assertFalse(galleryLowConfBundle.guideCropFallbackUsed)
+        assertTrue(galleryLowConfBundle.requiresManualCornerConfirmation)
+        // Overlay corners initialize from the safe default inset frame (0.07..0.93)
+        assertEquals(0.07f, galleryLowConfBundle.detectedCornersNorm[0].x, 1e-4f)
+        assertEquals(0.07f, galleryLowConfBundle.detectedCornersNorm[0].y, 1e-4f)
+
+        // 5. Manual customQuadNorm overrides both automatic detection and camera guide crop
+        val manualQuad = listOf(
+            android.graphics.PointF(0.20f, 0.22f),
+            android.graphics.PointF(0.80f, 0.22f),
+            android.graphics.PointF(0.80f, 0.78f),
+            android.graphics.PointF(0.20f, 0.78f)
+        )
+        val manualOverrideBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = angledDocBmp,
+            maxKb = targetMaxKb,
+            cropRectNorm = cameraGuideRect,
+            customQuadNorm = manualQuad
+        )
+        assertNotNull(manualOverrideBundle)
+        assertTrue(manualOverrideBundle!!.perspectiveWarped)
+        assertFalse(manualOverrideBundle.guideCropFallbackUsed)
+        assertFalse(manualOverrideBundle.requiresManualCornerConfirmation)
+        assertEquals(0.20f, manualOverrideBundle.detectedCornersNorm[0].x, 1e-4f)
+        assertEquals(0.22f, manualOverrideBundle.detectedCornersNorm[0].y, 1e-4f)
+        assertTrue(manualOverrideBundle.jpgResult.fileSizeKb <= targetMaxKb.toDouble())
+        assertTrue(manualOverrideBundle.pdfSizeKb <= targetMaxKb.toDouble())
+
+        // 6. Invalid customQuadNorm (self-intersecting bowtie, concave, collapsed, out-of-bounds, tiny)
+        //    is rejected and NEVER passed to warpDocumentPerspective()
+        val selfIntersectingQuad = listOf(
+            android.graphics.PointF(0.15f, 0.15f),
+            android.graphics.PointF(0.85f, 0.85f),
+            android.graphics.PointF(0.85f, 0.15f),
+            android.graphics.PointF(0.15f, 0.85f)
+        )
+        val rejectedBowtie = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = angledDocBmp,
+            maxKb = targetMaxKb,
+            cropRectNorm = cameraGuideRect,
+            customQuadNorm = selfIntersectingQuad
+        )
+        assertNull("Self-intersecting manual quad must be rejected before perspective warp", rejectedBowtie)
+
+        val tinyInvalidQuad = listOf(
+            android.graphics.PointF(0.48f, 0.48f),
+            android.graphics.PointF(0.52f, 0.48f),
+            android.graphics.PointF(0.52f, 0.52f),
+            android.graphics.PointF(0.48f, 0.52f)
+        )
+        val rejectedTiny = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = angledDocBmp,
+            maxKb = targetMaxKb,
+            customQuadNorm = tinyInvalidQuad
+        )
+        assertNull("Tiny manual quad below area threshold must be rejected before perspective warp", rejectedTiny)
+    }
+
+    @Test
+    fun testPhase3B3ReprocessingUsesOriginalBitmapResetsApprovalAndInvalidatesExportToken() = runBlocking {
+        // Construct a 500x500 original white-paper document bitmap where:
+        // - The entire sheet is pure white paper (255, 255, 255) so both narrow and wide crops pass white-background compliance
+        // - A dark ink header band is placed near the top of the original sheet (y in 30..45, normalized y in 0.06..0.09)
+        // First crop to a narrower inner region [0.20..0.80] (which excludes the y=0.06..0.09 header band),
+        // then re-run on the same originalBmp with wide corners [0.05..0.95] to prove reprocessing samples
+        // from originalBmp (recovering the dark ink header band at top of bundle2)!
+        val w = 500
+        val h = 500
+        val originalBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val inOuterHeaderInk = y in 30..45 && x in 150..350
+                originalBmp.setPixel(
+                    x,
+                    y,
+                    if (inOuterHeaderInk) Color.rgb(15, 15, 15) else Color.WHITE
+                )
+            }
+        }
+
+        val narrowQuad = listOf(
+            android.graphics.PointF(0.20f, 0.20f),
+            android.graphics.PointF(0.80f, 0.20f),
+            android.graphics.PointF(0.80f, 0.80f),
+            android.graphics.PointF(0.20f, 0.80f)
+        )
+        val bundle1 = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = originalBmp,
+            minKb = 1,
+            maxKb = 180,
+            applyClearScanFilter = false,
+            customQuadNorm = narrowQuad
+        )
+        assertNotNull(bundle1)
+        assertTrue("Compliant white document must pass technical compliance", bundle1!!.jpgResult.isCompliant)
+        assertFalse(bundle1.jpgResult.userPreviewAccepted)
+        assertFalse(bundle1.jpgResult.isExportReady)
+        // Narrow crop [0.20..0.80] does NOT contain the outer header ink (so mid-top is pure white)
+        val midTopPixelGen1 = bundle1.cleanedBitmap.getPixel(bundle1.cleanedBitmap.width / 2, 10)
+        assertTrue(Color.red(midTopPixelGen1) >= 240)
+
+        // Simulate user approving bundle1 and issuing a PDF export token
+        val bundle1Approved = bundle1.copy(
+            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(bundle1.jpgResult, true)
+        )
+        assertTrue(bundle1Approved.jpgResult.userPreviewAccepted)
+        assertTrue(bundle1Approved.jpgResult.isExportReady)
+        val gen1Id = com.example.ui.screens.newOneClickGenerationId()
+        val tokenGen1 = com.example.ui.screens.OneClickPdfExportToken.issueForBundle(gen1Id, bundle1Approved)
+
+        // 7 & 8. Re-run with adjusted wide corners [0.05..0.95] on originalBmp:
+        //    - Uses originalBmp (recovering the dark outer header ink at y ~ 10px of warped output!)
+        //    - Resets userPreviewAccepted == false and isExportReady == false
+        val wideQuad = listOf(
+            android.graphics.PointF(0.05f, 0.05f),
+            android.graphics.PointF(0.95f, 0.05f),
+            android.graphics.PointF(0.95f, 0.95f),
+            android.graphics.PointF(0.05f, 0.95f)
+        )
+        val bundle2 = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = originalBmp,
+            minKb = 1,
+            maxKb = 180,
+            applyClearScanFilter = false,
+            customQuadNorm = wideQuad
+        )
+        assertNotNull(bundle2)
+        val midTopPixelGen2 = bundle2!!.cleanedBitmap.getPixel(bundle2.cleanedBitmap.width / 2, 12)
+        assertTrue(
+            "Reprocessing with wider corners must sample from originalBmp and recover the outer header ink (expected dark <= 60, got ${Color.red(midTopPixelGen2)})",
+            Color.red(midTopPixelGen2) <= 60
+        )
+        assertFalse(
+            "Reprocessed bundle must reset userPreviewAccepted == false",
+            bundle2.jpgResult.userPreviewAccepted
+        )
+        assertFalse(
+            "Reprocessed bundle must reset isExportReady == false",
+            bundle2.jpgResult.isExportReady
+        )
+
+        // 9. New bundle generation invalidates any previous OneClickPdfExportToken
+        val gen2Id = com.example.ui.screens.newOneClickGenerationId()
+        org.junit.Assert.assertNotEquals(gen1Id, gen2Id)
+        val staleValidation = com.example.ui.screens.validateOneClickPdfExportSnapshot(
+            expectedToken = tokenGen1,
+            currentGenerationId = gen2Id,
+            currentBundle = bundle2
+        )
+        assertTrue(
+            "Previous generation token must be rejected as AbortedStaleGeneration after corner adjustment",
+            staleValidation is com.example.ui.screens.OneClickPdfExportOutcome.AbortedStaleGeneration
+        )
+    }
+
+    @Test
+    fun testPhase3B3PdfMasterComposeUiManualCornerAdjustmentApprovalResetAndInvalidQuadGuard() {
+        val originalDocBmp = createHighContrastAngledDocumentScene(400, 560)
+        val initialDetectedCorners = listOf(
+            android.graphics.PointF(0.16f, 0.14f),
+            android.graphics.PointF(0.86f, 0.18f),
+            android.graphics.PointF(0.82f, 0.86f),
+            android.graphics.PointF(0.12f, 0.82f)
+        )
+        val initialBundle = buildTestOneClickBundle(
+            namePrefix = "phase3b3_init",
+            pdfContent = "%PDF-1.4 INITIAL-GEN-1".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = true
+        ).copy(
+            detectedCornersNorm = initialDetectedCorners,
+            cornerConfidence = 0.88f,
+            perspectiveWarped = true,
+            requiresManualCornerConfirmation = false,
+            guideCropFallbackUsed = false
+        )
+
+        var latestBundle: OneClickPreparationCoordinator.OneClickDocumentBundle? = initialBundle
+        var latestGenerationId: String? = null
+        var latestPendingToken: com.example.ui.screens.OneClickPdfExportToken? = null
+
+        composeTestRule.setContent {
+            com.example.ui.screens.ImagesToPdfSection(
+                targetMinKb = 1,
+                initialOneClickOriginalBitmap = originalDocBmp,
+                initialOneClickBundle = initialBundle,
+                onPendingPdfExportTokenChanged = { latestPendingToken = it },
+                onOneClickBundleChanged = { bundle, genId ->
+                    latestBundle = bundle
+                    latestGenerationId = genId
+                }
+            )
+        }
+        composeTestRule.waitForIdle()
+        val initialGenId = latestGenerationId
+
+        // 1. Loaded One-Click document shows the "Adjust 4 Corners" action and initially approved export buttons
+        composeTestRule.onNodeWithTag("toggle_one_click_corners_btn").assertExists()
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOn()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsEnabled()
+
+        // 2. Toggling "Adjust 4 Corners" displays InteractiveCornerCropOverlay
+        composeTestRule.onNodeWithTag("toggle_one_click_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("corner_crop_canvas").assertExists()
+        composeTestRule.onNodeWithTag("apply_corners_btn").assertExists()
+        composeTestRule.onNodeWithTag("reset_corners_btn").assertExists()
+
+        // 5. Invalid dragged corners show a validation error, do NOT apply warp, and do NOT replace the current valid bundle
+        val canvasNode = composeTestRule.onNodeWithTag("corner_crop_canvas")
+        val canvasBounds = canvasNode.fetchSemanticsNode().boundsInRoot
+        val fit = com.example.ui.components.CornerOverlayCoordinateMapper.computeImageFitTransform(
+            bitmapWidth = originalDocBmp.width,
+            bitmapHeight = originalDocBmp.height,
+            canvasWidth = canvasBounds.width,
+            canvasHeight = canvasBounds.height
+        )
+        val tlCanvas = fit.bitmapNormalizedToCanvas(initialDetectedCorners[0])
+        val brCanvas = fit.bitmapNormalizedToCanvas(initialDetectedCorners[2])
+        val crossToInvalidDelta = androidx.compose.ui.geometry.Offset(
+            (brCanvas.x - tlCanvas.x) + fit.displayedWidth * 0.06f,
+            (brCanvas.y - tlCanvas.y) + fit.displayedHeight * 0.06f
+        )
+        canvasNode.performTouchInput {
+            down(tlCanvas)
+            moveBy(crossToInvalidDelta)
+            up()
+        }
+        composeTestRule.waitForIdle()
+
+        val bundleBeforeInvalidApply = latestBundle
+        val genIdBeforeInvalidApply = latestGenerationId
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+
+        // Validation error is displayed, overlay remains open, and current valid bundle is untouched
+        composeTestRule.onNodeWithTag("corner_crop_validation_error").assertExists()
+        composeTestRule.onNodeWithTag("corner_crop_canvas").assertExists()
+        org.junit.Assert.assertSame("Invalid manual corners must NOT replace the active valid bundle", bundleBeforeInvalidApply, latestBundle)
+        assertEquals("Invalid manual corners must NOT change the active generation ID", genIdBeforeInvalidApply, latestGenerationId)
+
+        // 6. Reset restores valid corners, clears the validation error, and triggers reprocessing
+        composeTestRule.onNodeWithTag("reset_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("corner_crop_validation_error").assertDoesNotExist()
+
+        // Wait for coroutine reprocessing to finish on main/IO
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            latestGenerationId != null && latestGenerationId != initialGenId
+        }
+        composeTestRule.waitForIdle()
+
+        // 3. Applying valid adjusted corners triggers reprocessing, resets preview acceptance checkbox,
+        //    and disables Save JPG, Save PDF, and Share until re-approved
+        val genAfterReset = latestGenerationId
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            latestGenerationId != null && latestGenerationId != genAfterReset
+        }
+        composeTestRule.waitForIdle()
+
+        assertNull("Reprocessing after corner adjustment must clear any pending PDF export token", latestPendingToken)
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+
+        // 4. Re-approving after corner adjustment enables Save JPG, Save PDF, and Share
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOn()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsEnabled()
+        assertTrue("Re-approved bundle must have isExportReady == true", latestBundle!!.jpgResult.isExportReady)
+    }
 }
+
 
 
 

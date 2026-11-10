@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.PointF
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Compare
 import androidx.compose.material.icons.filled.Compress
+import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -87,6 +89,8 @@ import com.example.data.portal.PortalDatabase
 import com.example.processing.ImageProcessor
 import com.example.processing.OneClickPreparationCoordinator
 import com.example.processing.PdfProcessor
+import com.example.ui.components.CornerOverlayCoordinateMapper
+import com.example.ui.components.InteractiveCornerCropOverlay
 import com.example.ui.components.PortalPresetSelectorBar
 import com.example.ui.theme.EmeraldTertiary
 import com.example.ui.theme.NavyPrimary
@@ -377,7 +381,9 @@ fun ImagesToPdfSection(
     targetDpi: Int = 200,
     initialOneClickOriginalBitmap: Bitmap? = null,
     initialOneClickBundle: OneClickPreparationCoordinator.OneClickDocumentBundle? = null,
-    onPendingPdfExportTokenChanged: ((OneClickPdfExportToken?) -> Unit)? = null
+    initialOneClickUseGuideCrop: Boolean = false,
+    onPendingPdfExportTokenChanged: ((OneClickPdfExportToken?) -> Unit)? = null,
+    onOneClickBundleChanged: ((OneClickPreparationCoordinator.OneClickDocumentBundle?, String?) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -385,6 +391,11 @@ fun ImagesToPdfSection(
     // 1-Click Single Document Dual JPG + PDF state
     var oneClickOriginalBitmap by remember { mutableStateOf(initialOneClickOriginalBitmap) }
     var oneClickBundle by remember { mutableStateOf(initialOneClickBundle) }
+    var oneClickUseGuideCrop by remember {
+        mutableStateOf(initialOneClickUseGuideCrop || initialOneClickBundle?.guideCropRectNorm != null)
+    }
+    var oneClickCustomQuadNorm by remember { mutableStateOf<List<PointF>?>(null) }
+    var showOneClickCornerOverlay by remember { mutableStateOf(false) }
     var currentBundleGenerationId by remember {
         mutableStateOf<String?>(if (initialOneClickBundle != null) newOneClickGenerationId() else null)
     }
@@ -402,13 +413,24 @@ fun ImagesToPdfSection(
         onPendingPdfExportTokenChanged?.invoke(newToken)
     }
 
+    LaunchedEffect(initialOneClickOriginalBitmap) {
+        if (initialOneClickOriginalBitmap != null && initialOneClickOriginalBitmap !== oneClickOriginalBitmap) {
+            oneClickOriginalBitmap = initialOneClickOriginalBitmap
+        }
+    }
+
     LaunchedEffect(initialOneClickBundle) {
         if (initialOneClickBundle != null && initialOneClickBundle !== oneClickBundle) {
             updatePendingPdfExportToken(null)
-            currentBundleGenerationId = newOneClickGenerationId()
+            val newGenId = newOneClickGenerationId()
+            currentBundleGenerationId = newGenId
             oneClickPreviewAccepted = initialOneClickBundle.jpgResult.userPreviewAccepted
             oneClickSaveMessage = null
+            if (initialOneClickBundle.guideCropRectNorm != null) {
+                oneClickUseGuideCrop = true
+            }
             oneClickBundle = initialOneClickBundle
+            onOneClickBundleChanged?.invoke(initialOneClickBundle, newGenId)
         }
     }
 
@@ -420,20 +442,39 @@ fun ImagesToPdfSection(
     var showCameraCapture by remember { mutableStateOf(false) }
     var generatedPageCount by remember { mutableIntStateOf(0) }
 
-    fun triggerOneClickDocumentPrepare(sourceBmp: Bitmap, useGuideCrop: Boolean) {
+    fun showSafeToast(message: String, duration: Int = Toast.LENGTH_SHORT) {
+        if (android.os.Looper.myLooper() != null) {
+            Toast.makeText(context, message, duration).show()
+        }
+    }
+
+    fun triggerOneClickDocumentPrepare(
+        sourceBmp: Bitmap,
+        useGuideCrop: Boolean,
+        customQuadNorm: List<PointF>? = null,
+        isNewInputSource: Boolean = false
+    ) {
         // Invalidate any pending PDF export token and reset preview approval immediately
         updatePendingPdfExportToken(null)
         currentBundleGenerationId = null
         oneClickPreviewAccepted = false
         oneClickSaveMessage = null
-        oneClickBundle = oneClickBundle?.let { prev ->
-            prev.copy(
-                jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
-                    prev.jpgResult,
-                    false
+        oneClickUseGuideCrop = useGuideCrop
+        if (isNewInputSource) {
+            oneClickCustomQuadNorm = null
+            showOneClickCornerOverlay = false
+            oneClickBundle = null
+        } else {
+            oneClickBundle = oneClickBundle?.let { prev ->
+                prev.copy(
+                    jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                        prev.jpgResult,
+                        false
+                    )
                 )
-            )
+            }
         }
+        onOneClickBundleChanged?.invoke(oneClickBundle, null)
         coroutineScope.launch {
             isOneClickProcessing = true
             oneClickSaveMessage = null
@@ -448,22 +489,26 @@ fun ImagesToPdfSection(
                     maxKb = targetMaxKb,
                     dpi = targetDpi,
                     applyClearScanFilter = true,
-                    cropRectNorm = cropRect
+                    cropRectNorm = cropRect,
+                    customQuadNorm = customQuadNorm
                 )
                 updatePendingPdfExportToken(null)
                 if (bundle != null) {
-                    currentBundleGenerationId = newOneClickGenerationId()
+                    val newGenId = newOneClickGenerationId()
+                    currentBundleGenerationId = newGenId
                     oneClickPreviewAccepted = bundle.jpgResult.userPreviewAccepted
                     oneClickBundle = bundle
-                    Toast.makeText(
-                        context,
-                        "1-Click Document Ready! JPG: ${String.format(Locale.US, "%.1f", bundle.jpgResult.fileSizeKb)} KB • PDF: ${String.format(Locale.US, "%.1f", bundle.pdfSizeKb)} KB",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    onOneClickBundleChanged?.invoke(bundle, newGenId)
+                    showSafeToast(
+                        "1-Click Document Ready! JPG: ${String.format(Locale.US, "%.1f", bundle.jpgResult.fileSizeKb)} KB • PDF: ${String.format(Locale.US, "%.1f", bundle.pdfSizeKb)} KB"
+                    )
                 } else {
                     currentBundleGenerationId = null
-                    oneClickBundle = null
-                    Toast.makeText(context, "1-Click document scan failed", Toast.LENGTH_SHORT).show()
+                    if (isNewInputSource) {
+                        oneClickBundle = null
+                    }
+                    onOneClickBundleChanged?.invoke(oneClickBundle, null)
+                    showSafeToast("1-Click document scan failed")
                 }
             } finally {
                 isOneClickProcessing = false
@@ -484,7 +529,12 @@ fun ImagesToPdfSection(
                     if (pickedBitmaps.isEmpty()) {
                         pickedBitmaps.add(bmp)
                     }
-                    triggerOneClickDocumentPrepare(bmp, useGuideCrop = false)
+                    triggerOneClickDocumentPrepare(
+                        sourceBmp = bmp,
+                        useGuideCrop = false,
+                        customQuadNorm = null,
+                        isNewInputSource = true
+                    )
                 } else {
                     Toast.makeText(context, "Unable to decode selected document.", Toast.LENGTH_SHORT).show()
                 }
@@ -505,7 +555,12 @@ fun ImagesToPdfSection(
                     if (pickedBitmaps.isEmpty()) {
                         pickedBitmaps.add(bmp)
                     }
-                    triggerOneClickDocumentPrepare(bmp, useGuideCrop = true)
+                    triggerOneClickDocumentPrepare(
+                        sourceBmp = bmp,
+                        useGuideCrop = true,
+                        customQuadNorm = null,
+                        isNewInputSource = true
+                    )
                 } else {
                     Toast.makeText(context, "Failed to decode captured document.", Toast.LENGTH_SHORT).show()
                 }
@@ -577,7 +632,12 @@ fun ImagesToPdfSection(
                         pickedBitmaps.add(bmp)
                         if (oneClickOriginalBitmap == null) {
                             oneClickOriginalBitmap = bmp
-                            triggerOneClickDocumentPrepare(bmp, useGuideCrop = false)
+                            triggerOneClickDocumentPrepare(
+                                sourceBmp = bmp,
+                                useGuideCrop = false,
+                                customQuadNorm = null,
+                                isNewInputSource = true
+                            )
                         }
                         addedCount++
                     }
@@ -599,7 +659,12 @@ fun ImagesToPdfSection(
                     pickedBitmaps.add(bmp)
                     if (oneClickOriginalBitmap == null) {
                         oneClickOriginalBitmap = bmp
-                        triggerOneClickDocumentPrepare(bmp, useGuideCrop = true)
+                        triggerOneClickDocumentPrepare(
+                            sourceBmp = bmp,
+                            useGuideCrop = true,
+                            customQuadNorm = null,
+                            isNewInputSource = true
+                        )
                     }
                 } else {
                     Toast.makeText(context, "Failed to decode captured page.", Toast.LENGTH_SHORT).show()
@@ -614,7 +679,12 @@ fun ImagesToPdfSection(
                         pickedBitmaps.add(bmp)
                         if (oneClickOriginalBitmap == null) {
                             oneClickOriginalBitmap = bmp
-                            triggerOneClickDocumentPrepare(bmp, useGuideCrop = true)
+                            triggerOneClickDocumentPrepare(
+                                sourceBmp = bmp,
+                                useGuideCrop = true,
+                                customQuadNorm = null,
+                                isNewInputSource = true
+                            )
                         }
                         added++
                     }
@@ -655,321 +725,410 @@ fun ImagesToPdfSection(
         }
     }
 
-    // 1. 1-Click Clear Scan Document Card (Dual JPG + PDF output under Portal Max KB)
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                    Text(
-                        text = "⚡ 1-Click Clear Scan (JPG + PDF)",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = "Auto-crop + Clear Scan contrast filter + Both JPG & PDF (<$targetMaxKb KB for ${selectedPortal.portalName})",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = { showSingleDocCamera = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.weight(1f).testTag("one_click_doc_camera_btn")
-                ) {
-                    Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("1-Click Cam Scan", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                }
-
-                OutlinedButton(
-                    onClick = {
-                        singleDocGalleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    },
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.weight(1f).testTag("one_click_doc_gallery_btn")
-                ) {
-                    Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Pick Document", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-
-            if (isOneClickProcessing) {
-                Spacer(modifier = Modifier.height(12.dp))
+    Column(modifier = Modifier.fillMaxWidth()) {
+        // 1. 1-Click Clear Scan Document Card (Dual JPG + PDF output under Portal Max KB)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+        ) {
+            Column(modifier = Modifier.padding(if (showOneClickCornerOverlay) 10.dp else 16.dp)) {
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Applying Clear Scan & preparing JPG + PDF (<$targetMaxKb KB)...", fontSize = 12.sp)
-                }
-            }
-
-            oneClickBundle?.let { bundle ->
-                Spacer(modifier = Modifier.height(12.dp))
-                Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
-                    border = androidx.compose.foundation.BorderStroke(1.5.dp, EmeraldTertiary)
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text(
+                            text = "⚡ 1-Click Clear Scan (JPG + PDF)",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        if (!showOneClickCornerOverlay) {
+                            Text(
+                                text = "Auto-crop + Clear Scan contrast filter + Both JPG & PDF (<$targetMaxKb KB for ${selectedPortal.portalName})",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    if (oneClickOriginalBitmap != null) {
+                        OutlinedButton(
+                            onClick = { showOneClickCornerOverlay = !showOneClickCornerOverlay },
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.testTag("toggle_one_click_corners_btn")
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldTertiary)
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "1-Click Clear Scan Ready!",
-                                    fontWeight = FontWeight.Bold,
-                                    color = EmeraldTertiary,
-                                    fontSize = 13.sp
+                            Icon(
+                                imageVector = Icons.Default.CropFree,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (showOneClickCornerOverlay) "Hide Corners" else "Adjust 4 Corners",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+
+                if (showOneClickCornerOverlay && oneClickOriginalBitmap != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    val effectiveGuideRect = oneClickBundle?.guideCropRectNorm
+                        ?: if (oneClickUseGuideCrop) CameraCaptureMode.DOCUMENT_PAGE.guideCropRectNorm else null
+                    val effectiveConfidence = oneClickBundle?.let { b ->
+                        if (b.cornerConfidence > 0f) {
+                            b.cornerConfidence
+                        } else if (b.detectedCornersNorm.size == 4 && b.guideCropRectNorm == null && !b.guideCropFallbackUsed) {
+                            0.75f
+                        } else {
+                            0f
+                        }
+                    } ?: 0f
+                    val initialOverlayCorners = remember(
+                        oneClickOriginalBitmap,
+                        oneClickCustomQuadNorm,
+                        oneClickBundle?.detectedCornersNorm,
+                        effectiveConfidence,
+                        effectiveGuideRect
+                    ) {
+                        OneClickPreparationCoordinator.resolveInitialOverlayCornersNorm(
+                            customQuadNorm = oneClickCustomQuadNorm,
+                            detectedCornersNorm = oneClickBundle?.detectedCornersNorm ?: emptyList(),
+                            cornerConfidence = effectiveConfidence,
+                            guideCropRectNorm = effectiveGuideRect
+                        )
+                    }
+
+                    InteractiveCornerCropOverlay(
+                        bitmap = oneClickOriginalBitmap!!,
+                        initialCornersNorm = initialOverlayCorners,
+                        confidence = oneClickBundle?.cornerConfidence ?: 0f,
+                        onApplyCorners = { corners ->
+                            val validation = CornerOverlayCoordinateMapper.validateManualDocumentQuad(corners)
+                            if (validation.isValid) {
+                                val appliedCopy = corners.map { PointF(it.x, it.y) }
+                                oneClickCustomQuadNorm = appliedCopy
+                                showOneClickCornerOverlay = false
+                                triggerOneClickDocumentPrepare(
+                                    sourceBmp = oneClickOriginalBitmap!!,
+                                    useGuideCrop = oneClickUseGuideCrop,
+                                    customQuadNorm = appliedCopy,
+                                    isNewInputSource = false
                                 )
+                            } else {
+                                val errMsg = validation.errorMessage
+                                    ?: "Invalid document corners. Please adjust into a convex quadrilateral."
+                                Toast.makeText(context, errMsg, Toast.LENGTH_SHORT).show()
                             }
-                            if (oneClickOriginalBitmap != null) {
-                                Surface(
-                                    color = NavyPrimary.copy(alpha = 0.1f),
-                                    shape = RoundedCornerShape(8.dp),
-                                    modifier = Modifier.clickable { showOneClickOriginalPreview = !showOneClickOriginalPreview }
+                        },
+                        onResetCorners = {
+                            oneClickCustomQuadNorm = null
+                            triggerOneClickDocumentPrepare(
+                                sourceBmp = oneClickOriginalBitmap!!,
+                                useGuideCrop = oneClickUseGuideCrop,
+                                customQuadNorm = null,
+                                isNewInputSource = false
+                            )
+                        },
+                        onInvalidCorners = { msg ->
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                } else {
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { showSingleDocCamera = true },
+                            colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.weight(1f).testTag("one_click_doc_camera_btn")
+                        ) {
+                            Icon(imageVector = Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("1-Click Cam Scan", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                singleDocGalleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.weight(1f).testTag("one_click_doc_gallery_btn")
+                        ) {
+                            Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Pick Document", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+
+                    if (isOneClickProcessing) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Applying Clear Scan & preparing JPG + PDF (<$targetMaxKb KB)...", fontSize = 12.sp)
+                        }
+                    }
+
+                    oneClickBundle?.let { bundle ->
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
+                            border = androidx.compose.foundation.BorderStroke(1.5.dp, EmeraldTertiary)
+                        ) {
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(imageVector = Icons.Default.Compare, contentDescription = null, tint = NavyPrimary, modifier = Modifier.size(13.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldTertiary)
+                                        Spacer(modifier = Modifier.width(6.dp))
                                         Text(
-                                            text = if (showOneClickOriginalPreview) "Showing: Before" else "Before / After",
-                                            fontSize = 10.sp,
+                                            text = "1-Click Clear Scan Ready!",
                                             fontWeight = FontWeight.Bold,
-                                            color = NavyPrimary
+                                            color = EmeraldTertiary,
+                                            fontSize = 13.sp
                                         )
+                                    }
+                                    if (oneClickOriginalBitmap != null) {
+                                        Surface(
+                                            color = NavyPrimary.copy(alpha = 0.1f),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.clickable { showOneClickOriginalPreview = !showOneClickOriginalPreview }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(imageVector = Icons.Default.Compare, contentDescription = null, tint = NavyPrimary, modifier = Modifier.size(13.dp))
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = if (showOneClickOriginalPreview) "Showing: Before" else "Before / After",
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = NavyPrimary
+                                                )
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                                Spacer(modifier = Modifier.height(8.dp))
 
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(160.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(Color.White)
-                                .border(1.dp, EmeraldTertiary.copy(alpha = 0.4f), RoundedCornerShape(8.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            val bmpToShow = if (showOneClickOriginalPreview && oneClickOriginalBitmap != null) {
-                                oneClickOriginalBitmap!!
-                            } else {
-                                bundle.cleanedBitmap
-                            }
-                            Image(
-                                bitmap = bmpToShow.asImageBitmap(),
-                                contentDescription = "Scanned Document Preview",
-                                modifier = Modifier.fillMaxSize().padding(6.dp),
-                                contentScale = ContentScale.Fit
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        val jpgKb = bundle.jpgResult.fileSizeKb
-                        val pdfKb = bundle.pdfSizeKb
-                        Text(
-                            text = "JPG: ${bundle.jpgResult.widthPx}×${bundle.jpgResult.heightPx} px • ${String.format(Locale.US, "%.1f", jpgKb)} KB  |  PDF: ${String.format(Locale.US, "%.1f", pdfKb)} KB (<$targetMaxKb KB)",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = NavyPrimary
-                        )
-
-                        if (oneClickSaveMessage != null) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "✓ $oneClickSaveMessage",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = EmeraldTertiary
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked = oneClickPreviewAccepted,
-                                onCheckedChange = { accepted ->
-                                    oneClickPreviewAccepted = accepted
-                                    if (!accepted) {
-                                        updatePendingPdfExportToken(null)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(160.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color.White)
+                                        .border(1.dp, EmeraldTertiary.copy(alpha = 0.4f), RoundedCornerShape(8.dp)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    val bmpToShow = if (showOneClickOriginalPreview && oneClickOriginalBitmap != null) {
+                                        oneClickOriginalBitmap!!
+                                    } else {
+                                        bundle.cleanedBitmap
                                     }
-                                    oneClickBundle?.let { currentBundle ->
-                                        oneClickBundle = currentBundle.copy(
-                                            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
-                                                currentBundle.jpgResult,
-                                                accepted
-                                            )
-                                        )
-                                    }
-                                },
-                                modifier = Modifier.testTag("pdf_one_click_preview_acceptance_checkbox")
-                            )
-                            Text(
-                                text = "I have reviewed the processed preview and approve it for export",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = NavyPrimary
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(6.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = {
-                                    val activeBundle = oneClickBundle
-                                    val activeGenId = currentBundleGenerationId
-                                    if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
-                                        Toast.makeText(
-                                            context,
-                                            ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        return@Button
-                                    }
-                                    val expectedToken = OneClickPdfExportToken.issueForBundle(
-                                        generationId = activeGenId,
-                                        bundle = activeBundle
+                                    Image(
+                                        bitmap = bmpToShow.asImageBitmap(),
+                                        contentDescription = "Scanned Document Preview",
+                                        modifier = Modifier.fillMaxSize().padding(6.dp),
+                                        contentScale = ContentScale.Fit
                                     )
-                                    coroutineScope.launch {
-                                        val latestBundle = oneClickBundle
-                                        val latestGenId = currentBundleGenerationId
-                                        val validationError = validateOneClickPdfExportSnapshot(
-                                            expectedToken = expectedToken,
-                                            currentGenerationId = latestGenId,
-                                            currentBundle = latestBundle
-                                        )
-                                        if (validationError != null || latestBundle == null) {
-                                            val msg = when (validationError) {
-                                                is OneClickPdfExportOutcome.AbortedStaleGeneration -> validationError.userMessage
-                                                else -> ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                val jpgKb = bundle.jpgResult.fileSizeKb
+                                val pdfKb = bundle.pdfSizeKb
+                                Text(
+                                    text = "JPG: ${bundle.jpgResult.widthPx}×${bundle.jpgResult.heightPx} px • ${String.format(Locale.US, "%.1f", jpgKb)} KB  |  PDF: ${String.format(Locale.US, "%.1f", pdfKb)} KB (<$targetMaxKb KB)",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = NavyPrimary
+                                )
+
+                                if (oneClickSaveMessage != null) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "✓ $oneClickSaveMessage",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = EmeraldTertiary
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Checkbox(
+                                        checked = oneClickPreviewAccepted,
+                                        onCheckedChange = { accepted ->
+                                            oneClickPreviewAccepted = accepted
+                                            if (!accepted) {
+                                                updatePendingPdfExportToken(null)
                                             }
-                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                            return@launch
-                                        }
-                                        val jpgFile = File(latestBundle.jpgResult.processedFilePath)
-                                        val uri = ImageProcessor.saveFileToGalleryMediaStore(
-                                            context = context,
-                                            sourceFile = jpgFile,
-                                            displayName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg",
-                                            mimeType = "image/jpeg"
-                                        )
-                                        if (uri.isSuccess) {
-                                            oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", latestBundle.jpgResult.fileSizeKb)} KB)"
-                                            Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
-                                        }
-                                    }
-                                },
-                                enabled = bundle.jpgResult.isExportReady,
-                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
-                                shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier.weight(1f).testTag("download_doc_jpg_btn")
-                            ) {
-                                Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Save JPG", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
-
-                            Button(
-                                onClick = {
-                                    val activeBundle = oneClickBundle
-                                    val activeGenId = currentBundleGenerationId
-                                    if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
-                                        updatePendingPdfExportToken(null)
-                                        Toast.makeText(
-                                            context,
-                                            ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        return@Button
-                                    }
-                                    updatePendingPdfExportToken(
-                                        OneClickPdfExportToken.issueForBundle(
-                                            generationId = activeGenId,
-                                            bundle = activeBundle
-                                        )
+                                            oneClickBundle?.let { currentBundle ->
+                                                val updatedBundle = currentBundle.copy(
+                                                    jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                                                        currentBundle.jpgResult,
+                                                        accepted
+                                                    )
+                                                )
+                                                oneClickBundle = updatedBundle
+                                                onOneClickBundleChanged?.invoke(updatedBundle, currentBundleGenerationId)
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("pdf_one_click_preview_acceptance_checkbox")
                                     )
-                                    val suggestedName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
-                                    saveOneClickPdfLauncher.launch(suggestedName)
-                                },
-                                enabled = bundle.jpgResult.isExportReady,
-                                colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
-                                shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier.weight(1f).testTag("download_doc_pdf_btn")
-                            ) {
-                                Icon(imageVector = Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(15.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Save PDF", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
-
-                            OutlinedButton(
-                                onClick = {
-                                    val activeBundle = oneClickBundle
-                                    if (activeBundle == null || !activeBundle.jpgResult.isExportReady) {
-                                        Toast.makeText(
-                                            context,
-                                            ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        return@OutlinedButton
-                                    }
-                                    sharePreparedFiles(
-                                        context,
-                                        listOf(File(activeBundle.jpgResult.processedFilePath), activeBundle.pdfFile)
+                                    Text(
+                                        text = "I have reviewed the processed preview and approve it for export",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = NavyPrimary
                                     )
-                                },
-                                enabled = bundle.jpgResult.isExportReady,
-                                shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier.testTag("share_doc_bundle_btn")
-                            ) {
-                                Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(15.dp))
+                                }
+
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            val activeBundle = oneClickBundle
+                                            val activeGenId = currentBundleGenerationId
+                                            if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
+                                                Toast.makeText(
+                                                    context,
+                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                                return@Button
+                                            }
+                                            val expectedToken = OneClickPdfExportToken.issueForBundle(
+                                                generationId = activeGenId,
+                                                bundle = activeBundle
+                                            )
+                                            coroutineScope.launch {
+                                                val latestBundle = oneClickBundle
+                                                val latestGenId = currentBundleGenerationId
+                                                val validationError = validateOneClickPdfExportSnapshot(
+                                                    expectedToken = expectedToken,
+                                                    currentGenerationId = latestGenId,
+                                                    currentBundle = latestBundle
+                                                )
+                                                if (validationError != null || latestBundle == null) {
+                                                    val msg = when (validationError) {
+                                                        is OneClickPdfExportOutcome.AbortedStaleGeneration -> validationError.userMessage
+                                                        else -> ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+                                                    }
+                                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                                    return@launch
+                                                }
+                                                val jpgFile = File(latestBundle.jpgResult.processedFilePath)
+                                                val uri = ImageProcessor.saveFileToGalleryMediaStore(
+                                                    context = context,
+                                                    sourceFile = jpgFile,
+                                                    displayName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg",
+                                                    mimeType = "image/jpeg"
+                                                )
+                                                if (uri.isSuccess) {
+                                                    oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", latestBundle.jpgResult.fileSizeKb)} KB)"
+                                                    Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
+                                                }
+                                            }
+                                        },
+                                        enabled = bundle.jpgResult.isExportReady,
+                                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.weight(1f).testTag("download_doc_jpg_btn")
+                                    ) {
+                                        Icon(imageVector = Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Save JPG", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            val activeBundle = oneClickBundle
+                                            val activeGenId = currentBundleGenerationId
+                                            if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
+                                                updatePendingPdfExportToken(null)
+                                                Toast.makeText(
+                                                    context,
+                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                                return@Button
+                                            }
+                                            updatePendingPdfExportToken(
+                                                OneClickPdfExportToken.issueForBundle(
+                                                    generationId = activeGenId,
+                                                    bundle = activeBundle
+                                                )
+                                            )
+                                            val suggestedName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
+                                            saveOneClickPdfLauncher.launch(suggestedName)
+                                        },
+                                        enabled = bundle.jpgResult.isExportReady,
+                                        colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.weight(1f).testTag("download_doc_pdf_btn")
+                                    ) {
+                                        Icon(imageVector = Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(15.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Save PDF", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            val activeBundle = oneClickBundle
+                                            if (activeBundle == null || !activeBundle.jpgResult.isExportReady) {
+                                                Toast.makeText(
+                                                    context,
+                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                                return@OutlinedButton
+                                            }
+                                            sharePreparedFiles(
+                                                context,
+                                                listOf(File(activeBundle.jpgResult.processedFilePath), activeBundle.pdfFile)
+                                            )
+                                        },
+                                        enabled = bundle.jpgResult.isExportReady,
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.testTag("share_doc_bundle_btn")
+                                    ) {
+                                        Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(15.dp))
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
 
     Spacer(modifier = Modifier.height(14.dp))
 
@@ -1252,6 +1411,7 @@ fun ImagesToPdfSection(
                 }
             }
         }
+    }
     }
 }
 

@@ -300,16 +300,72 @@ object OneClickPreparationCoordinator {
         val cleanedBitmap: Bitmap,
         val detectedCornersNorm: List<PointF> = emptyList(),
         val cornerConfidence: Float = 0f,
-        val perspectiveWarped: Boolean = false
+        val perspectiveWarped: Boolean = false,
+        val requiresManualCornerConfirmation: Boolean = false,
+        val guideCropFallbackUsed: Boolean = false,
+        val guideCropRectNorm: RectF? = null
     )
 
     /**
+     * Converts a normalized [RectF] guide frame into 4 clockwise normalized document corners:
+     * Top-Left, Top-Right, Bottom-Right, Bottom-Left, clamped to [0f, 1f].
+     */
+    fun rectToNormalizedQuadCorners(rect: RectF): List<PointF> {
+        val left = rect.left.coerceIn(0f, 1f)
+        val top = rect.top.coerceIn(0f, 1f)
+        val right = rect.right.coerceIn(left, 1f)
+        val bottom = rect.bottom.coerceIn(top, 1f)
+        return listOf(
+            PointF(left, top),
+            PointF(right, top),
+            PointF(right, bottom),
+            PointF(left, bottom)
+        )
+    }
+
+    /**
+     * Resolves the initial 4 normalized corners for the manual adjustment overlay:
+     * 1. Valid user-supplied [customQuadNorm] when present,
+     * 2. Otherwise [detectedCornersNorm] when available with positive detector confidence,
+     * 3. Otherwise [guideCropRectNorm] converted to 4 clockwise corners when camera guide crop was provided,
+     * 4. Otherwise the safe default inset frame.
+     */
+    fun resolveInitialOverlayCornersNorm(
+        customQuadNorm: List<PointF>? = null,
+        detectedCornersNorm: List<PointF> = emptyList(),
+        cornerConfidence: Float = 0f,
+        guideCropRectNorm: RectF? = null
+    ): List<PointF> {
+        if (customQuadNorm != null &&
+            com.example.ui.components.CornerOverlayCoordinateMapper.validateManualDocumentQuad(customQuadNorm).isValid
+        ) {
+            return customQuadNorm.map { PointF(it.x, it.y) }
+        }
+        if (cornerConfidence > 0f &&
+            detectedCornersNorm.size == 4 &&
+            com.example.ui.components.CornerOverlayCoordinateMapper.validateManualDocumentQuad(detectedCornersNorm).isValid
+        ) {
+            return detectedCornersNorm.map { PointF(it.x, it.y) }
+        }
+        if (guideCropRectNorm != null) {
+            val rectCorners = rectToNormalizedQuadCorners(guideCropRectNorm)
+            if (com.example.ui.components.CornerOverlayCoordinateMapper.validateManualDocumentQuad(rectCorners).isValid) {
+                return rectCorners
+            }
+        }
+        return DocumentCornerProcessor.DocumentQuadNorm.defaultInsetFrame().cornersNorm
+    }
+
+    /**
      * Executes the 1-Click Auto-Processing Pipeline for a Document / ID Card:
-     * 1. Runs 4-corner quadrilateral detection & homography perspective warp when [customQuadNorm] is provided
-     *    or when [DocumentCornerProcessor.detectDocumentCorners] autoWarpEligible is true; otherwise crops to
-     *    [cropRectNorm] / [UnifiedMediaInput.mappedSensorCropRectNorm].
-     * 2. Applies Clear Scan / Magic Scan enhancement filter (shadow removal + high-contrast text).
-     * 3. Generates both a compressed JPG and a single-page PDF strictly under [maxKb].
+     * 1. Priority 1: Valid user-supplied [customQuadNorm] (rejects invalid manual quads immediately).
+     * 2. Priority 2: Automatic detected corners when [DocumentCornerProcessor.detectDocumentCorners]
+     *    `autoWarpEligible == true` (unified across both Camera and Gallery inputs).
+     * 3. Priority 3: Conservative rectangular camera guide crop ([cropRectNorm] / [UnifiedMediaInput.mappedSensorCropRectNorm])
+     *    when automatic perspective correction is not eligible.
+     * 4. Priority 4: Uncropped original bitmap.
+     * 5. Applies Clear Scan / Magic Scan enhancement filter (shadow removal + high-contrast text).
+     * 6. Generates both a compressed JPG and a single-page PDF strictly under [maxKb].
      */
     suspend fun autoPrepareDocumentJpgAndPdf(
         context: Context,
@@ -327,21 +383,49 @@ object OneClickPreparationCoordinator {
         val rawBitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
         val effectiveCropRectNorm = cropRectNorm ?: input?.mappedSensorCropRectNorm
 
+        // Validate user-supplied manual quadrilateral before warping; never pass invalid quads to warpDocumentPerspective.
+        val validatedCustomQuad: List<PointF>? = if (customQuadNorm != null) {
+            val validation = com.example.ui.components.CornerOverlayCoordinateMapper.validateManualDocumentQuad(customQuadNorm)
+            if (!validation.isValid) {
+                return null
+            }
+            customQuadNorm.map { PointF(it.x, it.y) }
+        } else {
+            null
+        }
+
         val quadDetection = DocumentCornerProcessor.detectDocumentCorners(rawBitmap)
-        val activeQuad = customQuadNorm?.takeIf { it.size == 4 }
-            ?: if (effectiveCropRectNorm == null && quadDetection.autoWarpEligible) quadDetection.cornersNorm else null
+        val activeQuad: List<PointF>? = validatedCustomQuad
+            ?: if (quadDetection.autoWarpEligible && quadDetection.cornersNorm.size == 4) {
+                quadDetection.cornersNorm
+            } else {
+                null
+            }
 
         val perspectiveWarped: Boolean
+        val guideCropFallbackUsed: Boolean
         val geometricallyCorrected = if (activeQuad != null) {
             perspectiveWarped = true
+            guideCropFallbackUsed = false
             DocumentCornerProcessor.warpDocumentPerspective(rawBitmap, activeQuad)
         } else if (effectiveCropRectNorm != null) {
             perspectiveWarped = false
+            guideCropFallbackUsed = true
             ImageProcessor.cropBitmap(rawBitmap, effectiveCropRectNorm)
         } else {
             perspectiveWarped = false
+            guideCropFallbackUsed = false
             rawBitmap
         }
+
+        val requiresManualCornerConfirmation = validatedCustomQuad == null && !quadDetection.autoWarpEligible
+        val resolvedCornersNorm = resolveInitialOverlayCornersNorm(
+            customQuadNorm = validatedCustomQuad,
+            detectedCornersNorm = quadDetection.cornersNorm,
+            cornerConfidence = quadDetection.confidence,
+            guideCropRectNorm = effectiveCropRectNorm
+        )
+        val effectiveConfidence = if (validatedCustomQuad != null) 1.0f else quadDetection.confidence
 
         val enhanced = if (applyClearScanFilter) {
             ImageProcessor.applyMagicDocFilter(geometricallyCorrected)
@@ -388,9 +472,12 @@ object OneClickPreparationCoordinator {
             pdfFile = finalPdf,
             pdfSizeKb = finalPdf.length() / 1024.0,
             cleanedBitmap = enhanced,
-            detectedCornersNorm = quadDetection.cornersNorm,
-            cornerConfidence = quadDetection.confidence,
-            perspectiveWarped = perspectiveWarped
+            detectedCornersNorm = resolvedCornersNorm,
+            cornerConfidence = effectiveConfidence,
+            perspectiveWarped = perspectiveWarped,
+            requiresManualCornerConfirmation = requiresManualCornerConfirmation,
+            guideCropFallbackUsed = guideCropFallbackUsed,
+            guideCropRectNorm = effectiveCropRectNorm
         )
     }
 }

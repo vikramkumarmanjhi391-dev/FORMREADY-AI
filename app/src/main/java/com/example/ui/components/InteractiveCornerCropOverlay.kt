@@ -511,7 +511,7 @@ fun InteractiveCornerCropOverlay(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(260.dp)
+                    .height(210.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(Color(0xFF10141C)),
                 contentAlignment = Alignment.Center
