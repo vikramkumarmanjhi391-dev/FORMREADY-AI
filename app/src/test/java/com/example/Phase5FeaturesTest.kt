@@ -36,6 +36,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTouchInput
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -3352,7 +3353,371 @@ class Phase05AExportReadinessGateUiTest {
             throwingStreamOutcome is com.example.ui.screens.OneClickPdfExportOutcome.FailedFileOrStream
         )
     }
+
+    @Test
+    fun testPhase3B2ImageFitCoordinateMappingPortraitLandscapeSquareAndLetterboxing() {
+        val mapper = com.example.ui.components.CornerOverlayCoordinateMapper
+        val eps = 1e-4f
+
+        // 1 & 4. Portrait bitmap (600x900) inside a landscape Canvas (1000x600) -> horizontal letterboxing
+        val portraitInLandscape = mapper.computeImageFitTransform(
+            bitmapWidth = 600,
+            bitmapHeight = 900,
+            canvasWidth = 1000f,
+            canvasHeight = 600f
+        )
+        assertEquals(2f / 3f, portraitInLandscape.scale, eps)
+        assertEquals(400f, portraitInLandscape.displayedWidth, eps)
+        assertEquals(600f, portraitInLandscape.displayedHeight, eps)
+        assertEquals(300f, portraitInLandscape.offsetX, eps)
+        assertEquals(0f, portraitInLandscape.offsetY, eps)
+        assertTrue(portraitInLandscape.hasHorizontalLetterbox)
+        assertFalse(portraitInLandscape.hasVerticalLetterbox)
+
+        // Verify top-left (0,0) and bottom-right (1,1) map to (300,0) and (700,600), not (0,0) and (1000,600)
+        val pTlCanvas = portraitInLandscape.bitmapNormalizedToCanvas(android.graphics.PointF(0f, 0f))
+        val pBrCanvas = portraitInLandscape.bitmapNormalizedToCanvas(android.graphics.PointF(1f, 1f))
+        assertEquals(300f, pTlCanvas.x, eps)
+        assertEquals(0f, pTlCanvas.y, eps)
+        assertEquals(700f, pBrCanvas.x, eps)
+        assertEquals(600f, pBrCanvas.y, eps)
+
+        // Left & right letterbox areas must not be treated as displayed image pixels
+        assertFalse(portraitInLandscape.isInsideDisplayedImage(150f, 300f))
+        assertFalse(portraitInLandscape.isInsideDisplayedImage(850f, 300f))
+        assertTrue(portraitInLandscape.isInsideDisplayedImage(500f, 300f))
+
+        // 2 & 5. Landscape bitmap (1200x600) inside a portrait Canvas (600x900) -> vertical letterboxing
+        val landscapeInPortrait = mapper.computeImageFitTransform(
+            bitmapWidth = 1200,
+            bitmapHeight = 600,
+            canvasWidth = 600f,
+            canvasHeight = 900f
+        )
+        assertEquals(0.5f, landscapeInPortrait.scale, eps)
+        assertEquals(600f, landscapeInPortrait.displayedWidth, eps)
+        assertEquals(300f, landscapeInPortrait.displayedHeight, eps)
+        assertEquals(0f, landscapeInPortrait.offsetX, eps)
+        assertEquals(300f, landscapeInPortrait.offsetY, eps)
+        assertFalse(landscapeInPortrait.hasHorizontalLetterbox)
+        assertTrue(landscapeInPortrait.hasVerticalLetterbox)
+
+        val lTlCanvas = landscapeInPortrait.bitmapNormalizedToCanvas(android.graphics.PointF(0f, 0f))
+        val lBrCanvas = landscapeInPortrait.bitmapNormalizedToCanvas(android.graphics.PointF(1f, 1f))
+        assertEquals(0f, lTlCanvas.x, eps)
+        assertEquals(300f, lTlCanvas.y, eps)
+        assertEquals(600f, lBrCanvas.x, eps)
+        assertEquals(600f, lBrCanvas.y, eps)
+        assertFalse(landscapeInPortrait.isInsideDisplayedImage(300f, 120f))
+        assertFalse(landscapeInPortrait.isInsideDisplayedImage(300f, 780f))
+        assertTrue(landscapeInPortrait.isInsideDisplayedImage(300f, 450f))
+
+        // 3. Square bitmap (500x500) inside rectangular Canvases (800x400 and 400x800)
+        val squareInWide = mapper.computeImageFitTransform(500, 500, 800f, 400f)
+        assertEquals(400f, squareInWide.displayedWidth, eps)
+        assertEquals(400f, squareInWide.displayedHeight, eps)
+        assertEquals(200f, squareInWide.offsetX, eps)
+        assertEquals(0f, squareInWide.offsetY, eps)
+        assertTrue(squareInWide.hasHorizontalLetterbox)
+
+        val squareInTall = mapper.computeImageFitTransform(500, 500, 400f, 800f)
+        assertEquals(400f, squareInTall.displayedWidth, eps)
+        assertEquals(400f, squareInTall.displayedHeight, eps)
+        assertEquals(0f, squareInTall.offsetX, eps)
+        assertEquals(200f, squareInTall.offsetY, eps)
+        assertTrue(squareInTall.hasVerticalLetterbox)
+
+        // 6. Normalized -> Canvas -> Normalized round-trip accuracy across all transforms
+        val samplePoints = listOf(
+            android.graphics.PointF(0f, 0f),
+            android.graphics.PointF(1f, 0f),
+            android.graphics.PointF(1f, 1f),
+            android.graphics.PointF(0f, 1f),
+            android.graphics.PointF(0.15f, 0.14f),
+            android.graphics.PointF(0.84f, 0.19f),
+            android.graphics.PointF(0.79f, 0.86f),
+            android.graphics.PointF(0.12f, 0.81f),
+            android.graphics.PointF(0.50f, 0.50f)
+        )
+        for (tf in listOf(portraitInLandscape, landscapeInPortrait, squareInWide, squareInTall)) {
+            for (pt in samplePoints) {
+                val canvasOffset = tf.bitmapNormalizedToCanvas(pt)
+                val roundTrip = tf.canvasToBitmapNormalized(canvasOffset)
+                assertEquals(pt.x, roundTrip.x, 1e-5f)
+                assertEquals(pt.y, roundTrip.y, 1e-5f)
+            }
+        }
+
+        // 7. Pointer mapping near all four image boundaries and inside letterbox bars
+        val leftLetterboxNorm = portraitInLandscape.canvasToBitmapNormalized(androidx.compose.ui.geometry.Offset(50f, 300f))
+        assertEquals(0f, leftLetterboxNorm.x, eps)
+        assertEquals(0.5f, leftLetterboxNorm.y, eps)
+
+        val rightLetterboxNorm = portraitInLandscape.canvasToBitmapNormalized(androidx.compose.ui.geometry.Offset(950f, 300f))
+        assertEquals(1f, rightLetterboxNorm.x, eps)
+        assertEquals(0.5f, rightLetterboxNorm.y, eps)
+
+        val topLetterboxNorm = landscapeInPortrait.canvasToBitmapNormalized(androidx.compose.ui.geometry.Offset(300f, 50f))
+        assertEquals(0.5f, topLetterboxNorm.x, eps)
+        assertEquals(0f, topLetterboxNorm.y, eps)
+
+        val bottomLetterboxNorm = landscapeInPortrait.canvasToBitmapNormalized(androidx.compose.ui.geometry.Offset(300f, 850f))
+        assertEquals(0.5f, bottomLetterboxNorm.x, eps)
+        assertEquals(1f, bottomLetterboxNorm.y, eps)
+
+        // Hit-testing uses displayed image coordinates and ignores letterbox taps
+        val corners = listOf(
+            android.graphics.PointF(0.10f, 0.10f),
+            android.graphics.PointF(0.90f, 0.10f),
+            android.graphics.PointF(0.90f, 0.90f),
+            android.graphics.PointF(0.10f, 0.90f)
+        )
+        // For portraitInLandscape (offsetX=300, displayedW=400, displayedH=600), TL (0.10, 0.10) is at (340, 60)
+        // Old broken Canvas-wide code would have placed TL at (100, 60) inside the left letterbox!
+        assertEquals(
+            "Touch at old un-letterboxed coordinate (100, 60) must NOT hit TL handle",
+            -1,
+            mapper.findNearestCornerHandleIndex(
+                pointerCanvas = androidx.compose.ui.geometry.Offset(100f, 60f),
+                cornersNorm = corners,
+                fitTransform = portraitInLandscape,
+                hitRadiusPx = 48f
+            )
+        )
+        assertEquals(
+            "Touch at true fitted image coordinate (340, 60) MUST hit TL handle (index 0)",
+            0,
+            mapper.findNearestCornerHandleIndex(
+                pointerCanvas = androidx.compose.ui.geometry.Offset(340f, 60f),
+                cornersNorm = corners,
+                fitTransform = portraitInLandscape,
+                hitRadiusPx = 48f
+            )
+        )
+
+        // 8. Dragging a corner without coordinate drift (200 micro-steps vs 1 single step, plus letterbox excursion recovery)
+        val startCorner = android.graphics.PointF(0.20f, 0.25f)
+        val stepDelta = androidx.compose.ui.geometry.Offset(0.6f, 0.45f)
+        var accumulated = androidx.compose.ui.geometry.Offset.Zero
+        var draggedCorner = startCorner
+        for (step in 1..200) {
+            accumulated += stepDelta
+            draggedCorner = mapper.dragCornerHandle(startCorner, accumulated, portraitInLandscape)
+        }
+        val singleStepCorner = mapper.dragCornerHandle(
+            startCornerNorm = startCorner,
+            totalDragCanvasDelta = androidx.compose.ui.geometry.Offset(120f, 90f),
+            fitTransform = portraitInLandscape
+        )
+        assertEquals("Zero horizontal drift after 200 drag steps", singleStepCorner.x, draggedCorner.x, 1e-6f)
+        assertEquals("Zero vertical drift after 200 drag steps", singleStepCorner.y, draggedCorner.y, 1e-6f)
+        // 120px on 400px displayedWidth = +0.30 -> 0.20 + 0.30 = 0.50; 90px on 600px displayedHeight = +0.15 -> 0.25 + 0.15 = 0.40
+        assertEquals(0.50f, draggedCorner.x, 1e-5f)
+        assertEquals(0.40f, draggedCorner.y, 1e-5f)
+    }
+
+    @Test
+    fun testPhase3B2ManualQuadrilateralValidationSelfIntersectingAndRotatedQuads() {
+        val mapper = com.example.ui.components.CornerOverlayCoordinateMapper
+
+        // 9A. Self-intersecting bowtie (top-right and bottom-right swapped so top and bottom edges cross)
+        val bowtieHorizontal = listOf(
+            android.graphics.PointF(0.15f, 0.15f),
+            android.graphics.PointF(0.85f, 0.85f),
+            android.graphics.PointF(0.85f, 0.15f),
+            android.graphics.PointF(0.15f, 0.85f)
+        )
+        val bowtieRes1 = mapper.validateManualDocumentQuad(bowtieHorizontal)
+        assertFalse("Self-intersecting horizontal bowtie must be rejected", bowtieRes1.isValid)
+        assertEquals(
+            com.example.ui.components.ManualQuadInvalidReason.SELF_INTERSECTING_EDGES,
+            bowtieRes1.invalidReason
+        )
+
+        // 9B. Self-intersecting figure-8 (top-right and bottom-left swapped so left and right edges cross)
+        val bowtieVertical = listOf(
+            android.graphics.PointF(0.15f, 0.15f),
+            android.graphics.PointF(0.15f, 0.85f),
+            android.graphics.PointF(0.85f, 0.85f),
+            android.graphics.PointF(0.85f, 0.15f)
+        )
+        val bowtieRes2 = mapper.validateManualDocumentQuad(bowtieVertical)
+        assertFalse("Reversed/crossed quad must be rejected", bowtieRes2.isValid)
+
+        // 9C. Concave dart (bottom-right pushed inward past the BL-TR diagonal)
+        val concaveDart = listOf(
+            android.graphics.PointF(0.15f, 0.15f),
+            android.graphics.PointF(0.85f, 0.15f),
+            android.graphics.PointF(0.35f, 0.35f),
+            android.graphics.PointF(0.15f, 0.85f)
+        )
+        val concaveRes = mapper.validateManualDocumentQuad(concaveDart)
+        assertFalse("Concave dart quadrilateral must be rejected", concaveRes.isValid)
+        assertEquals(
+            com.example.ui.components.ManualQuadInvalidReason.NON_CONVEX_OR_REVERSED_WINDING,
+            concaveRes.invalidReason
+        )
+
+        // 9D. Out-of-bounds, collapsed corners, and tiny area
+        val outOfBoundsQuad = listOf(
+            android.graphics.PointF(-0.05f, 0.10f),
+            android.graphics.PointF(0.85f, 0.10f),
+            android.graphics.PointF(0.85f, 0.85f),
+            android.graphics.PointF(0.10f, 0.85f)
+        )
+        assertFalse(mapper.validateManualDocumentQuad(outOfBoundsQuad).isValid)
+
+        val tinyQuad = listOf(
+            android.graphics.PointF(0.45f, 0.45f),
+            android.graphics.PointF(0.55f, 0.45f),
+            android.graphics.PointF(0.55f, 0.55f),
+            android.graphics.PointF(0.45f, 0.55f)
+        )
+        val tinyRes = mapper.validateManualDocumentQuad(tinyQuad)
+        assertFalse("Tiny quad below minimum area must be rejected", tinyRes.isValid)
+        assertEquals(com.example.ui.components.ManualQuadInvalidReason.AREA_TOO_SMALL, tinyRes.invalidReason)
+
+        // 10. Valid rotated quadrilaterals (25°, 42°, and 58° clockwise rotations)
+        // Note: At 58° rotation, topRight.y > bottomLeft.y and bottomLeft.x < topLeft.x, which would
+        // fail naive corner-by-corner axis-aligned checks, but must be ACCEPTED as a valid rotated quad!
+        for (deg in listOf(25.0, 42.0, 58.0, -35.0)) {
+            val rad = Math.toRadians(deg)
+            val cosA = kotlin.math.cos(rad).toFloat()
+            val sinA = kotlin.math.sin(rad).toFloat()
+            val cx = 0.50f
+            val cy = 0.50f
+            val hw = 0.22f
+            val hh = 0.28f
+
+            fun rotPt(lx: Float, ly: Float): android.graphics.PointF = android.graphics.PointF(
+                cx + lx * cosA - ly * sinA,
+                cy + lx * sinA + ly * cosA
+            )
+
+            val rotatedQuad = listOf(
+                rotPt(-hw, -hh),
+                rotPt(hw, -hh),
+                rotPt(hw, hh),
+                rotPt(-hw, hh)
+            )
+            val rotValidation = mapper.validateManualDocumentQuad(rotatedQuad)
+            assertTrue(
+                "Valid quadrilateral rotated by $deg degrees must be accepted (error=${rotValidation.errorMessage})",
+                rotValidation.isValid
+            )
+        }
+    }
+
+    @Test
+    fun testPhase3B2InteractiveCornerCropOverlayComposeUiDragValidationAndReset() {
+        val portraitBmp = Bitmap.createBitmap(300, 600, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        val initialCorners = listOf(
+            android.graphics.PointF(0.15f, 0.15f),
+            android.graphics.PointF(0.85f, 0.15f),
+            android.graphics.PointF(0.85f, 0.85f),
+            android.graphics.PointF(0.15f, 0.85f)
+        )
+
+        var appliedCorners: List<android.graphics.PointF>? = null
+        var invalidMessageReceived: String? = null
+        var resetCalledCount = 0
+
+        composeTestRule.setContent {
+            com.example.ui.components.InteractiveCornerCropOverlay(
+                bitmap = portraitBmp,
+                initialCornersNorm = initialCorners,
+                confidence = 0.72f,
+                onApplyCorners = { appliedCorners = it },
+                onResetCorners = { resetCalledCount++ },
+                onInvalidCorners = { invalidMessageReceived = it }
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        val canvasNode = composeTestRule.onNodeWithTag("corner_crop_canvas")
+        val canvasBounds = canvasNode.fetchSemanticsNode().boundsInRoot
+        val canvasW = canvasBounds.width
+        val canvasH = canvasBounds.height
+
+        val fit = com.example.ui.components.CornerOverlayCoordinateMapper.computeImageFitTransform(
+            bitmapWidth = portraitBmp.width,
+            bitmapHeight = portraitBmp.height,
+            canvasWidth = canvasW,
+            canvasHeight = canvasH
+        )
+        assertTrue("Portrait 300x600 bitmap in overlay must have horizontal letterbox", fit.hasHorizontalLetterbox)
+
+        // 1. Touch and drag in the left letterbox region (x = 10f) must NOT move any corner handle
+        val tlCanvasBefore = fit.bitmapNormalizedToCanvas(initialCorners[0])
+        canvasNode.performTouchInput {
+            down(androidx.compose.ui.geometry.Offset(5f, canvasH * 0.5f))
+            moveBy(androidx.compose.ui.geometry.Offset(25f, 25f))
+            up()
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        assertNotNull(appliedCorners)
+        assertEquals(0.15f, appliedCorners!![0].x, 1e-4f)
+        assertEquals(0.15f, appliedCorners!![0].y, 1e-4f)
+
+        // 2. Drag Top-Left handle from its fitted image position by (+0.10 * displayedWidth, +0.10 * displayedHeight)
+        val deltaCanvas = androidx.compose.ui.geometry.Offset(
+            fit.displayedWidth * 0.10f,
+            fit.displayedHeight * 0.10f
+        )
+        canvasNode.performTouchInput {
+            down(tlCanvasBefore)
+            moveBy(deltaCanvas * 0.5f)
+            moveBy(deltaCanvas * 0.5f)
+            up()
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(0.25f, appliedCorners!![0].x, 0.01f)
+        assertEquals(0.25f, appliedCorners!![0].y, 0.01f)
+
+        // 3. Drag Top-Left handle past Bottom-Right to create an invalid self-intersecting quadrilateral
+        val validSnapshotBeforeInvalidDrag = appliedCorners!!.map { android.graphics.PointF(it.x, it.y) }
+        val currentTlCanvas = fit.bitmapNormalizedToCanvas(validSnapshotBeforeInvalidDrag[0])
+        val brCanvas = fit.bitmapNormalizedToCanvas(validSnapshotBeforeInvalidDrag[2])
+        val crossDelta = androidx.compose.ui.geometry.Offset(
+            (brCanvas.x - currentTlCanvas.x) + fit.displayedWidth * 0.05f,
+            (brCanvas.y - currentTlCanvas.y) + fit.displayedHeight * 0.05f
+        )
+        canvasNode.performTouchInput {
+            down(currentTlCanvas)
+            moveBy(crossDelta)
+            up()
+        }
+        composeTestRule.waitForIdle()
+
+        // Clicking Apply Warp on an invalid self-intersecting quad must NOT invoke onApplyCorners
+        // and must show the validation error banner while retaining the previous valid state!
+        appliedCorners = null
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        assertNull("Invalid self-intersecting quad must NEVER be applied", appliedCorners)
+        assertNotNull("Invalid quad must report a clear correction message", invalidMessageReceived)
+        composeTestRule.onNodeWithTag("corner_crop_validation_error").assertExists()
+
+        // 4. Clicking Reset restores valid corners, clears the error banner, and allows Apply Warp
+        composeTestRule.onNodeWithTag("reset_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, resetCalledCount)
+        composeTestRule.onNodeWithTag("corner_crop_validation_error").assertDoesNotExist()
+
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        assertNotNull("Reset corners must be valid and apply cleanly", appliedCorners)
+        assertEquals(0.06f, appliedCorners!![0].x, 1e-4f)
+        assertEquals(0.06f, appliedCorners!![0].y, 1e-4f)
+    }
 }
+
 
 
 

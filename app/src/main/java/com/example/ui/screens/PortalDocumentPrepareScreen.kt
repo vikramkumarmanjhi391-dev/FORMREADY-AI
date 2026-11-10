@@ -79,6 +79,7 @@ import com.example.processing.DocumentCornerProcessor
 import com.example.processing.ImageProcessor
 import com.example.processing.OneClickPreparationCoordinator
 import com.example.processing.PdfProcessor
+import com.example.ui.components.CornerOverlayCoordinateMapper
 import com.example.ui.components.InteractiveCornerCropOverlay
 import com.example.ui.components.PhotoStudioAdjustBottomSheet
 import com.example.ui.components.SignatureStudioAdjustBottomSheet
@@ -235,12 +236,15 @@ fun PortalDocumentPrepareScreen(
                 else -> {
                     // Document / ID Card Pipeline (Phase 3B)
                     val quadDetection = DocumentCornerProcessor.detectDocumentCorners(bmp)
-                    detectedCornersNorm = quadDetection.cornersNorm
+                    val validCustomQuad = customQuad?.takeIf {
+                        CornerOverlayCoordinateMapper.validateManualDocumentQuad(it).isValid
+                    }
+                    detectedCornersNorm = validCustomQuad ?: quadDetection.cornersNorm
                     detectedCornerConfidence = quadDetection.confidence
 
                     val warpedBmp = when {
-                        customQuad != null && customQuad.size == 4 ->
-                            DocumentCornerProcessor.warpDocumentPerspective(bmp, customQuad)
+                        validCustomQuad != null ->
+                            DocumentCornerProcessor.warpDocumentPerspective(bmp, validCustomQuad)
                         quadDetection.autoWarpEligible ->
                             DocumentCornerProcessor.warpDocumentPerspective(bmp, quadDetection.cornersNorm)
                         else -> {
@@ -595,13 +599,23 @@ fun PortalDocumentPrepareScreen(
                         initialCornersNorm = detectedCornersNorm,
                         confidence = detectedCornerConfidence,
                         onApplyCorners = { corners ->
-                            showCornerOverlay = false
-                            userPreviewAccepted = false
-                            runPreparationPipeline(sourceBitmap!!, currentMediaInput, corners, false)
+                            val validation = CornerOverlayCoordinateMapper.validateManualDocumentQuad(corners)
+                            if (validation.isValid) {
+                                showCornerOverlay = false
+                                userPreviewAccepted = false
+                                runPreparationPipeline(sourceBitmap!!, currentMediaInput, corners, false)
+                            } else {
+                                val errMsg = validation.errorMessage
+                                    ?: "Invalid document corners. Please adjust into a convex quadrilateral."
+                                android.widget.Toast.makeText(context, errMsg, android.widget.Toast.LENGTH_SHORT).show()
+                            }
                         },
                         onResetCorners = {
                             userPreviewAccepted = false
                             runPreparationPipeline(sourceBitmap!!, currentMediaInput, null, false)
+                        },
+                        onInvalidCorners = { msg ->
+                            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
                         }
                     )
                 }
