@@ -205,6 +205,8 @@ fun PdfMasterScreen() {
 
 const val ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE =
     "Please review and accept the processed preview before exporting."
+const val ONE_CLICK_PDF_CORNER_CONFIRMATION_REQUIRED_MESSAGE =
+    "Please confirm or adjust the 4 document corners before exporting."
 const val ONE_CLICK_PDF_STALE_EXPORT_MESSAGE =
     "Document changed or preview approval was reset. Please review the current preview and start saving again."
 
@@ -292,6 +294,11 @@ fun validateOneClickPdfExportSnapshot(
     }
     if (!expectedToken.matchesBundle(currentGenerationId, currentBundle)) {
         return OneClickPdfExportOutcome.AbortedStaleGeneration()
+    }
+    if (currentBundle.requiresManualCornerConfirmation) {
+        return OneClickPdfExportOutcome.AbortedNotExportReady(
+            userMessage = ONE_CLICK_PDF_CORNER_CONFIRMATION_REQUIRED_MESSAGE
+        )
     }
     if (!currentBundle.jpgResult.isExportReady) {
         return OneClickPdfExportOutcome.AbortedNotExportReady()
@@ -383,7 +390,10 @@ fun ImagesToPdfSection(
     initialOneClickBundle: OneClickPreparationCoordinator.OneClickDocumentBundle? = null,
     initialOneClickUseGuideCrop: Boolean = false,
     onPendingPdfExportTokenChanged: ((OneClickPdfExportToken?) -> Unit)? = null,
-    onOneClickBundleChanged: ((OneClickPreparationCoordinator.OneClickDocumentBundle?, String?) -> Unit)? = null
+    onOneClickBundleChanged: ((OneClickPreparationCoordinator.OneClickDocumentBundle?, String?) -> Unit)? = null,
+    onOneClickProcessingChanged: ((Boolean) -> Unit)? = null,
+    documentPrepareRunner: (suspend (Bitmap, android.graphics.RectF?, List<PointF>?) -> OneClickPreparationCoordinator.OneClickDocumentBundle?)? = null,
+    onTriggerOneClickPrepareReady: (((sourceBmp: Bitmap, useGuideCrop: Boolean, customQuadNorm: List<PointF>?, isNewInputSource: Boolean) -> Long) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -401,6 +411,8 @@ fun ImagesToPdfSection(
     }
     var pendingPdfExportToken by remember { mutableStateOf<OneClickPdfExportToken?>(null) }
     var isOneClickProcessing by remember { mutableStateOf(false) }
+    val processingRequestSequence = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+    var activeProcessingRequestId by remember { mutableStateOf(0L) }
     var showOneClickOriginalPreview by remember { mutableStateOf(false) }
     var showSingleDocCamera by remember { mutableStateOf(false) }
     var oneClickSaveMessage by remember { mutableStateOf<String?>(null) }
@@ -411,6 +423,11 @@ fun ImagesToPdfSection(
     fun updatePendingPdfExportToken(newToken: OneClickPdfExportToken?) {
         pendingPdfExportToken = newToken
         onPendingPdfExportTokenChanged?.invoke(newToken)
+    }
+
+    fun updateOneClickProcessing(processing: Boolean) {
+        isOneClickProcessing = processing
+        onOneClickProcessingChanged?.invoke(processing)
     }
 
     LaunchedEffect(initialOneClickOriginalBitmap) {
@@ -453,7 +470,10 @@ fun ImagesToPdfSection(
         useGuideCrop: Boolean,
         customQuadNorm: List<PointF>? = null,
         isNewInputSource: Boolean = false
-    ) {
+    ): Long {
+        val requestId = processingRequestSequence.incrementAndGet()
+        activeProcessingRequestId = requestId
+
         // Invalidate any pending PDF export token and reset preview approval immediately
         updatePendingPdfExportToken(null)
         currentBundleGenerationId = null
@@ -475,23 +495,40 @@ fun ImagesToPdfSection(
             }
         }
         onOneClickBundleChanged?.invoke(oneClickBundle, null)
+        updateOneClickProcessing(true)
+
         coroutineScope.launch {
-            isOneClickProcessing = true
-            oneClickSaveMessage = null
             showOneClickOriginalPreview = false
             try {
                 val cropRect = if (useGuideCrop) CameraCaptureMode.DOCUMENT_PAGE.guideCropRectNorm else null
-                val bundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
-                    context = context,
-                    input = null,
-                    preDecodedBitmap = sourceBmp,
-                    minKb = targetMinKb,
-                    maxKb = targetMaxKb,
-                    dpi = targetDpi,
-                    applyClearScanFilter = true,
-                    cropRectNorm = cropRect,
-                    customQuadNorm = customQuadNorm
-                )
+                val bundle = if (documentPrepareRunner != null) {
+                    documentPrepareRunner.invoke(sourceBmp, cropRect, customQuadNorm)
+                } else {
+                    OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+                        context = context,
+                        input = null,
+                        preDecodedBitmap = sourceBmp,
+                        minKb = targetMinKb,
+                        maxKb = targetMaxKb,
+                        dpi = targetDpi,
+                        applyClearScanFilter = true,
+                        cropRectNorm = cropRect,
+                        customQuadNorm = customQuadNorm
+                    )
+                }
+
+                // Latest-request-wins guard: if a newer request started while this request was in flight,
+                // discard this stale result, clean up its temporary files safely, and never touch active state.
+                if (requestId != activeProcessingRequestId) {
+                    if (bundle != null) {
+                        OneClickPreparationCoordinator.cleanupBundleTempFiles(
+                            bundle = bundle,
+                            activeBundle = oneClickBundle
+                        )
+                    }
+                    return@launch
+                }
+
                 updatePendingPdfExportToken(null)
                 if (bundle != null) {
                     val newGenId = newOneClickGenerationId()
@@ -511,9 +548,16 @@ fun ImagesToPdfSection(
                     showSafeToast("1-Click document scan failed")
                 }
             } finally {
-                isOneClickProcessing = false
+                if (requestId == activeProcessingRequestId) {
+                    updateOneClickProcessing(false)
+                }
             }
         }
+        return requestId
+    }
+
+    LaunchedEffect(onTriggerOneClickPrepareReady) {
+        onTriggerOneClickPrepareReady?.invoke(::triggerOneClickDocumentPrepare)
     }
 
     val singleDocGalleryPicker = rememberLauncherForActivityResult(
@@ -1017,12 +1061,13 @@ fun ImagesToPdfSection(
                                         onClick = {
                                             val activeBundle = oneClickBundle
                                             val activeGenId = currentBundleGenerationId
-                                            if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
-                                                Toast.makeText(
-                                                    context,
-                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
+                                            if (activeBundle == null || activeGenId == null || !activeBundle.isExportReady) {
+                                                val msg = if (activeBundle?.requiresManualCornerConfirmation == true) {
+                                                    ONE_CLICK_PDF_CORNER_CONFIRMATION_REQUIRED_MESSAGE
+                                                } else {
+                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+                                                }
+                                                showSafeToast(msg, Toast.LENGTH_SHORT)
                                                 return@Button
                                             }
                                             val expectedToken = OneClickPdfExportToken.issueForBundle(
@@ -1040,9 +1085,10 @@ fun ImagesToPdfSection(
                                                 if (validationError != null || latestBundle == null) {
                                                     val msg = when (validationError) {
                                                         is OneClickPdfExportOutcome.AbortedStaleGeneration -> validationError.userMessage
+                                                        is OneClickPdfExportOutcome.AbortedNotExportReady -> validationError.userMessage
                                                         else -> ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
                                                     }
-                                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                                    showSafeToast(msg, Toast.LENGTH_SHORT)
                                                     return@launch
                                                 }
                                                 val jpgFile = File(latestBundle.jpgResult.processedFilePath)
@@ -1054,11 +1100,11 @@ fun ImagesToPdfSection(
                                                 )
                                                 if (uri.isSuccess) {
                                                     oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", latestBundle.jpgResult.fileSizeKb)} KB)"
-                                                    Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
+                                                    showSafeToast(oneClickSaveMessage!!, Toast.LENGTH_LONG)
                                                 }
                                             }
                                         },
-                                        enabled = bundle.jpgResult.isExportReady,
+                                        enabled = bundle.isExportReady,
                                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
                                         shape = RoundedCornerShape(8.dp),
                                         modifier = Modifier.weight(1f).testTag("download_doc_jpg_btn")
@@ -1072,13 +1118,14 @@ fun ImagesToPdfSection(
                                         onClick = {
                                             val activeBundle = oneClickBundle
                                             val activeGenId = currentBundleGenerationId
-                                            if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
+                                            if (activeBundle == null || activeGenId == null || !activeBundle.isExportReady) {
                                                 updatePendingPdfExportToken(null)
-                                                Toast.makeText(
-                                                    context,
-                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
+                                                val msg = if (activeBundle?.requiresManualCornerConfirmation == true) {
+                                                    ONE_CLICK_PDF_CORNER_CONFIRMATION_REQUIRED_MESSAGE
+                                                } else {
+                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+                                                }
+                                                showSafeToast(msg, Toast.LENGTH_SHORT)
                                                 return@Button
                                             }
                                             updatePendingPdfExportToken(
@@ -1090,7 +1137,7 @@ fun ImagesToPdfSection(
                                             val suggestedName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
                                             saveOneClickPdfLauncher.launch(suggestedName)
                                         },
-                                        enabled = bundle.jpgResult.isExportReady,
+                                        enabled = bundle.isExportReady,
                                         colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
                                         shape = RoundedCornerShape(8.dp),
                                         modifier = Modifier.weight(1f).testTag("download_doc_pdf_btn")
@@ -1103,12 +1150,13 @@ fun ImagesToPdfSection(
                                     OutlinedButton(
                                         onClick = {
                                             val activeBundle = oneClickBundle
-                                            if (activeBundle == null || !activeBundle.jpgResult.isExportReady) {
-                                                Toast.makeText(
-                                                    context,
-                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
+                                            if (activeBundle == null || !activeBundle.isExportReady) {
+                                                val msg = if (activeBundle?.requiresManualCornerConfirmation == true) {
+                                                    ONE_CLICK_PDF_CORNER_CONFIRMATION_REQUIRED_MESSAGE
+                                                } else {
+                                                    ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+                                                }
+                                                showSafeToast(msg, Toast.LENGTH_SHORT)
                                                 return@OutlinedButton
                                             }
                                             sharePreparedFiles(
@@ -1116,7 +1164,7 @@ fun ImagesToPdfSection(
                                                 listOf(File(activeBundle.jpgResult.processedFilePath), activeBundle.pdfFile)
                                             )
                                         },
-                                        enabled = bundle.jpgResult.isExportReady,
+                                        enabled = bundle.isExportReady,
                                         shape = RoundedCornerShape(8.dp),
                                         modifier = Modifier.testTag("share_doc_bundle_btn")
                                     ) {

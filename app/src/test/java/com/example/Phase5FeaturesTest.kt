@@ -4140,12 +4140,396 @@ class Phase05AExportReadinessGateUiTest {
         composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsEnabled()
         assertTrue("Re-approved bundle must have isExportReady == true", latestBundle!!.jpgResult.isExportReady)
     }
+
+    @Test
+    fun testPhase3B3_1ManualCornerConfirmationEnforcementAcrossValidatorAndComposeUi() = runBlocking {
+        // 1. High-contrast automatic perspective detection sets requiresManualCornerConfirmation = false
+        val angledDocBmp = createHighContrastAngledDocumentScene(420, 580)
+        val autoWarpedBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = angledDocBmp,
+            minKb = 1,
+            maxKb = 180
+        )
+        assertNotNull(autoWarpedBundle)
+        assertTrue(autoWarpedBundle!!.perspectiveWarped)
+        assertFalse(autoWarpedBundle.requiresManualCornerConfirmation)
+        val approvedAutoWarped = autoWarpedBundle.copy(
+            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(autoWarpedBundle.jpgResult, true)
+        )
+        assertTrue(approvedAutoWarped.isExportReady)
+
+        // 2. Low-confidence scene with guide crop fallback sets requiresManualCornerConfirmation = true
+        //    and cannot become export-ready merely by accepting the preview
+        val lowContrastBmp = Bitmap.createBitmap(400, 560, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        val guideRect = android.graphics.RectF(0.08f, 0.08f, 0.92f, 0.92f)
+        val guideFallbackBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = lowContrastBmp,
+            minKb = 1,
+            maxKb = 180,
+            cropRectNorm = guideRect
+        )
+        assertNotNull(guideFallbackBundle)
+        assertTrue(guideFallbackBundle!!.guideCropFallbackUsed)
+        assertFalse(guideFallbackBundle.perspectiveWarped)
+        assertTrue(guideFallbackBundle.requiresManualCornerConfirmation)
+
+        val previewAcceptedGuideFallback = guideFallbackBundle.copy(
+            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(guideFallbackBundle.jpgResult, true)
+        )
+        assertTrue(
+            "Underlying jpgResult may have userPreviewAccepted == true",
+            previewAcceptedGuideFallback.jpgResult.isExportReady
+        )
+        assertFalse(
+            "Low-confidence bundle with requiresManualCornerConfirmation == true must NOT become export-ready merely by accepting preview",
+            previewAcceptedGuideFallback.isExportReady
+        )
+
+        // 3. Low-confidence scene with no guide crop uses original bitmap and sets requiresManualCornerConfirmation = true
+        val uncroppedLowConfidenceBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
+            context = context,
+            input = null,
+            preDecodedBitmap = lowContrastBmp,
+            minKb = 1,
+            maxKb = 180,
+            cropRectNorm = null
+        )
+        assertNotNull(uncroppedLowConfidenceBundle)
+        assertFalse(uncroppedLowConfidenceBundle!!.guideCropFallbackUsed)
+        assertFalse(uncroppedLowConfidenceBundle.perspectiveWarped)
+        assertTrue(uncroppedLowConfidenceBundle.requiresManualCornerConfirmation)
+        val previewAcceptedUncropped = uncroppedLowConfidenceBundle.copy(
+            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(uncroppedLowConfidenceBundle.jpgResult, true)
+        )
+        assertFalse(previewAcceptedUncropped.isExportReady)
+
+        // 4. validateOneClickPdfExportSnapshot and executeValidatedOneClickPdfExport reject export
+        //    when requiresManualCornerConfirmation == true even if jpgResult.isExportReady == true
+        val lowConfGenId = com.example.ui.screens.newOneClickGenerationId()
+        val lowConfToken = com.example.ui.screens.OneClickPdfExportToken.issueForBundle(
+            lowConfGenId,
+            previewAcceptedGuideFallback
+        )
+        val validationError = com.example.ui.screens.validateOneClickPdfExportSnapshot(
+            expectedToken = lowConfToken,
+            currentGenerationId = lowConfGenId,
+            currentBundle = previewAcceptedGuideFallback
+        )
+        assertTrue(validationError is com.example.ui.screens.OneClickPdfExportOutcome.AbortedNotExportReady)
+        assertEquals(
+            com.example.ui.screens.ONE_CLICK_PDF_CORNER_CONFIRMATION_REQUIRED_MESSAGE,
+            (validationError as com.example.ui.screens.OneClickPdfExportOutcome.AbortedNotExportReady).userMessage
+        )
+
+        var streamOpenedForUnconfirmed = false
+        val exportOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = lowConfToken,
+            currentGenerationIdProvider = { lowConfGenId },
+            currentBundleProvider = { previewAcceptedGuideFallback },
+            outputStreamProvider = {
+                streamOpenedForUnconfirmed = true
+                java.io.ByteArrayOutputStream()
+            }
+        )
+        assertFalse("Output stream must never be opened when manual corner confirmation is required", streamOpenedForUnconfirmed)
+        assertTrue(exportOutcome is com.example.ui.screens.OneClickPdfExportOutcome.AbortedNotExportReady)
+
+        // 5. Compose UI enforcement:
+        //    - Start with a low-confidence bundle (requiresManualCornerConfirmation = true)
+        //    - Even after accepting the preview checkbox, Save JPG, Save PDF, and Share remain disabled
+        //    - Opening Adjust 4 Corners and applying valid corners clears requiresManualCornerConfirmation = false
+        //      and resets preview approval so fresh approval is required
+        //    - Re-approving enables Save JPG, Save PDF, and Share
+        //    - Resetting back to automatic detection on lowContrastBmp recalculates requiresManualCornerConfirmation = true
+        //      and blocks export again
+        var latestBundle: OneClickPreparationCoordinator.OneClickDocumentBundle? = guideFallbackBundle
+        var latestGenId: String? = null
+
+        composeTestRule.setContent {
+            com.example.ui.screens.ImagesToPdfSection(
+                targetMinKb = 1,
+                initialOneClickOriginalBitmap = lowContrastBmp,
+                initialOneClickBundle = guideFallbackBundle,
+                initialOneClickUseGuideCrop = true,
+                onOneClickBundleChanged = { b, g ->
+                    latestBundle = b
+                    latestGenId = g
+                }
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+
+        // Clicking preview acceptance checkbox while requiresManualCornerConfirmation == true must NOT enable export
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOn()
+        assertTrue(latestBundle!!.requiresManualCornerConfirmation)
+        assertFalse(latestBundle!!.isExportReady)
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+
+        // Open Adjust 4 Corners and apply valid quadrilateral
+        val genBeforeApply = latestGenId
+        composeTestRule.onNodeWithTag("toggle_one_click_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("apply_corners_btn").performClick()
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            latestGenId != null && latestGenId != genBeforeApply
+        }
+        composeTestRule.waitForIdle()
+
+        assertFalse(
+            "Applying valid manual corners must set requiresManualCornerConfirmation = false",
+            latestBundle!!.requiresManualCornerConfirmation
+        )
+        assertTrue(latestBundle!!.perspectiveWarped)
+        // Preview approval must be reset after manual corners are applied
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+
+        // Fresh user preview approval now enables Save JPG, Save PDF, and Share
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        assertTrue(latestBundle!!.isExportReady)
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsEnabled()
+
+        // Open Adjust 4 Corners and click Reset -> returns to low-confidence guide fallback,
+        // recalculating requiresManualCornerConfirmation = true and blocking export even if preview is checked
+        val genBeforeReset = latestGenId
+        composeTestRule.onNodeWithTag("toggle_one_click_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("reset_corners_btn").performClick()
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            latestGenId != null && latestGenId != genBeforeReset
+        }
+        composeTestRule.waitForIdle()
+
+        // Close corner overlay to inspect export controls
+        composeTestRule.onNodeWithTag("toggle_one_click_corners_btn").performClick()
+        composeTestRule.waitForIdle()
+
+        assertTrue(
+            "Resetting to low-confidence guide fallback must recalculate requiresManualCornerConfirmation == true",
+            latestBundle!!.requiresManualCornerConfirmation
+        )
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        assertFalse(
+            "Export must remain blocked after Reset when detection remains low-confidence",
+            latestBundle!!.isExportReady
+        )
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testPhase3B3_1ConcurrentReprocessingLatestRequestWinsAndStaleFileCleanup() = runBlocking {
+        val sourceBmp = createHighContrastAngledDocumentScene(360, 500)
+
+        val bundleA = buildTestOneClickBundle(
+            namePrefix = "phase3b3_1_reqA_stale",
+            pdfContent = "%PDF-1.4 STALE-REQUEST-A".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+        val bundleB = buildTestOneClickBundle(
+            namePrefix = "phase3b3_1_reqB_active",
+            pdfContent = "%PDF-1.4 LATEST-REQUEST-B".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+        val bundleD = buildTestOneClickBundle(
+            namePrefix = "phase3b3_1_reqD_active",
+            pdfContent = "%PDF-1.4 LATEST-REQUEST-D".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+        val bundleE = buildTestOneClickBundle(
+            namePrefix = "phase3b3_1_reqE_stale",
+            pdfContent = "%PDF-1.4 STALE-REQUEST-E".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+        val bundleF = buildTestOneClickBundle(
+            namePrefix = "phase3b3_1_reqF_active",
+            pdfContent = "%PDF-1.4 LATEST-REQUEST-F".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+
+        val deferredQueue = ArrayDeque<kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>>()
+        var latestBundle: OneClickPreparationCoordinator.OneClickDocumentBundle? = null
+        var latestGenId: String? = null
+        var isProcessing = false
+        var triggerFn: ((Bitmap, Boolean, List<android.graphics.PointF>?, Boolean) -> Long)? = null
+
+        composeTestRule.setContent {
+            com.example.ui.screens.ImagesToPdfSection(
+                targetMinKb = 1,
+                initialOneClickOriginalBitmap = sourceBmp,
+                onOneClickBundleChanged = { b, g ->
+                    latestBundle = b
+                    latestGenId = g
+                },
+                onOneClickProcessingChanged = { proc ->
+                    isProcessing = proc
+                },
+                documentPrepareRunner = { _, _, _ ->
+                    val nextDeferred = deferredQueue.removeFirst()
+                    nextDeferred.await()
+                },
+                onTriggerOneClickPrepareReady = { fn ->
+                    triggerFn = fn
+                }
+            )
+        }
+        composeTestRule.waitForIdle()
+        assertNotNull(triggerFn)
+
+        // Scenario 1: Request A starts, then Request B starts before A finishes; B finishes first, then A finishes later
+        val deferredA = kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>()
+        val deferredB = kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>()
+        deferredQueue.addLast(deferredA)
+        deferredQueue.addLast(deferredB)
+
+        var reqIdA = 0L
+        var reqIdB = 0L
+        composeTestRule.runOnIdle {
+            reqIdA = triggerFn!!.invoke(sourceBmp, true, null, false)
+            reqIdB = triggerFn!!.invoke(sourceBmp, false, null, false)
+        }
+        composeTestRule.waitForIdle()
+        assertTrue("Monotonically increasing request IDs required", reqIdB > reqIdA)
+        assertTrue("isOneClickProcessing must be true while Request B is active", isProcessing)
+
+        // Complete newer Request B first
+        deferredB.complete(bundleB)
+        composeTestRule.waitForIdle()
+
+        org.junit.Assert.assertSame("Active Request B must publish bundleB", bundleB, latestBundle)
+        val genIdB = latestGenId
+        assertNotNull("Active Request B must set a valid generation ID", genIdB)
+        assertFalse("isOneClickProcessing must become false when active Request B finishes", isProcessing)
+
+        // Approve bundleB and issue an export token before stale Request A finishes
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        assertTrue(latestBundle!!.isExportReady)
+        val approvedBundleB = latestBundle!!
+        val tokenB = com.example.ui.screens.OneClickPdfExportToken.issueForBundle(genIdB!!, approvedBundleB)
+
+        val staleJpgFileA = File(bundleA.jpgResult.processedFilePath)
+        val stalePdfFileA = bundleA.pdfFile
+        val activeJpgFileB = File(bundleB.jpgResult.processedFilePath)
+        val activePdfFileB = bundleB.pdfFile
+        assertTrue(staleJpgFileA.exists())
+        assertTrue(stalePdfFileA.exists())
+
+        // Now complete stale Request A after Request B has already been published and approved
+        deferredA.complete(bundleA)
+        composeTestRule.waitForIdle()
+
+        // Verify stale Request A NEVER overwrote bundleB, genIdB, preview approval, or tokenB validity
+        org.junit.Assert.assertSame(
+            "Stale Request A must NEVER overwrite newer approved bundleB",
+            approvedBundleB,
+            latestBundle
+        )
+        assertEquals(
+            "Stale Request A must NEVER overwrite newer generation ID genIdB",
+            genIdB,
+            latestGenId
+        )
+        assertTrue("Approved state on bundleB must remain intact", latestBundle!!.isExportReady)
+        assertNull(
+            "Export token for bundleB must remain valid after stale Request A is discarded",
+            com.example.ui.screens.validateOneClickPdfExportSnapshot(
+                expectedToken = tokenB,
+                currentGenerationId = latestGenId,
+                currentBundle = latestBundle
+            )
+        )
+        // Verify temporary files created by stale Request A were cleaned up while active bundleB files remain intact
+        assertFalse("Stale Request A JPG temp file must be deleted", staleJpgFileA.exists())
+        assertFalse("Stale Request A PDF temp file must be deleted", stalePdfFileA.exists())
+        assertTrue("Active Request B JPG file must NOT be deleted", activeJpgFileB.exists())
+        assertTrue("Active Request B PDF file must NOT be deleted", activePdfFileB.exists())
+
+        // Scenario 2: Stale failing request (Request C returns null after Request D succeeds with bundleD)
+        val deferredC = kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>()
+        val deferredD = kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>()
+        deferredQueue.addLast(deferredC)
+        deferredQueue.addLast(deferredD)
+
+        composeTestRule.runOnIdle {
+            triggerFn!!.invoke(sourceBmp, true, null, true)
+            triggerFn!!.invoke(sourceBmp, false, null, false)
+        }
+        composeTestRule.waitForIdle()
+
+        deferredD.complete(bundleD)
+        composeTestRule.waitForIdle()
+        org.junit.Assert.assertSame(bundleD, latestBundle)
+        val genIdD = latestGenId
+        assertNotNull(genIdD)
+
+        // Stale Request C fails with null -> must NOT clear bundleD or genIdD
+        deferredC.complete(null)
+        composeTestRule.waitForIdle()
+        org.junit.Assert.assertSame("Stale failed request must NEVER clear newer valid bundleD", bundleD, latestBundle)
+        assertEquals("Stale failed request must NEVER clear newer generation ID", genIdD, latestGenId)
+
+        // Scenario 3: Stale Request E finishes BEFORE active Request F finishes -> isProcessing stays true until F finishes
+        val deferredE = kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>()
+        val deferredF = kotlinx.coroutines.CompletableDeferred<OneClickPreparationCoordinator.OneClickDocumentBundle?>()
+        deferredQueue.addLast(deferredE)
+        deferredQueue.addLast(deferredF)
+
+        composeTestRule.runOnIdle {
+            triggerFn!!.invoke(sourceBmp, true, null, false)
+            triggerFn!!.invoke(sourceBmp, false, null, false)
+        }
+        composeTestRule.waitForIdle()
+        assertTrue(isProcessing)
+
+        // Complete stale Request E while Request F is still running
+        deferredE.complete(bundleE)
+        composeTestRule.waitForIdle()
+        assertTrue(
+            "isOneClickProcessing must remain true when stale Request E finishes while active Request F is still running",
+            isProcessing
+        )
+        assertFalse("Stale Request E temp PDF must be cleaned up immediately", bundleE.pdfFile.exists())
+
+        // Now complete active Request F
+        deferredF.complete(bundleF)
+        composeTestRule.waitForIdle()
+        assertFalse(
+            "isOneClickProcessing must become false once active Request F finishes",
+            isProcessing
+        )
+        org.junit.Assert.assertSame(bundleF, latestBundle)
+    }
 }
-
-
-
-
-
-
-
-

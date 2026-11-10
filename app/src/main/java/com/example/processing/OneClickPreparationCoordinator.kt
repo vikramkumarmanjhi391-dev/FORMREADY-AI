@@ -304,7 +304,31 @@ object OneClickPreparationCoordinator {
         val requiresManualCornerConfirmation: Boolean = false,
         val guideCropFallbackUsed: Boolean = false,
         val guideCropRectNorm: RectF? = null
-    )
+    ) {
+        val isExportReady: Boolean
+            get() = jpgResult.isExportReady && !requiresManualCornerConfirmation
+    }
+
+    /**
+     * Safely deletes temporary JPG and PDF output files created for a stale [bundle],
+     * ensuring that no file currently referenced by [activeBundle] is ever deleted.
+     */
+    fun cleanupBundleTempFiles(
+        bundle: OneClickDocumentBundle,
+        activeBundle: OneClickDocumentBundle? = null
+    ) {
+        val activeJpgPath = activeBundle?.jpgResult?.processedFilePath?.let { File(it).absolutePath }
+        val activePdfPath = activeBundle?.pdfFile?.absolutePath
+
+        val staleJpgFile = File(bundle.jpgResult.processedFilePath)
+        if (staleJpgFile.absolutePath != activeJpgPath && staleJpgFile.exists()) {
+            runCatching { staleJpgFile.delete() }
+        }
+        val stalePdfFile = bundle.pdfFile
+        if (stalePdfFile.absolutePath != activePdfPath && stalePdfFile.exists()) {
+            runCatching { stalePdfFile.delete() }
+        }
+    }
 
     /**
      * Converts a normalized [RectF] guide frame into 4 clockwise normalized document corners:
