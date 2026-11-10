@@ -59,6 +59,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -198,24 +199,218 @@ fun PdfMasterScreen() {
     }
 }
 
+const val ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE =
+    "Please review and accept the processed preview before exporting."
+const val ONE_CLICK_PDF_STALE_EXPORT_MESSAGE =
+    "Document changed or preview approval was reset. Please review the current preview and start saving again."
+
+private val nextOneClickGenerationSequence = java.util.concurrent.atomic.AtomicLong(0L)
+
+fun newOneClickGenerationId(): String {
+    val seq = nextOneClickGenerationSequence.incrementAndGet()
+    return "oneclick_gen_${seq}_${java.util.UUID.randomUUID()}"
+}
+
+/**
+ * Immutable generation token binding a pending PDF export request to the exact
+ * [OneClickPreparationCoordinator.OneClickDocumentBundle] snapshot whose preview was reviewed and approved.
+ */
+data class OneClickPdfExportToken(
+    val generationId: String,
+    val expectedRuleId: String,
+    val expectedJpgPath: String,
+    val expectedPdfPath: String,
+    val expectedBitmapIdentity: Int
+) {
+    fun matchesBundle(
+        currentGenerationId: String?,
+        currentBundle: OneClickPreparationCoordinator.OneClickDocumentBundle?
+    ): Boolean {
+        if (currentGenerationId == null || currentBundle == null) return false
+        return generationId == currentGenerationId &&
+            expectedRuleId == currentBundle.jpgResult.ruleId &&
+            expectedJpgPath == currentBundle.jpgResult.processedFilePath &&
+            expectedPdfPath == currentBundle.pdfFile.absolutePath &&
+            expectedBitmapIdentity == System.identityHashCode(currentBundle.cleanedBitmap)
+    }
+
+    companion object {
+        fun issueForBundle(
+            generationId: String,
+            bundle: OneClickPreparationCoordinator.OneClickDocumentBundle
+        ): OneClickPdfExportToken {
+            return OneClickPdfExportToken(
+                generationId = generationId,
+                expectedRuleId = bundle.jpgResult.ruleId,
+                expectedJpgPath = bundle.jpgResult.processedFilePath,
+                expectedPdfPath = bundle.pdfFile.absolutePath,
+                expectedBitmapIdentity = System.identityHashCode(bundle.cleanedBitmap)
+            )
+        }
+    }
+}
+
+sealed class OneClickPdfExportOutcome {
+    data class Success(
+        val validatedGenerationId: String,
+        val validatedBundle: OneClickPreparationCoordinator.OneClickDocumentBundle,
+        val exportedPdfFile: File,
+        val exportedBytes: Long,
+        val exportedSizeKb: Double,
+        val statusMessage: String
+    ) : OneClickPdfExportOutcome()
+
+    data class AbortedStaleGeneration(
+        val userMessage: String = ONE_CLICK_PDF_STALE_EXPORT_MESSAGE
+    ) : OneClickPdfExportOutcome()
+
+    data class AbortedNotExportReady(
+        val userMessage: String = ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+    ) : OneClickPdfExportOutcome()
+
+    data class FailedFileOrStream(
+        val userMessage: String
+    ) : OneClickPdfExportOutcome()
+}
+
+/**
+ * Validates that the current [OneClickPreparationCoordinator.OneClickDocumentBundle] still matches
+ * the [expectedToken] issued when the Save PDF action was initiated and that [isExportReady] is true.
+ * Returns `null` when valid, or the specific [OneClickPdfExportOutcome] abort reason otherwise.
+ */
+fun validateOneClickPdfExportSnapshot(
+    expectedToken: OneClickPdfExportToken?,
+    currentGenerationId: String?,
+    currentBundle: OneClickPreparationCoordinator.OneClickDocumentBundle?
+): OneClickPdfExportOutcome? {
+    if (expectedToken == null || currentGenerationId == null || currentBundle == null) {
+        return OneClickPdfExportOutcome.AbortedStaleGeneration()
+    }
+    if (!expectedToken.matchesBundle(currentGenerationId, currentBundle)) {
+        return OneClickPdfExportOutcome.AbortedStaleGeneration()
+    }
+    if (!currentBundle.jpgResult.isExportReady) {
+        return OneClickPdfExportOutcome.AbortedNotExportReady()
+    }
+    return null
+}
+
+/**
+ * Executes a snapshot-consistent One-Click PDF export:
+ * 1. Retrieves the current bundle and generation ID at execution time.
+ * 2. Requires that the current bundle still matches [expectedToken].
+ * 3. Re-checks `currentBundle.jpgResult.isExportReady`.
+ * 4. Copies `currentBundle.pdfFile` (never a separately captured file from another generation).
+ * 5. Verifies that `currentBundle.pdfFile` exists, is readable, and is non-empty.
+ * 6. Handles a null output stream or copy exceptions without reporting success.
+ */
+fun executeValidatedOneClickPdfExport(
+    expectedToken: OneClickPdfExportToken?,
+    currentGenerationIdProvider: () -> String?,
+    currentBundleProvider: () -> OneClickPreparationCoordinator.OneClickDocumentBundle?,
+    outputStreamProvider: () -> java.io.OutputStream?
+): OneClickPdfExportOutcome {
+    val currentGenId = currentGenerationIdProvider()
+    val currentBundle = currentBundleProvider()
+
+    val validationFailure = validateOneClickPdfExportSnapshot(
+        expectedToken = expectedToken,
+        currentGenerationId = currentGenId,
+        currentBundle = currentBundle
+    )
+    if (validationFailure != null) {
+        return validationFailure
+    }
+
+    val validatedBundle = currentBundle!!
+    val validatedGenId = currentGenId!!
+    val pdfFileToCopy = validatedBundle.pdfFile
+
+    if (!pdfFileToCopy.exists() || !pdfFileToCopy.isFile || !pdfFileToCopy.canRead() || pdfFileToCopy.length() <= 0L) {
+        return OneClickPdfExportOutcome.FailedFileOrStream(
+            "Failed to save PDF: Processed PDF file is missing or unreadable."
+        )
+    }
+
+    return try {
+        val outStream = outputStreamProvider()
+            ?: return OneClickPdfExportOutcome.FailedFileOrStream(
+                "Failed to save PDF: Unable to open destination file."
+            )
+
+        val copiedBytes = outStream.use { out ->
+            FileInputStream(pdfFileToCopy).use { inStream ->
+                val bytes = inStream.copyTo(out)
+                out.flush()
+                bytes
+            }
+        }
+
+        if (copiedBytes <= 0L) {
+            return OneClickPdfExportOutcome.FailedFileOrStream(
+                "Failed to save PDF: Copy wrote 0 bytes."
+            )
+        }
+
+        val exportedKb = copiedBytes / 1024.0
+        val statusMsg = "PDF saved (${String.format(Locale.US, "%.1f", exportedKb)} KB)"
+        OneClickPdfExportOutcome.Success(
+            validatedGenerationId = validatedGenId,
+            validatedBundle = validatedBundle,
+            exportedPdfFile = pdfFileToCopy,
+            exportedBytes = copiedBytes,
+            exportedSizeKb = exportedKb,
+            statusMessage = statusMsg
+        )
+    } catch (e: Exception) {
+        OneClickPdfExportOutcome.FailedFileOrStream(
+            "Failed to save PDF: ${e.message ?: "I/O error"}"
+        )
+    }
+}
+
 @Composable
 fun ImagesToPdfSection(
     selectedPortal: PortalSpec = PortalDatabase.getAllPortals().first(),
     targetMinKb: Int = 20,
     targetMaxKb: Int = 200,
-    targetDpi: Int = 200
+    targetDpi: Int = 200,
+    initialOneClickOriginalBitmap: Bitmap? = null,
+    initialOneClickBundle: OneClickPreparationCoordinator.OneClickDocumentBundle? = null,
+    onPendingPdfExportTokenChanged: ((OneClickPdfExportToken?) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
     // 1-Click Single Document Dual JPG + PDF state
-    var oneClickOriginalBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var oneClickBundle by remember { mutableStateOf<OneClickPreparationCoordinator.OneClickDocumentBundle?>(null) }
+    var oneClickOriginalBitmap by remember { mutableStateOf(initialOneClickOriginalBitmap) }
+    var oneClickBundle by remember { mutableStateOf(initialOneClickBundle) }
+    var currentBundleGenerationId by remember {
+        mutableStateOf<String?>(if (initialOneClickBundle != null) newOneClickGenerationId() else null)
+    }
+    var pendingPdfExportToken by remember { mutableStateOf<OneClickPdfExportToken?>(null) }
     var isOneClickProcessing by remember { mutableStateOf(false) }
     var showOneClickOriginalPreview by remember { mutableStateOf(false) }
     var showSingleDocCamera by remember { mutableStateOf(false) }
     var oneClickSaveMessage by remember { mutableStateOf<String?>(null) }
-    var oneClickPreviewAccepted by remember { mutableStateOf(false) }
+    var oneClickPreviewAccepted by remember {
+        mutableStateOf(initialOneClickBundle?.jpgResult?.userPreviewAccepted ?: false)
+    }
+
+    fun updatePendingPdfExportToken(newToken: OneClickPdfExportToken?) {
+        pendingPdfExportToken = newToken
+        onPendingPdfExportTokenChanged?.invoke(newToken)
+    }
+
+    LaunchedEffect(initialOneClickBundle) {
+        if (initialOneClickBundle != null && initialOneClickBundle !== oneClickBundle) {
+            updatePendingPdfExportToken(null)
+            currentBundleGenerationId = newOneClickGenerationId()
+            oneClickPreviewAccepted = initialOneClickBundle.jpgResult.userPreviewAccepted
+            oneClickSaveMessage = null
+            oneClickBundle = initialOneClickBundle
+        }
+    }
 
     // Multi-page PDF state
     val pickedBitmaps = remember { mutableStateListOf<Bitmap>() }
@@ -226,7 +421,19 @@ fun ImagesToPdfSection(
     var generatedPageCount by remember { mutableIntStateOf(0) }
 
     fun triggerOneClickDocumentPrepare(sourceBmp: Bitmap, useGuideCrop: Boolean) {
+        // Invalidate any pending PDF export token and reset preview approval immediately
+        updatePendingPdfExportToken(null)
+        currentBundleGenerationId = null
         oneClickPreviewAccepted = false
+        oneClickSaveMessage = null
+        oneClickBundle = oneClickBundle?.let { prev ->
+            prev.copy(
+                jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
+                    prev.jpgResult,
+                    false
+                )
+            )
+        }
         coroutineScope.launch {
             isOneClickProcessing = true
             oneClickSaveMessage = null
@@ -243,14 +450,19 @@ fun ImagesToPdfSection(
                     applyClearScanFilter = true,
                     cropRectNorm = cropRect
                 )
-                oneClickBundle = bundle
+                updatePendingPdfExportToken(null)
                 if (bundle != null) {
+                    currentBundleGenerationId = newOneClickGenerationId()
+                    oneClickPreviewAccepted = bundle.jpgResult.userPreviewAccepted
+                    oneClickBundle = bundle
                     Toast.makeText(
                         context,
                         "1-Click Document Ready! JPG: ${String.format(Locale.US, "%.1f", bundle.jpgResult.fileSizeKb)} KB • PDF: ${String.format(Locale.US, "%.1f", bundle.pdfSizeKb)} KB",
                         Toast.LENGTH_SHORT
                     ).show()
                 } else {
+                    currentBundleGenerationId = null
+                    oneClickBundle = null
                     Toast.makeText(context, "1-Click document scan failed", Toast.LENGTH_SHORT).show()
                 }
             } finally {
@@ -263,6 +475,7 @@ fun ImagesToPdfSection(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
+            updatePendingPdfExportToken(null)
             coroutineScope.launch {
                 val input = UnifiedMediaInput.fromGalleryUri(uri, CameraCaptureMode.DOCUMENT_PAGE)
                 val bmp = input.resolveBitmap(context)
@@ -284,6 +497,7 @@ fun ImagesToPdfSection(
             mode = CameraCaptureMode.DOCUMENT_PAGE,
             instantOneClickByDefault = true,
             onMediaCaptured = { input ->
+                updatePendingPdfExportToken(null)
                 val bmp = input.toBitmap(context)
                 input.cleanupPrivateCameraFileIfTemporary()
                 if (bmp != null) {
@@ -304,42 +518,46 @@ fun ImagesToPdfSection(
     val saveOneClickPdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { destUri: Uri? ->
-        val currentBundle = oneClickBundle
-        val pdfFile = currentBundle?.pdfFile
+        val expectedToken = pendingPdfExportToken
+        updatePendingPdfExportToken(null)
         if (destUri != null) {
-            if (currentBundle == null || pdfFile == null || !currentBundle.jpgResult.isExportReady) {
-                Toast.makeText(
-                    context,
-                    "Please review and accept the processed preview before exporting.",
-                    Toast.LENGTH_SHORT
-                ).show()
+            val immediateValidation = validateOneClickPdfExportSnapshot(
+                expectedToken = expectedToken,
+                currentGenerationId = currentBundleGenerationId,
+                currentBundle = oneClickBundle
+            )
+            if (immediateValidation != null) {
+                val msg = when (immediateValidation) {
+                    is OneClickPdfExportOutcome.AbortedStaleGeneration -> immediateValidation.userMessage
+                    is OneClickPdfExportOutcome.AbortedNotExportReady -> immediateValidation.userMessage
+                    is OneClickPdfExportOutcome.FailedFileOrStream -> immediateValidation.userMessage
+                    is OneClickPdfExportOutcome.Success -> ""
+                }
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 return@rememberLauncherForActivityResult
             }
             coroutineScope.launch(Dispatchers.IO) {
-                try {
-                    val latestBundle = oneClickBundle
-                    if (latestBundle == null || !latestBundle.jpgResult.isExportReady) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(
-                                context,
-                                "Please review and accept the processed preview before exporting.",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                val outcome = executeValidatedOneClickPdfExport(
+                    expectedToken = expectedToken,
+                    currentGenerationIdProvider = { currentBundleGenerationId },
+                    currentBundleProvider = { oneClickBundle },
+                    outputStreamProvider = { context.contentResolver.openOutputStream(destUri) }
+                )
+                withContext(Dispatchers.Main) {
+                    when (outcome) {
+                        is OneClickPdfExportOutcome.Success -> {
+                            oneClickSaveMessage = outcome.statusMessage
+                            Toast.makeText(context, outcome.statusMessage, Toast.LENGTH_LONG).show()
                         }
-                        return@launch
-                    }
-                    context.contentResolver.openOutputStream(destUri)?.use { out ->
-                        FileInputStream(pdfFile).use { inStream ->
-                            inStream.copyTo(out)
+                        is OneClickPdfExportOutcome.AbortedStaleGeneration -> {
+                            Toast.makeText(context, outcome.userMessage, Toast.LENGTH_SHORT).show()
                         }
-                    }
-                    withContext(Dispatchers.Main) {
-                        oneClickSaveMessage = "PDF saved (${String.format(Locale.US, "%.1f", pdfFile.length() / 1024.0)} KB)"
-                        Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Failed to save PDF: ${e.message}", Toast.LENGTH_SHORT).show()
+                        is OneClickPdfExportOutcome.AbortedNotExportReady -> {
+                            Toast.makeText(context, outcome.userMessage, Toast.LENGTH_SHORT).show()
+                        }
+                        is OneClickPdfExportOutcome.FailedFileOrStream -> {
+                            Toast.makeText(context, outcome.userMessage, Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
             }
@@ -609,6 +827,9 @@ fun ImagesToPdfSection(
                                 checked = oneClickPreviewAccepted,
                                 onCheckedChange = { accepted ->
                                     oneClickPreviewAccepted = accepted
+                                    if (!accepted) {
+                                        updatePendingPdfExportToken(null)
+                                    }
                                     oneClickBundle?.let { currentBundle ->
                                         oneClickBundle = currentBundle.copy(
                                             jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(
@@ -636,22 +857,34 @@ fun ImagesToPdfSection(
                         ) {
                             Button(
                                 onClick = {
-                                    if (!bundle.jpgResult.isExportReady) {
+                                    val activeBundle = oneClickBundle
+                                    val activeGenId = currentBundleGenerationId
+                                    if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
                                         Toast.makeText(
                                             context,
-                                            "Please review and accept the processed preview before exporting.",
+                                            ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
                                             Toast.LENGTH_SHORT
                                         ).show()
                                         return@Button
                                     }
+                                    val expectedToken = OneClickPdfExportToken.issueForBundle(
+                                        generationId = activeGenId,
+                                        bundle = activeBundle
+                                    )
                                     coroutineScope.launch {
                                         val latestBundle = oneClickBundle
-                                        if (latestBundle == null || !latestBundle.jpgResult.isExportReady) {
-                                            Toast.makeText(
-                                                context,
-                                                "Please review and accept the processed preview before exporting.",
-                                                Toast.LENGTH_SHORT
-                                            ).show()
+                                        val latestGenId = currentBundleGenerationId
+                                        val validationError = validateOneClickPdfExportSnapshot(
+                                            expectedToken = expectedToken,
+                                            currentGenerationId = latestGenId,
+                                            currentBundle = latestBundle
+                                        )
+                                        if (validationError != null || latestBundle == null) {
+                                            val msg = when (validationError) {
+                                                is OneClickPdfExportOutcome.AbortedStaleGeneration -> validationError.userMessage
+                                                else -> ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE
+                                            }
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                             return@launch
                                         }
                                         val jpgFile = File(latestBundle.jpgResult.processedFilePath)
@@ -662,7 +895,7 @@ fun ImagesToPdfSection(
                                             mimeType = "image/jpeg"
                                         )
                                         if (uri.isSuccess) {
-                                            oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", jpgKb)} KB)"
+                                            oneClickSaveMessage = "JPG saved to Gallery (${String.format(Locale.US, "%.1f", latestBundle.jpgResult.fileSizeKb)} KB)"
                                             Toast.makeText(context, oneClickSaveMessage, Toast.LENGTH_LONG).show()
                                         }
                                     }
@@ -679,14 +912,23 @@ fun ImagesToPdfSection(
 
                             Button(
                                 onClick = {
-                                    if (!bundle.jpgResult.isExportReady) {
+                                    val activeBundle = oneClickBundle
+                                    val activeGenId = currentBundleGenerationId
+                                    if (activeBundle == null || activeGenId == null || !activeBundle.jpgResult.isExportReady) {
+                                        updatePendingPdfExportToken(null)
                                         Toast.makeText(
                                             context,
-                                            "Please review and accept the processed preview before exporting.",
+                                            ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
                                             Toast.LENGTH_SHORT
                                         ).show()
                                         return@Button
                                     }
+                                    updatePendingPdfExportToken(
+                                        OneClickPdfExportToken.issueForBundle(
+                                            generationId = activeGenId,
+                                            bundle = activeBundle
+                                        )
+                                    )
                                     val suggestedName = "FormReady_Doc_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.pdf"
                                     saveOneClickPdfLauncher.launch(suggestedName)
                                 },
@@ -702,17 +944,18 @@ fun ImagesToPdfSection(
 
                             OutlinedButton(
                                 onClick = {
-                                    if (!bundle.jpgResult.isExportReady) {
+                                    val activeBundle = oneClickBundle
+                                    if (activeBundle == null || !activeBundle.jpgResult.isExportReady) {
                                         Toast.makeText(
                                             context,
-                                            "Please review and accept the processed preview before exporting.",
+                                            ONE_CLICK_PDF_APPROVAL_REQUIRED_MESSAGE,
                                             Toast.LENGTH_SHORT
                                         ).show()
                                         return@OutlinedButton
                                     }
                                     sharePreparedFiles(
                                         context,
-                                        listOf(File(bundle.jpgResult.processedFilePath), bundle.pdfFile)
+                                        listOf(File(activeBundle.jpgResult.processedFilePath), activeBundle.pdfFile)
                                     )
                                 },
                                 enabled = bundle.jpgResult.isExportReady,

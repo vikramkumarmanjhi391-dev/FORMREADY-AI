@@ -2627,7 +2627,314 @@ class Phase05AExportReadinessGateUiTest {
             .performScrollToNode(hasTestTag("share_all_portal_docs_btn"))
         composeTestRule.onNodeWithTag("share_all_portal_docs_btn").assertIsEnabled()
     }
+
+    private fun buildTestOneClickBundle(
+        namePrefix: String,
+        pdfContent: ByteArray,
+        isCompliant: Boolean = true,
+        technicalBackgroundCompliant: Boolean = true,
+        userPreviewAccepted: Boolean = false
+    ): OneClickPreparationCoordinator.OneClickDocumentBundle {
+        val jpgFile = createDummyProcessedFile("${namePrefix}.jpg")
+        val pdfFile = File(testDir, "${namePrefix}.pdf").apply {
+            writeBytes(pdfContent)
+        }
+        val cleanedBmp = Bitmap.createBitmap(400, 550, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        val baseJpgResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "rule_${namePrefix}",
+            documentType = DocumentType.AADHAAR_CARD,
+            originalFileName = jpgFile.name,
+            processedFilePath = jpgFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = jpgFile.length(),
+            fileSizeKb = jpgFile.length() / 1024.0,
+            widthPx = 400,
+            heightPx = 550,
+            isCompliant = isCompliant,
+            validationMessages = listOf(if (isCompliant) "Compliant" else "Failed"),
+            status = if (!isCompliant) {
+                com.example.data.model.PreparationStatus.SIZE_EXCEEDED
+            } else if (userPreviewAccepted) {
+                com.example.data.model.PreparationStatus.SUCCESS_PREPARED
+            } else {
+                com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL
+            },
+            dpi = 200,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = technicalBackgroundCompliant,
+            outputBackgroundPixelChecksPassed = technicalBackgroundCompliant,
+            backgroundReplacementApplied = technicalBackgroundCompliant,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = userPreviewAccepted
+        )
+        return OneClickPreparationCoordinator.OneClickDocumentBundle(
+            jpgResult = baseJpgResult,
+            pdfFile = pdfFile,
+            pdfSizeKb = pdfFile.length() / 1024.0,
+            cleanedBitmap = cleanedBmp
+        )
+    }
+
+    @Test
+    fun testPdfMasterOneClickPendingApprovedRemovedAndBundleReplacementInComposeUi() {
+        val sampleBmp = Bitmap.createBitmap(400, 550, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        val bundle1Pending = buildTestOneClickBundle(
+            namePrefix = "doc_gen1",
+            pdfContent = "%PDF-1.4 GEN-1 CONTENT AAAA".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+        val bundle2Pending = buildTestOneClickBundle(
+            namePrefix = "doc_gen2",
+            pdfContent = "%PDF-1.4 GEN-2 CONTENT BBBBBBBB".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = false
+        )
+
+        val bundleState = androidx.compose.runtime.mutableStateOf(bundle1Pending)
+        var latestPendingToken: com.example.ui.screens.OneClickPdfExportToken? = null
+
+        composeTestRule.setContent {
+            com.example.ui.screens.ImagesToPdfSection(
+                initialOneClickOriginalBitmap = sampleBmp,
+                initialOneClickBundle = bundleState.value,
+                onPendingPdfExportTokenChanged = { latestPendingToken = it }
+            )
+        }
+
+        // A. Pending approval: Save PDF, Save JPG, and Share bundle all disabled
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+
+        // B. Approved preview: All three actions become enabled after explicit approval
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOn()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsEnabled()
+
+        // C. Approval removed: Export becomes blocked again
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+        assertNull("Unchecking approval must clear any pending PDF export token", latestPendingToken)
+
+        // D. Re-approve bundle1, then replace bundle with bundle2Pending (simulating new scan/pick)
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsEnabled()
+
+        bundleState.value = bundle2Pending
+        composeTestRule.waitForIdle()
+
+        // Replacing bundle resets approval checkbox and blocks all export buttons for the new bundle
+        assertNull("Replacing bundle must invalidate pending PDF export token", latestPendingToken)
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testPdfMasterOneClickTechnicalFailureCannotBeOverriddenByApprovalInComposeUi() {
+        val sampleBmp = Bitmap.createBitmap(400, 550, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+        val nonCompliantBundle = buildTestOneClickBundle(
+            namePrefix = "doc_non_compliant",
+            pdfContent = "%PDF-1.4 NON-COMPLIANT".toByteArray(StandardCharsets.US_ASCII),
+            isCompliant = false,
+            technicalBackgroundCompliant = false,
+            userPreviewAccepted = false
+        )
+
+        composeTestRule.setContent {
+            com.example.ui.screens.ImagesToPdfSection(
+                initialOneClickOriginalBitmap = sampleBmp,
+                initialOneClickBundle = nonCompliantBundle
+            )
+        }
+
+        // Check the approval checkbox on a technically failed bundle
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pdf_one_click_preview_acceptance_checkbox").assertIsOn()
+
+        // All 3 export controls MUST remain disabled because technical compliance failed
+        composeTestRule.onNodeWithTag("download_doc_jpg_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("download_doc_pdf_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_doc_bundle_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testOneClickPdfSnapshotConsistencyStaleTokenRejectionAndFileStreamFailures() {
+        val pdf1Bytes = "%PDF-1.4 GENERATION-ONE-UNIQUE-PAYLOAD-11111".toByteArray(StandardCharsets.US_ASCII)
+        val pdf2Bytes = "%PDF-1.4 GENERATION-TWO-UNIQUE-PAYLOAD-2222222222".toByteArray(StandardCharsets.US_ASCII)
+
+        val bundle1Approved = buildTestOneClickBundle(
+            namePrefix = "snapshot_gen1",
+            pdfContent = pdf1Bytes,
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = true
+        )
+        val gen1Id = com.example.ui.screens.newOneClickGenerationId()
+        val token1 = com.example.ui.screens.OneClickPdfExportToken.issueForBundle(gen1Id, bundle1Approved)
+
+        val bundle2Approved = buildTestOneClickBundle(
+            namePrefix = "snapshot_gen2",
+            pdfContent = pdf2Bytes,
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = true
+        )
+        val gen2Id = com.example.ui.screens.newOneClickGenerationId()
+
+        // D1. Bundle replaced while SAF is open (even if new bundle2 is ALSO approved):
+        // Stale token1 MUST be rejected and neither pdf1 nor pdf2 may be copied under stale token1!
+        var streamOpenedForStaleGen = false
+        val staleGenOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = token1,
+            currentGenerationIdProvider = { gen2Id },
+            currentBundleProvider = { bundle2Approved },
+            outputStreamProvider = {
+                streamOpenedForStaleGen = true
+                java.io.ByteArrayOutputStream()
+            }
+        )
+        assertTrue(
+            "Stale generation token must abort with AbortedStaleGeneration",
+            staleGenOutcome is com.example.ui.screens.OneClickPdfExportOutcome.AbortedStaleGeneration
+        )
+        assertFalse("Output stream must never be opened when generation token is stale", streamOpenedForStaleGen)
+
+        // D2. Same generation ID string but bundle instance/files changed -> must also be rejected
+        var streamOpenedForMismatchedBundle = false
+        val mismatchedBundleOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = token1,
+            currentGenerationIdProvider = { gen1Id },
+            currentBundleProvider = { bundle2Approved },
+            outputStreamProvider = {
+                streamOpenedForMismatchedBundle = true
+                java.io.ByteArrayOutputStream()
+            }
+        )
+        assertTrue(
+            "Mismatched bundle under same generation ID must abort with AbortedStaleGeneration",
+            mismatchedBundleOutcome is com.example.ui.screens.OneClickPdfExportOutcome.AbortedStaleGeneration
+        )
+        assertFalse(streamOpenedForMismatchedBundle)
+
+        // C. Approval revoked on current bundle before SAF callback completes -> must abort with AbortedNotExportReady
+        val bundle1Unapproved = bundle1Approved.copy(
+            jpgResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(bundle1Approved.jpgResult, false)
+        )
+        var streamOpenedForUnapproved = false
+        val unapprovedOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = token1,
+            currentGenerationIdProvider = { gen1Id },
+            currentBundleProvider = { bundle1Unapproved },
+            outputStreamProvider = {
+                streamOpenedForUnapproved = true
+                java.io.ByteArrayOutputStream()
+            }
+        )
+        assertTrue(
+            "Unapproved current bundle must abort with AbortedNotExportReady",
+            unapprovedOutcome is com.example.ui.screens.OneClickPdfExportOutcome.AbortedNotExportReady
+        )
+        assertFalse("Output stream must never be opened when approval was revoked", streamOpenedForUnapproved)
+
+        // E. Current bundle consistency: Valid token2 for approved bundle2 copies strictly bundle2.pdfFile
+        val token2 = com.example.ui.screens.OneClickPdfExportToken.issueForBundle(gen2Id, bundle2Approved)
+        val destSink = java.io.ByteArrayOutputStream()
+        val successOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = token2,
+            currentGenerationIdProvider = { gen2Id },
+            currentBundleProvider = { bundle2Approved },
+            outputStreamProvider = { destSink }
+        )
+        assertTrue(
+            "Valid matching token for approved bundle must succeed",
+            successOutcome is com.example.ui.screens.OneClickPdfExportOutcome.Success
+        )
+        val success = successOutcome as com.example.ui.screens.OneClickPdfExportOutcome.Success
+        assertEquals(gen2Id, success.validatedGenerationId)
+        assertEquals(bundle2Approved.pdfFile.absolutePath, success.exportedPdfFile.absolutePath)
+        assertEquals(pdf2Bytes.size.toLong(), success.exportedBytes)
+        org.junit.Assert.assertArrayEquals(
+            "Copied PDF bytes must match currentBundle.pdfFile exactly and never a previous bundle's PDF",
+            pdf2Bytes,
+            destSink.toByteArray()
+        )
+        assertTrue(success.statusMessage.startsWith("PDF saved ("))
+
+        // F1. Missing PDF file -> FailedFileOrStream (never Success)
+        val missingBundle = buildTestOneClickBundle(
+            namePrefix = "snapshot_missing",
+            pdfContent = pdf1Bytes,
+            isCompliant = true,
+            technicalBackgroundCompliant = true,
+            userPreviewAccepted = true
+        )
+        val missingGenId = com.example.ui.screens.newOneClickGenerationId()
+        val missingToken = com.example.ui.screens.OneClickPdfExportToken.issueForBundle(missingGenId, missingBundle)
+        assertTrue(missingBundle.pdfFile.delete())
+        val missingOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = missingToken,
+            currentGenerationIdProvider = { missingGenId },
+            currentBundleProvider = { missingBundle },
+            outputStreamProvider = { java.io.ByteArrayOutputStream() }
+        )
+        assertTrue(
+            "Missing PDF file must return FailedFileOrStream without reporting success",
+            missingOutcome is com.example.ui.screens.OneClickPdfExportOutcome.FailedFileOrStream
+        )
+
+        // F2. Null OutputStream from ContentResolver -> FailedFileOrStream (never Success)
+        val nullStreamOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = token2,
+            currentGenerationIdProvider = { gen2Id },
+            currentBundleProvider = { bundle2Approved },
+            outputStreamProvider = { null }
+        )
+        assertTrue(
+            "Null output stream must return FailedFileOrStream without reporting success",
+            nullStreamOutcome is com.example.ui.screens.OneClickPdfExportOutcome.FailedFileOrStream
+        )
+
+        // F3. Copy exception -> FailedFileOrStream (never Success)
+        val throwingStreamOutcome = com.example.ui.screens.executeValidatedOneClickPdfExport(
+            expectedToken = token2,
+            currentGenerationIdProvider = { gen2Id },
+            currentBundleProvider = { bundle2Approved },
+            outputStreamProvider = {
+                object : OutputStream() {
+                    override fun write(b: Int) {
+                        throw java.io.IOException("Simulated disk full error")
+                    }
+                }
+            }
+        )
+        assertTrue(
+            "Copy failure must return FailedFileOrStream without reporting success",
+            throwingStreamOutcome is com.example.ui.screens.OneClickPdfExportOutcome.FailedFileOrStream
+        )
+    }
 }
+
 
 
 
