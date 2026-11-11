@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - Postponed
+  workflow_dispatch:
 
 permissions:
   contents: read
