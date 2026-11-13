@@ -1,0 +1,111 @@
+
+name: FormReady AI - Stable Debug APK
+
+on:
+  push:
+    branches:
+      - apk-build-stable-signing
+
+permissions:
+  contents: write
+
+concurrency:
+  group: formready-ai-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and publish stable-signed debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout app source from main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Restore persistent debug signing key
+        id: signing
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.FORMREADY_DEBUG_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_BASE64" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## APK build not started"
+              echo ""
+              echo "Add the repository Actions secret FORMREADY_DEBUG_KEYSTORE_BASE64, then push a new commit to apk-build-stable-signing."
+              echo "The build was safely skipped; no source files were changed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Missing FORMREADY_DEBUG_KEYSTORE_BASE64 repository secret. Build skipped."
+            exit 0
+          fi
+
+          printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > debug.keystore
+          test -s debug.keystore
+          keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java 17
+        if: steps.signing.outputs.configured == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        if: steps.signing.outputs.configured == 'true'
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        if: steps.signing.outputs.configured == 'true'
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        if: steps.signing.outputs.configured == 'true'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Build complete universal APK
+        if: steps.signing.outputs.configured == 'true'
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK signature, package and file hash
+        if: steps.signing.outputs.configured == 'true'
+        shell: bash
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep -E "^(package:|sdkVersion:|targetSdkVersion:)"
+          sha256sum "$APK"
+
+      - name: Upload APK as workflow artifact
+        if: steps.signing.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FormReady-AI-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish direct APK download as a GitHub prerelease
+        if: steps.signing.outputs.configured == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: formready-apk-test-${{ github.run_number }}-${{ github.run_attempt }}
+          name: FormReady AI Test APK ${{ github.run_number }}
+          target_commitish: main
+          prerelease: true
+          make_latest: false
+          generate_release_notes: false
+          body: |
+            Test build generated from the main branch.
+            This APK uses the persistent debug signing key configured in GitHub Actions Secrets.
+            It is a debug/test APK, not a Play Store release.
+          files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
