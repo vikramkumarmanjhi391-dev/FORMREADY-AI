@@ -2726,14 +2726,25 @@ class Phase05AExportReadinessGateUiTest {
         testDir.deleteRecursively()
     }
 
-    private fun createDummyProcessedFile(name: String = "prepared.jpg"): File {
+    private fun createDummyProcessedFile(
+        name: String = "prepared.jpg",
+        exactSizeBytes: Int = 14 * 1024
+    ): File {
         val file = File(testDir, name)
-        val bmp = Bitmap.createBitmap(350, 450, Bitmap.Config.ARGB_8888).apply {
+        val bmp = Bitmap.createBitmap(140, 60, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.WHITE)
         }
-        FileOutputStream(file).use { out ->
-            bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        val baos = java.io.ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+        val jpegBytes = baos.toByteArray()
+        val finalBytes = if (exactSizeBytes > jpegBytes.size) {
+            ByteArray(exactSizeBytes).also { dest ->
+                System.arraycopy(jpegBytes, 0, dest, 0, jpegBytes.size)
+            }
+        } else {
+            jpegBytes.copyOf(exactSizeBytes.coerceAtLeast(1))
         }
+        file.writeBytes(finalBytes)
         return file
     }
 
@@ -4142,7 +4153,7 @@ class Phase05AExportReadinessGateUiTest {
     }
 
     @Test
-    fun testPhase3B3_1ManualCornerConfirmationEnforcementAcrossValidatorAndComposeUi() = runBlocking {
+    fun testPhase3B3_1ManualCornerConfirmationEnforcementAcrossValidatorAndComposeUi(): Unit = runBlocking {
         // 1. High-contrast automatic perspective detection sets requiresManualCornerConfirmation = false
         val angledDocBmp = createHighContrastAngledDocumentScene(420, 580)
         val autoWarpedBundle = OneClickPreparationCoordinator.autoPrepareDocumentJpgAndPdf(
@@ -4340,7 +4351,7 @@ class Phase05AExportReadinessGateUiTest {
     }
 
     @Test
-    fun testPhase3B3_1ConcurrentReprocessingLatestRequestWinsAndStaleFileCleanup() = runBlocking {
+    fun testPhase3B3_1ConcurrentReprocessingLatestRequestWinsAndStaleFileCleanup(): Unit = runBlocking {
         val sourceBmp = createHighContrastAngledDocumentScene(360, 500)
 
         val bundleA = buildTestOneClickBundle(
@@ -4532,4 +4543,389 @@ class Phase05AExportReadinessGateUiTest {
         )
         org.junit.Assert.assertSame(bundleF, latestBundle)
     }
+
+    @Test
+    fun testPhase1SignatureStudio4_5KbBelow10KbMinimumMustNotShowReadyAndMustDisableSaveShare() {
+        // Real Motorola device scenario:
+        // Target dimensions: 140 × 60 px, Target DPI: 300, Allowed file size: 10–20 KB
+        // Actual output: 4.5 KB (4649 bytes), Ink ratio: 8.7%, Paper white: 99%
+        val actualFile4649 = createDummyProcessedFile("motorola_sign_4649b.jpg", exactSizeBytes = 4649)
+        assertEquals(4649L, actualFile4649.length())
+
+        val sampleBmp = Bitmap.createBitmap(140, 60, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+            for (x in 15 until 125) {
+                for (y in 26..31) {
+                    setPixel(x, y, Color.BLACK)
+                }
+            }
+        }
+
+        val evidence = com.example.data.model.SignatureValidationEvidence(
+            processingMethod = com.example.data.model.SignatureProcessingMethod.SAUVOLA_ADAPTIVE_THRESHOLD,
+            sauvolaExecuted = true,
+            usedGentleFallback = false,
+            fallbackReason = null,
+            verifiedInkPixelCount = 730,
+            inkPixelRatio = 0.087f,
+            minRequiredInkRatio = 0.015f,
+            maxAllowedInkRatio = 0.45f,
+            inkPresenceVerified = true,
+            inkRatioWithinBounds = true,
+            strokeBoundingBoxFound = true,
+            strokeBoxWidthRatio = 0.78f,
+            strokeBoxHeightRatio = 0.42f,
+            paperWhitenessRatio = 0.99f,
+            paperMeanLuminance = 253
+        )
+
+        val motorolaUnderMinResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "ssc_cgl_sign",
+            documentType = DocumentType.SIGNATURE_ENGLISH,
+            originalFileName = actualFile4649.name,
+            processedFilePath = actualFile4649.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = 4649L,
+            fileSizeKb = 4649.0 / 1024.0,
+            widthPx = 140,
+            heightPx = 60,
+            isCompliant = false,
+            validationMessages = listOf(
+                "File size (4.5 KB / 4649 bytes) is below the required portal minimum of 10 KB."
+            ),
+            status = com.example.data.model.PreparationStatus.SIZE_BELOW_MIN,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false,
+            signatureEvidence = evidence
+        )
+
+        // 1. Direct evaluation of evaluateSignatureStudioReadiness
+        val readiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = motorolaUnderMinResult,
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.FILE_SIZE_TOO_SMALL, readiness.status)
+        assertEquals(4649L, readiness.actualFileSizeBytes)
+        assertFalse("4.5 KB file with 10 KB minimum must fail meetsMinFileSize", readiness.meetsMinFileSize)
+        assertTrue(readiness.meetsMaxFileSize)
+        assertTrue(readiness.meetsDimensions)
+        assertTrue(readiness.meetsDpi)
+        assertFalse("4.5 KB file with 10 KB minimum must NOT be technically compliant", readiness.isTechnicallyCompliant)
+        assertFalse("4.5 KB file with 10 KB minimum must NOT be export ready", readiness.isExportReady)
+        assertFalse("4.5 KB file with 10 KB minimum must NOT allow Save or Share", readiness.canSaveOrShare)
+        assertEquals("File Size Too Small", readiness.badgeText)
+        assertEquals("File Size Too Small (4.5 KB)", readiness.inspectorStatusText)
+        org.junit.Assert.assertNotEquals("1-Click Ready", readiness.badgeText)
+
+        // 2. Compose UI verification across main badge, Quality Inspector, preview approval, Save, and Share
+        composeTestRule.setContent {
+            com.example.ui.screens.SignatureStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = motorolaUnderMinResult
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("sign_main_readiness_badge", useUnmergedTree = true).assertExists()
+        composeTestRule.onNodeWithText("1-Click Ready").assertDoesNotExist()
+        composeTestRule.onNodeWithText("File Size Too Small").assertExists()
+        composeTestRule.onNodeWithText("File Size Too Small (4.5 KB)").assertExists()
+        composeTestRule.onNodeWithText("Readiness: File Size Too Small").assertExists()
+
+        // Save, Download, Share, and Locker buttons must be disabled
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsNotEnabled()
+
+        // Even if the user checks the preview approval checkbox, it must STILL not show Ready or enable Save/Share
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").assertIsOn()
+        composeTestRule.onNodeWithText("1-Click Ready").assertDoesNotExist()
+        composeTestRule.onNodeWithText("File Size Too Small").assertExists()
+        composeTestRule.onNodeWithText("File Size Too Small (4.5 KB)").assertExists()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testPhase1SignatureStudioAboveMaxAndByteBoundaryAndDimensionDpiMismatchesNeverShowReady() {
+        val sampleBmp = Bitmap.createBitmap(140, 60, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+        }
+
+        // 1. File above maximum (24.5 KB = 25,088 bytes against 10–20 KB) must show "File Size Too Large", never Ready
+        val oversizedFile = createDummyProcessedFile("oversized_sign.jpg", exactSizeBytes = 25_088)
+        val oversizedResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "ssc_cgl_sign",
+            documentType = DocumentType.SIGNATURE_ENGLISH,
+            originalFileName = oversizedFile.name,
+            processedFilePath = oversizedFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = oversizedFile.length(),
+            fileSizeKb = oversizedFile.length() / 1024.0,
+            widthPx = 140,
+            heightPx = 60,
+            isCompliant = false,
+            validationMessages = listOf("File size exceeds maximum 20 KB"),
+            status = com.example.data.model.PreparationStatus.SIZE_EXCEEDED,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = true
+        )
+        val oversizedReadiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = oversizedResult,
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.FILE_SIZE_TOO_LARGE, oversizedReadiness.status)
+        assertEquals("File Size Too Large", oversizedReadiness.badgeText)
+        assertFalse(oversizedReadiness.isExportReady)
+        assertFalse(oversizedReadiness.canSaveOrShare)
+
+        // 2. Exact byte-boundary check: 10,239 bytes (9.999 KB, which rounds to "10.0 KB" in %.1f) is 1 byte below
+        //    10 * 1024 = 10,240 bytes, and even with correct 140x60 px, 300 DPI, and spoofed isCompliant = true,
+        //    evaluateSignatureStudioReadiness must use the actual byte count and reject it as FILE_SIZE_TOO_SMALL!
+        val boundaryUnderMinFile = createDummyProcessedFile("boundary_10239b.jpg", exactSizeBytes = 10_239)
+        val spoofedBoundaryUnderMin = oversizedResult.copy(
+            originalFileName = boundaryUnderMinFile.name,
+            processedFilePath = boundaryUnderMinFile.absolutePath,
+            fileSizeBytes = 15 * 1024L, // Spoofed pre-compression estimate
+            fileSizeKb = 15.0,
+            isCompliant = true,
+            status = com.example.data.model.PreparationStatus.SUCCESS_PREPARED
+        )
+        val boundaryUnderReadiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = spoofedBoundaryUnderMin,
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(
+            "Actual disk file of 10,239 bytes (< 10,240 bytes) must be rejected even if pre-compression size was 15 KB",
+            com.example.ui.screens.SignatureReadinessStatus.FILE_SIZE_TOO_SMALL,
+            boundaryUnderReadiness.status
+        )
+        assertEquals(10_239L, boundaryUnderReadiness.actualFileSizeBytes)
+        assertFalse(boundaryUnderReadiness.isExportReady)
+        assertFalse(boundaryUnderReadiness.canSaveOrShare)
+
+        // 3. Exact byte-boundary above max: 20,481 bytes (1 byte over 20 * 1024 = 20,480 bytes) with correct 140x60 & 300 DPI
+        val boundaryOverMaxFile = createDummyProcessedFile("boundary_20481b.jpg", exactSizeBytes = 20_481)
+        val boundaryOverMaxResult = oversizedResult.copy(
+            originalFileName = boundaryOverMaxFile.name,
+            processedFilePath = boundaryOverMaxFile.absolutePath,
+            fileSizeBytes = 20_481L,
+            fileSizeKb = 20_481.0 / 1024.0,
+            isCompliant = true,
+            status = com.example.data.model.PreparationStatus.SUCCESS_PREPARED
+        )
+        val boundaryOverReadiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = boundaryOverMaxResult,
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.FILE_SIZE_TOO_LARGE, boundaryOverReadiness.status)
+        assertFalse(boundaryOverReadiness.isExportReady)
+
+        // 4. Dimensions mismatch and DPI mismatch check
+        val valid14KbFile = createDummyProcessedFile("valid_14kb.jpg", exactSizeBytes = 14 * 1024)
+        val dimMismatchReadiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = oversizedResult.copy(
+                processedFilePath = valid14KbFile.absolutePath,
+                fileSizeBytes = valid14KbFile.length(),
+                fileSizeKb = 14.0,
+                widthPx = 120,
+                heightPx = 50,
+                status = com.example.data.model.PreparationStatus.DIMENSIONS_MISMATCH
+            ),
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.DIMENSIONS_MISMATCH, dimMismatchReadiness.status)
+        assertEquals("Dimensions Mismatch", dimMismatchReadiness.badgeText)
+        assertFalse(dimMismatchReadiness.isExportReady)
+
+        val dpiMismatchReadiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = oversizedResult.copy(
+                processedFilePath = valid14KbFile.absolutePath,
+                fileSizeBytes = valid14KbFile.length(),
+                fileSizeKb = 14.0,
+                widthPx = 140,
+                heightPx = 60,
+                dpi = 72,
+                status = com.example.data.model.PreparationStatus.DPI_MISMATCH
+            ),
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.DPI_MISMATCH, dpiMismatchReadiness.status)
+        assertEquals("DPI Mismatch", dpiMismatchReadiness.badgeText)
+        assertFalse(dpiMismatchReadiness.isExportReady)
+
+        // 5. Verify oversized result in Compose UI never shows "1-Click Ready" and keeps Save/Share disabled
+        composeTestRule.setContent {
+            com.example.ui.screens.SignatureStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = oversizedResult
+            )
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("1-Click Ready").assertDoesNotExist()
+        composeTestRule.onNodeWithText("File Size Too Large").assertExists()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testPhase1SignatureStudioCompliantFileShowsReadyOnlyAfterApprovalAndCompletedProcessingNeverOverridesFailedValidation(): Unit = runBlocking {
+        val sampleBmp = Bitmap.createBitmap(140, 60, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+            for (x in 15 until 125) {
+                for (y in 26..31) {
+                    setPixel(x, y, Color.BLACK)
+                }
+            }
+        }
+
+        // Part A: Real end-to-end processing of a 140x60 signature with 10-20 KB rule where output is < 10 KB:
+        // Processing itself completes and returns a non-null ProcessedFileResult, but validation fails (SIZE_BELOW_MIN)
+        // and must remain failed even after updateUserPreviewAcceptance(..., true).
+        val strictRule = DocumentRule(
+            id = "ssc_sign_strict_10_20",
+            documentType = DocumentType.SIGNATURE_ENGLISH,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 10,
+            maxKb = 20,
+            exactWidthPx = 140,
+            exactHeightPx = 60,
+            dpi = 300,
+            requiresWhiteBackground = true
+        )
+        val processedSmallSign = OneClickPreparationCoordinator.autoPrepareSignature(
+            context = context,
+            input = null,
+            rule = strictRule,
+            preDecodedBitmap = sampleBmp,
+            customWidthPx = 140,
+            customHeightPx = 60,
+            customTargetKb = 20,
+            customDpi = 300
+        )
+        assertNotNull("Image processing itself completes and produces a result", processedSmallSign)
+        assertTrue("Small 140x60 JPEG on disk is under 10 KB", processedSmallSign!!.fileSizeBytes < 10 * 1024L)
+        assertFalse("Technical compliance must be false when below minKb", processedSmallSign.isCompliant)
+        assertEquals(com.example.data.model.PreparationStatus.SIZE_BELOW_MIN, processedSmallSign.status)
+
+        val afterApprovalAttempt = OneClickPreparationCoordinator.updateUserPreviewAcceptance(processedSmallSign, true)
+        val readinessAfterAttempt = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = afterApprovalAttempt,
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.FILE_SIZE_TOO_SMALL, readinessAfterAttempt.status)
+        assertFalse("Failed validation must remain failed even after processing completed and preview was accepted", readinessAfterAttempt.isExportReady)
+        assertFalse(readinessAfterAttempt.canSaveOrShare)
+        org.junit.Assert.assertNotEquals("1-Click Ready", readinessAfterAttempt.badgeText)
+
+        // Part B: Fully compliant 14.0 KB file must show "Processing Complete — Awaiting Review" before approval,
+        // and show "1-Click Ready" / "Export Ready (14.0 KB)" ONLY after required preview approval.
+        val compliantFile = createDummyProcessedFile("compliant_14kb_sign.jpg", exactSizeBytes = 14 * 1024)
+        val pendingCompliantSign = com.example.data.model.ProcessedFileResult(
+            ruleId = strictRule.id,
+            documentType = DocumentType.SIGNATURE_ENGLISH,
+            originalFileName = compliantFile.name,
+            processedFilePath = compliantFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = compliantFile.length(),
+            fileSizeKb = compliantFile.length() / 1024.0,
+            widthPx = 140,
+            heightPx = 60,
+            isCompliant = true,
+            validationMessages = listOf("File size verified: 14.0 KB"),
+            status = com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false
+        )
+
+        val pendingReadiness = com.example.ui.screens.evaluateSignatureStudioReadiness(
+            result = pendingCompliantSign,
+            targetMinKb = 10,
+            targetMaxKb = 20,
+            targetWidthPx = 140,
+            targetHeightPx = 60,
+            targetDpi = 300
+        )
+        assertEquals(com.example.ui.screens.SignatureReadinessStatus.AWAITING_REVIEW, pendingReadiness.status)
+        assertTrue(pendingReadiness.isTechnicallyCompliant)
+        assertFalse("Must NOT be export-ready before user preview approval", pendingReadiness.isExportReady)
+        assertFalse(pendingReadiness.canSaveOrShare)
+        assertEquals("Processing Complete — Awaiting Review", pendingReadiness.badgeText)
+
+        composeTestRule.setContent {
+            com.example.ui.screens.SignatureStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = pendingCompliantSign
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        // Before approval: badge shows "Processing Complete — Awaiting Review", NOT "1-Click Ready"
+        composeTestRule.onNodeWithText("1-Click Ready").assertDoesNotExist()
+        composeTestRule.onNodeWithText("Processing Complete — Awaiting Review").assertExists()
+        composeTestRule.onNodeWithText("Processing Complete — Awaiting Review (14.0 KB)").assertExists()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsNotEnabled()
+
+        // Approve preview -> now and ONLY now shows "1-Click Ready" and "Export Ready (14.0 KB)" and enables Save/Share
+        composeTestRule.onNodeWithTag("sign_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("1-Click Ready").assertExists()
+        composeTestRule.onNodeWithText("Export Ready (14.0 KB)").assertExists()
+        composeTestRule.onNodeWithText("Readiness: Export Ready").assertExists()
+        composeTestRule.onNodeWithTag("instant_gallery_download_sign_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("save_signature_device_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("share_signature_btn").assertIsEnabled()
+        composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsEnabled()
+    }
 }
+

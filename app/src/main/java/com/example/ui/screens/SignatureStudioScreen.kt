@@ -99,6 +99,205 @@ import java.util.Locale
 const val SIGNATURE_FALLBACK_BUTTON_LABEL = "Gentle Ink Processing"
 const val SIGNATURE_FALLBACK_TOAST_MESSAGE = "Applied gentle ink processing (resize & KB rules applied)"
 
+enum class SignatureReadinessStatus(
+    val badgeText: String,
+    val inspectorTitle: String
+) {
+    ORIGINAL_SAMPLE(
+        badgeText = "Original Sample",
+        inspectorTitle = "Original Sample"
+    ),
+    EXPORT_READY(
+        badgeText = "1-Click Ready",
+        inspectorTitle = "Export Ready"
+    ),
+    AWAITING_REVIEW(
+        badgeText = "Processing Complete — Awaiting Review",
+        inspectorTitle = "Processing Complete — Awaiting Review"
+    ),
+    FILE_SIZE_TOO_SMALL(
+        badgeText = "File Size Too Small",
+        inspectorTitle = "File Size Too Small"
+    ),
+    FILE_SIZE_TOO_LARGE(
+        badgeText = "File Size Too Large",
+        inspectorTitle = "File Size Too Large"
+    ),
+    DIMENSIONS_MISMATCH(
+        badgeText = "Dimensions Mismatch",
+        inspectorTitle = "Dimensions Mismatch"
+    ),
+    DPI_MISMATCH(
+        badgeText = "DPI Mismatch",
+        inspectorTitle = "DPI Mismatch"
+    ),
+    QUALITY_REVIEW_REQUIRED(
+        badgeText = "Quality Review Required",
+        inspectorTitle = "Quality Review Required"
+    )
+}
+
+data class SignatureStudioReadinessState(
+    val status: SignatureReadinessStatus,
+    val isTechnicallyCompliant: Boolean,
+    val isExportReady: Boolean,
+    val canSaveOrShare: Boolean,
+    val actualFileSizeBytes: Long,
+    val actualFileSizeKb: Double,
+    val meetsMinFileSize: Boolean,
+    val meetsMaxFileSize: Boolean,
+    val meetsDimensions: Boolean,
+    val meetsDpi: Boolean,
+    val meetsSignatureQuality: Boolean,
+    val meetsPreviewApproval: Boolean,
+    val badgeText: String,
+    val inspectorStatusText: String
+)
+
+/**
+ * Authoritative readiness calculation for Signature & Thumb Studio.
+ * Evaluates the actual final file byte count, pixel dimensions, DPI verification,
+ * signature-specific ink/paper validation, and preview approval.
+ * Only when all 6 required conditions pass may the UI display "1-Click Ready" or enable Save/Share.
+ */
+fun evaluateSignatureStudioReadiness(
+    result: ProcessedFileResult?,
+    targetMinKb: Int,
+    targetMaxKb: Int,
+    targetWidthPx: Int,
+    targetHeightPx: Int,
+    targetDpi: Int
+): SignatureStudioReadinessState {
+    if (result == null) {
+        return SignatureStudioReadinessState(
+            status = SignatureReadinessStatus.ORIGINAL_SAMPLE,
+            isTechnicallyCompliant = false,
+            isExportReady = false,
+            canSaveOrShare = false,
+            actualFileSizeBytes = 0L,
+            actualFileSizeKb = 0.0,
+            meetsMinFileSize = false,
+            meetsMaxFileSize = false,
+            meetsDimensions = false,
+            meetsDpi = false,
+            meetsSignatureQuality = false,
+            meetsPreviewApproval = false,
+            badgeText = SignatureReadinessStatus.ORIGINAL_SAMPLE.badgeText,
+            inspectorStatusText = SignatureReadinessStatus.ORIGINAL_SAMPLE.inspectorTitle
+        )
+    }
+
+    val minBytes = targetMinKb.coerceAtLeast(0).toLong() * 1024L
+    val maxBytes = targetMaxKb.coerceAtLeast(0).toLong() * 1024L
+    val hasValidBounds =
+        targetMinKb in 0..targetMaxKb &&
+        !result.hasConflict &&
+        result.status != PreparationStatus.CONFLICT_LIMITS
+
+    val diskFile = result.processedFilePath.takeIf { it.isNotBlank() }?.let { File(it) }
+    val diskByteLength = if (diskFile != null && diskFile.exists() && diskFile.isFile) diskFile.length() else 0L
+    val reportedBytes = result.fileSizeBytes
+
+    // Resolve actual final byte count without allowing pre-compression or rounded KB estimates to mask failures:
+    // if the file on disk exists and violates bounds, or if reportedBytes <= 0L, use the on-disk byte count;
+    // otherwise use reportedBytes (which ImageProcessor sets from outputFile.length()).
+    val actualBytes = when {
+        diskByteLength > 0L && (reportedBytes <= 0L || diskByteLength == reportedBytes) -> diskByteLength
+        diskByteLength > 0L && hasValidBounds && diskByteLength !in minBytes..maxBytes -> diskByteLength
+        reportedBytes > 0L -> reportedBytes
+        else -> diskByteLength
+    }
+    val actualSizeKb = actualBytes / 1024.0
+
+    val meetsMinFileSize =
+        hasValidBounds &&
+        actualBytes > 0L &&
+        actualBytes >= minBytes &&
+        (reportedBytes <= 0L || reportedBytes >= minBytes) &&
+        result.status != PreparationStatus.SIZE_BELOW_MIN
+
+    val meetsMaxFileSize =
+        hasValidBounds &&
+        actualBytes in 1L..maxBytes &&
+        (reportedBytes <= 0L || reportedBytes <= maxBytes) &&
+        result.status != PreparationStatus.SIZE_EXCEEDED
+
+    val meetsDimensions =
+        result.widthPx > 0 &&
+        result.heightPx > 0 &&
+        (targetWidthPx <= 0 || result.widthPx == targetWidthPx) &&
+        (targetHeightPx <= 0 || result.heightPx == targetHeightPx) &&
+        result.status != PreparationStatus.DIMENSIONS_MISMATCH
+
+    val meetsDpi =
+        result.dpi > 0 &&
+        (targetDpi <= 0 || result.dpi == targetDpi) &&
+        result.status != PreparationStatus.DPI_MISMATCH
+
+    val evidence = result.signatureEvidence
+    val signatureEvidenceValid = evidence == null || (
+        evidence.inkPresenceVerified &&
+        evidence.inkRatioWithinBounds &&
+        evidence.strokeBoundingBoxFound &&
+        evidence.paperWhitenessRatio >= com.example.processing.SignatureVisionProcessor.MIN_PAPER_WHITENESS_RATIO &&
+        evidence.paperMeanLuminance >= com.example.processing.SignatureVisionProcessor.MIN_PAPER_MEAN_LUMINANCE
+    )
+    val backgroundValid = !result.requiresWhiteBackground || result.technicalBackgroundCompliant
+    val meetsSignatureQuality =
+        result.isCompliant &&
+        backgroundValid &&
+        signatureEvidenceValid &&
+        result.status != PreparationStatus.BACKGROUND_NOT_WHITE &&
+        result.status != PreparationStatus.BACKGROUND_UNVERIFIED &&
+        result.status != PreparationStatus.FAILED &&
+        result.status != PreparationStatus.CONFLICT_LIMITS
+
+    val meetsPreviewApproval =
+        (!result.requiresUserPreviewApproval || result.userPreviewAccepted) &&
+        result.isExportReady
+
+    val isTechnicallyCompliant =
+        hasValidBounds &&
+        meetsMinFileSize &&
+        meetsMaxFileSize &&
+        meetsDimensions &&
+        meetsDpi &&
+        meetsSignatureQuality
+
+    val isExportReady = isTechnicallyCompliant && meetsPreviewApproval
+
+    val status = when {
+        !hasValidBounds -> SignatureReadinessStatus.QUALITY_REVIEW_REQUIRED
+        !meetsMinFileSize -> SignatureReadinessStatus.FILE_SIZE_TOO_SMALL
+        !meetsMaxFileSize -> SignatureReadinessStatus.FILE_SIZE_TOO_LARGE
+        !meetsDimensions -> SignatureReadinessStatus.DIMENSIONS_MISMATCH
+        !meetsDpi -> SignatureReadinessStatus.DPI_MISMATCH
+        !meetsSignatureQuality -> SignatureReadinessStatus.QUALITY_REVIEW_REQUIRED
+        !meetsPreviewApproval -> SignatureReadinessStatus.AWAITING_REVIEW
+        else -> SignatureReadinessStatus.EXPORT_READY
+    }
+
+    val formattedSizeKb = String.format(Locale.US, "%.1f", actualSizeKb)
+    val inspectorStatusText = "${status.inspectorTitle} ($formattedSizeKb KB)"
+
+    return SignatureStudioReadinessState(
+        status = status,
+        isTechnicallyCompliant = isTechnicallyCompliant,
+        isExportReady = isExportReady,
+        canSaveOrShare = isExportReady,
+        actualFileSizeBytes = actualBytes,
+        actualFileSizeKb = actualSizeKb,
+        meetsMinFileSize = meetsMinFileSize,
+        meetsMaxFileSize = meetsMaxFileSize,
+        meetsDimensions = meetsDimensions,
+        meetsDpi = meetsDpi,
+        meetsSignatureQuality = meetsSignatureQuality,
+        meetsPreviewApproval = meetsPreviewApproval,
+        badgeText = status.badgeText,
+        inspectorStatusText = inspectorStatusText
+    )
+}
+
 data class SignaturePreset(
     val title: String,
     val type: DocumentType,
@@ -284,13 +483,32 @@ fun SignatureStudioScreen(
         return
     }
 
+    val targetWidthInt = customWidthPx.toIntOrNull()?.coerceAtLeast(1) ?: (initialRule?.exactWidthPx ?: 140)
+    val targetHeightInt = customHeightPx.toIntOrNull()?.coerceAtLeast(1) ?: (initialRule?.exactHeightPx ?: 60)
+    val currentReadinessState = evaluateSignatureStudioReadiness(
+        result = processedResult,
+        targetMinKb = targetMinKb,
+        targetMaxKb = targetMaxKb,
+        targetWidthPx = targetWidthInt,
+        targetHeightPx = targetHeightInt,
+        targetDpi = customDpi
+    )
+
     // Storage Access Framework: Save to Device
     val saveDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument(selectedFormat.mimeType)
     ) { destinationUri: Uri? ->
         val currentRes = processedResult
+        val immediateReadiness = evaluateSignatureStudioReadiness(
+            result = currentRes,
+            targetMinKb = targetMinKb,
+            targetMaxKb = targetMaxKb,
+            targetWidthPx = customWidthPx.toIntOrNull()?.coerceAtLeast(1) ?: 140,
+            targetHeightPx = customHeightPx.toIntOrNull()?.coerceAtLeast(1) ?: 60,
+            targetDpi = customDpi
+        )
         if (destinationUri != null) {
-            if (currentRes == null || !currentRes.isExportReady) {
+            if (currentRes == null || !immediateReadiness.canSaveOrShare) {
                 Toast.makeText(
                     context,
                     "Please review and accept the processed preview before exporting.",
@@ -301,7 +519,15 @@ fun SignatureStudioScreen(
             coroutineScope.launch(Dispatchers.IO) {
                 try {
                     val latestRes = processedResult
-                    if (latestRes == null || !latestRes.isExportReady) {
+                    val latestReadiness = evaluateSignatureStudioReadiness(
+                        result = latestRes,
+                        targetMinKb = targetMinKb,
+                        targetMaxKb = targetMaxKb,
+                        targetWidthPx = customWidthPx.toIntOrNull()?.coerceAtLeast(1) ?: 140,
+                        targetHeightPx = customHeightPx.toIntOrNull()?.coerceAtLeast(1) ?: 60,
+                        targetDpi = customDpi
+                    )
+                    if (latestRes == null || !latestReadiness.canSaveOrShare) {
                         withContext(Dispatchers.Main) {
                             Toast.makeText(
                                 context,
@@ -319,7 +545,7 @@ fun SignatureStudioScreen(
                             }
                         }
                         withContext(Dispatchers.Main) {
-                            saveStatusMessage = "Successfully saved signature to device (${String.format(Locale.US, "%.1f", latestRes.fileSizeKb)} KB)"
+                            saveStatusMessage = "Successfully saved signature to device (${String.format(Locale.US, "%.1f", latestReadiness.actualFileSizeKb)} KB)"
                             Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                         }
                     } else {
@@ -484,15 +710,16 @@ fun SignatureStudioScreen(
 
                         // Exact Dimensions + DPI + KB Badge (bottom)
                         processedResult?.let { res ->
+                            val metricPrefix = if (currentReadinessState.isTechnicallyCompliant) "✓" else "⚠"
                             Surface(
-                                color = if (res.isCompliant) EmeraldTertiary else SaffronSecondary,
+                                color = if (currentReadinessState.isTechnicallyCompliant) EmeraldTertiary else SaffronSecondary,
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
                                     .padding(10.dp)
                             ) {
                                 Text(
-                                    text = "✓ ${res.widthPx}×${res.heightPx} px • ${res.dpi} DPI • ${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB",
+                                    text = "$metricPrefix ${res.widthPx}×${res.heightPx} px • ${res.dpi} DPI • ${String.format(Locale.US, "%.1f", currentReadinessState.actualFileSizeKb)} KB",
                                     color = Color.White,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.ExtraBold,
@@ -502,14 +729,19 @@ fun SignatureStudioScreen(
                         }
 
                         Surface(
-                            color = if (processedResult != null) EmeraldTertiary else NavyPrimary,
+                            color = when {
+                                processedResult == null -> NavyPrimary
+                                currentReadinessState.isExportReady -> EmeraldTertiary
+                                else -> SaffronSecondary
+                            },
                             shape = RoundedCornerShape(6.dp),
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
                                 .padding(10.dp)
+                                .testTag("sign_main_readiness_badge")
                         ) {
                             Text(
-                                text = if (processedResult != null) "1-Click Ready" else "Original Sample",
+                                text = currentReadinessState.badgeText,
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -596,6 +828,13 @@ fun SignatureStudioScreen(
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
+                            Text(
+                                text = "Readiness: ${currentReadinessState.status.inspectorTitle}",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (currentReadinessState.isExportReady) EmeraldTertiary else SaffronSecondary,
+                                modifier = Modifier.testTag("sign_preview_readiness_label")
+                            )
                             res.signatureEvidence?.let { ev ->
                                 Text(
                                     text = "Ink Ratio: ${String.format(Locale.US, "%.1f", ev.inkPixelRatio * 100f)}% • Paper White: ${(ev.paperWhitenessRatio * 100f).toInt()}%",
@@ -614,7 +853,7 @@ fun SignatureStudioScreen(
                     }
                 }
 
-                val isSuccess = res.isExportReady && res.status == PreparationStatus.SUCCESS_PREPARED
+                val isSuccess = currentReadinessState.isExportReady
                 val cardBg = if (isSuccess) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
                 val statusColor = if (isSuccess) EmeraldTertiary else SaffronSecondary
 
@@ -633,10 +872,11 @@ fun SignatureStudioScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "${res.status.label} (${String.format(Locale.US, "%.1f", res.fileSizeKb)} KB)",
+                                text = currentReadinessState.inspectorStatusText,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = statusColor
+                                color = statusColor,
+                                modifier = Modifier.testTag("sign_inspector_status_title")
                             )
                         }
 
@@ -675,7 +915,7 @@ fun SignatureStudioScreen(
                         // 1-Click Direct Download to Gallery Button
                         Button(
                             onClick = {
-                                if (!res.isExportReady) {
+                                if (!currentReadinessState.canSaveOrShare) {
                                     Toast.makeText(
                                         context,
                                         "Please review and accept the processed preview before exporting.",
@@ -685,7 +925,15 @@ fun SignatureStudioScreen(
                                 }
                                 coroutineScope.launch {
                                     val currentRes = processedResult
-                                    if (currentRes == null || !currentRes.isExportReady) {
+                                    val latestReadiness = evaluateSignatureStudioReadiness(
+                                        result = currentRes,
+                                        targetMinKb = targetMinKb,
+                                        targetMaxKb = targetMaxKb,
+                                        targetWidthPx = customWidthPx.toIntOrNull()?.coerceAtLeast(1) ?: 140,
+                                        targetHeightPx = customHeightPx.toIntOrNull()?.coerceAtLeast(1) ?: 60,
+                                        targetDpi = customDpi
+                                    )
+                                    if (currentRes == null || !latestReadiness.canSaveOrShare) {
                                         Toast.makeText(
                                             context,
                                             "Please review and accept the processed preview before exporting.",
@@ -702,14 +950,14 @@ fun SignatureStudioScreen(
                                         mimeType = currentRes.fileFormat.mimeType
                                     )
                                     if (saveRes.isSuccess) {
-                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", currentRes.fileSizeKb)} KB)"
+                                        saveStatusMessage = "${saveRes.getOrNull()} (${String.format(Locale.US, "%.1f", latestReadiness.actualFileSizeKb)} KB)"
                                         Toast.makeText(context, saveStatusMessage, Toast.LENGTH_LONG).show()
                                     } else {
                                         Toast.makeText(context, "Save failed: ${saveRes.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             },
-                            enabled = res.isExportReady,
+                            enabled = currentReadinessState.canSaveOrShare,
                             shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = EmeraldTertiary),
                             modifier = Modifier.fillMaxWidth().height(46.dp).testTag("instant_gallery_download_sign_btn")
@@ -728,7 +976,7 @@ fun SignatureStudioScreen(
                         ) {
                             OutlinedButton(
                                 onClick = {
-                                    if (!res.isExportReady) {
+                                    if (!currentReadinessState.canSaveOrShare) {
                                         Toast.makeText(
                                             context,
                                             "Please review and accept the processed preview before exporting.",
@@ -739,7 +987,7 @@ fun SignatureStudioScreen(
                                     val suggestedName = "signature_${res.widthPx}x${res.heightPx}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.${res.fileFormat.extension}"
                                     saveDocumentLauncher.launch(suggestedName)
                                 },
-                                enabled = res.isExportReady,
+                                enabled = currentReadinessState.canSaveOrShare,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.weight(1f).testTag("save_signature_device_btn")
                             ) {
@@ -750,7 +998,7 @@ fun SignatureStudioScreen(
 
                             OutlinedButton(
                                 onClick = {
-                                    if (!res.isExportReady) {
+                                    if (!currentReadinessState.canSaveOrShare) {
                                         Toast.makeText(
                                             context,
                                             "Please review and accept the processed preview before exporting.",
@@ -760,7 +1008,7 @@ fun SignatureStudioScreen(
                                     }
                                     sharePreparedFiles(context, listOf(File(res.processedFilePath)))
                                 },
-                                enabled = res.isExportReady,
+                                enabled = currentReadinessState.canSaveOrShare,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.weight(1f).testTag("share_signature_btn")
                             ) {
@@ -796,7 +1044,7 @@ fun SignatureStudioScreen(
 
                         OutlinedButton(
                             onClick = {
-                                if (!res.isExportReady) {
+                                if (!currentReadinessState.canSaveOrShare) {
                                     Toast.makeText(
                                         context,
                                         "Please review and accept the processed preview before exporting.",
@@ -807,7 +1055,15 @@ fun SignatureStudioScreen(
                                 coroutineScope.launch(Dispatchers.IO) {
                                     try {
                                         val currentRes = processedResult
-                                        if (currentRes == null || !currentRes.isExportReady) {
+                                        val latestReadiness = evaluateSignatureStudioReadiness(
+                                            result = currentRes,
+                                            targetMinKb = targetMinKb,
+                                            targetMaxKb = targetMaxKb,
+                                            targetWidthPx = customWidthPx.toIntOrNull()?.coerceAtLeast(1) ?: 140,
+                                            targetHeightPx = customHeightPx.toIntOrNull()?.coerceAtLeast(1) ?: 60,
+                                            targetDpi = customDpi
+                                        )
+                                        if (currentRes == null || !latestReadiness.canSaveOrShare) {
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(
                                                     context,
@@ -842,7 +1098,7 @@ fun SignatureStudioScreen(
                                     }
                                 }
                             },
-                            enabled = res.isExportReady,
+                            enabled = currentReadinessState.canSaveOrShare,
                             modifier = Modifier.fillMaxWidth().testTag("add_signature_to_locker_btn"),
                             shape = RoundedCornerShape(10.dp)
                         ) {
