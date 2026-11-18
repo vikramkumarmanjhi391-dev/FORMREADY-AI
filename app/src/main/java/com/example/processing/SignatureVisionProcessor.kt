@@ -125,6 +125,7 @@ object SignatureVisionProcessor {
         sourceBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
         val lum = IntArray(totalPixels)
+        val blueExcessArr = IntArray(totalPixels)
         val stride = width + 1
         val integralSum = LongArray((width + 1) * (height + 1))
         val integralSqSum = LongArray((width + 1) * (height + 1))
@@ -137,58 +138,111 @@ object SignatureVisionProcessor {
             val intPrevRow = y * stride
             for (x in 0 until width) {
                 val c = pixels[yOffset + x]
-                val l = (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
-                lum[yOffset + x] = l
-                rowSum += l
-                rowSqSum += l.toLong() * l.toLong()
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                val stdLum = (r * 299 + g * 587 + b * 114) / 1000
+                // Blue ballpoint and gel inks absorb red/green while reflecting blue.
+                // Incorporating blue excess into effective ink luminance preserves faint/light-blue strokes.
+                val warmAvg = (r * 2 + g) / 3
+                val blueEx = if (b > r + 4 && b > g + 2) (b - warmAvg).coerceAtLeast(0) else 0
+                val effLum = (stdLum - (blueEx * 48) / 100).coerceIn(0, 255)
+
+                lum[yOffset + x] = effLum
+                blueExcessArr[yOffset + x] = blueEx
+                rowSum += effLum
+                rowSqSum += effLum.toLong() * effLum.toLong()
                 integralSum[intCurrRow + x + 1] = integralSum[intPrevRow + x + 1] + rowSum
                 integralSqSum[intCurrRow + x + 1] = integralSqSum[intPrevRow + x + 1] + rowSqSum
             }
         }
 
-        val radius = (min(width, height) * windowRadiusRatio).roundToInt().coerceIn(8, 48)
+        val radiusMed = (min(width, height) * windowRadiusRatio).roundToInt().coerceIn(8, 48)
+        val radiusFine = (radiusMed / 3).coerceIn(3, 8)
         val rDynamic = 128.0
         val k = sauvolaK.coerceIn(0.08f, 0.40f).toDouble()
 
-        val isInkPixel = BooleanArray(totalPixels)
-        var rawInkCount = 0
+        // 0 = background, 1 = weak/thin candidate ink, 2 = strong ink seed
+        val inkState = ByteArray(totalPixels)
+        val localDeltaArr = FloatArray(totalPixels)
+        var rawCandidateCount = 0
 
         for (y in 0 until height) {
-            val y0 = max(0, y - radius)
-            val y1 = min(height - 1, y + radius)
-            val row0 = y0 * stride
-            val row1 = (y1 + 1) * stride
+            val ym0 = max(0, y - radiusMed)
+            val ym1 = min(height - 1, y + radiusMed)
+            val rowM0 = ym0 * stride
+            val rowM1 = (ym1 + 1) * stride
+
+            val yf0 = max(0, y - radiusFine)
+            val yf1 = min(height - 1, y + radiusFine)
+            val rowF0 = yf0 * stride
+            val rowF1 = (yf1 + 1) * stride
+
             val yOffset = y * width
 
             for (x in 0 until width) {
-                val x0 = max(0, x - radius)
-                val x1 = min(width - 1, x + radius)
-                val count = ((x1 - x0 + 1) * (y1 - y0 + 1)).toDouble()
+                val xm0 = max(0, x - radiusMed)
+                val xm1 = min(width - 1, x + radiusMed)
+                val countMed = ((xm1 - xm0 + 1) * (ym1 - ym0 + 1)).toDouble()
 
-                val sum = (integralSum[row1 + x1 + 1] - integralSum[row0 + x1 + 1] -
-                    integralSum[row1 + x0] + integralSum[row0 + x0]).toDouble()
-                val sqSum = (integralSqSum[row1 + x1 + 1] - integralSqSum[row0 + x1 + 1] -
-                    integralSqSum[row1 + x0] + integralSqSum[row0 + x0]).toDouble()
+                val sumMed = (integralSum[rowM1 + xm1 + 1] - integralSum[rowM0 + xm1 + 1] -
+                    integralSum[rowM1 + xm0] + integralSum[rowM0 + xm0]).toDouble()
+                val sqSumMed = (integralSqSum[rowM1 + xm1 + 1] - integralSqSum[rowM0 + xm1 + 1] -
+                    integralSqSum[rowM1 + xm0] + integralSqSum[rowM0 + xm0]).toDouble()
 
-                val mean = sum / count
-                val variance = (sqSum / count - mean * mean).coerceAtLeast(0.0)
-                val stdDev = sqrt(variance)
+                val meanMed = sumMed / countMed
+                val varMed = (sqSumMed / countMed - meanMed * meanMed).coerceAtLeast(0.0)
+                val stdMed = sqrt(varMed)
 
-                val localThreshold = mean * (1.0 + k * ((stdDev / rDynamic) - 1.0))
-                val pixelLum = lum[yOffset + x].toDouble()
+                val xf0 = max(0, x - radiusFine)
+                val xf1 = min(width - 1, x + radiusFine)
+                val countFine = ((xf1 - xf0 + 1) * (yf1 - yf0 + 1)).toDouble()
 
-                // Require local contrast (stdDev >= 7.5) or dark absolute ink (pixelLum < 115)
-                // so uniform grey paper shadows never trigger false ink pixels
-                if (pixelLum < localThreshold - 6.0 && (stdDev >= 7.5 || pixelLum < 115.0)) {
-                    isInkPixel[yOffset + x] = true
-                    rawInkCount++
+                val sumFine = (integralSum[rowF1 + xf1 + 1] - integralSum[rowF0 + xf1 + 1] -
+                    integralSum[rowF1 + xf0] + integralSum[rowF0 + xf0]).toDouble()
+                val sqSumFine = (integralSqSum[rowF1 + xf1 + 1] - integralSqSum[rowF0 + xf1 + 1] -
+                    integralSqSum[rowF1 + xf0] + integralSqSum[rowF0 + xf0]).toDouble()
+
+                val meanFine = sumFine / countFine
+                val varFine = (sqSumFine / countFine - meanFine * meanFine).coerceAtLeast(0.0)
+                val stdFine = sqrt(varFine)
+
+                val idx = yOffset + x
+                val pixelLum = lum[idx].toDouble()
+                val blueEx = blueExcessArr[idx]
+
+                val paperMean = max(meanMed, meanFine)
+                val localDelta = (paperMean - pixelLum).toFloat()
+                localDeltaArr[idx] = localDelta
+
+                val threshMed = meanMed * (1.0 + k * ((stdMed / rDynamic) - 1.0))
+                val threshFine = meanFine * (1.0 + (k * 0.72) * ((stdFine / rDynamic) - 1.0))
+
+                val blueContrastBonus = (blueEx * 0.22).coerceAtMost(6.5)
+                val effDelta = localDelta.toDouble() + blueContrastBonus
+
+                val isStrong = (pixelLum < threshMed - 4.5 && (stdMed >= 6.0 || stdFine >= 6.5 || pixelLum < 145.0 || effDelta >= 20.0)) ||
+                    (effDelta >= 16.0 && (stdFine >= 5.0 || stdMed >= 4.5 || blueEx >= 14)) ||
+                    (pixelLum < 118.0 && effDelta >= 9.0)
+
+                val isWeak = !isStrong && (
+                    (effDelta >= 8.5 && (stdFine >= 2.2 || stdMed >= 2.2 || blueEx >= 8)) ||
+                        (pixelLum < threshFine - 1.5 && effDelta >= 7.5) ||
+                        (pixelLum < threshMed - 1.5 && effDelta >= 7.5)
+                    )
+
+                if (isStrong) {
+                    inkState[idx] = 2
+                    rawCandidateCount++
+                } else if (isWeak) {
+                    inkState[idx] = 1
+                    rawCandidateCount++
                 }
             }
         }
 
-        val inkRatio = rawInkCount.toFloat() / totalPixels.toFloat()
-        // If no meaningful strokes were detected (or >65% of image triggered), fall back safely
-        if (rawInkCount < 12 || inkRatio > 0.65f) {
+        val rawCandidateRatio = rawCandidateCount.toFloat() / totalPixels.toFloat()
+        if (rawCandidateCount < 8 || rawCandidateRatio > 0.65f) {
             val fallbackBmp = ImageProcessor.adjustSignatureLighting(
                 src = sourceBitmap,
                 contrastFactor = 1.15f,
@@ -196,77 +250,263 @@ object SignatureVisionProcessor {
                 inkThreshold = 195,
                 preserveInkColor = preserveInkColor
             )
-            val fallbackBgMask = BooleanArray(totalPixels) { idx -> !isInkPixel[idx] }
+            val fallbackBgMask = BooleanArray(totalPixels) { idx -> inkState[idx].toInt() == 0 }
             return@measureStage SignatureExtractionResult(
                 processedBitmap = fallbackBmp,
                 inkBoundingBoxPx = Rect(0, 0, width, height),
-                inkPixelRatio = inkRatio,
+                inkPixelRatio = rawCandidateRatio,
                 backgroundMask = fallbackBgMask,
                 usedAdaptiveSauvola = false,
                 fallbackReason = "Insufficient local stroke contrast — applied gentle ink processing fallback.",
-                verifiedInkPixelCount = rawInkCount,
+                verifiedInkPixelCount = rawCandidateCount,
                 strokeBoundingBoxFound = false,
                 strokeBoxWidthRatio = 0f,
                 strokeBoxHeightRatio = 0f
             )
         }
 
-        // Filter isolated 1-pixel noise specks before computing stroke bounding box and output pixels
-        val outPixels = IntArray(totalPixels) { Color.WHITE }
-        val cleanBgMask = BooleanArray(totalPixels) { true }
+        // Connected-component hysteresis & proximity-aware dot preservation:
+        // 1. Rejects isolated 1-pixel sensor specks and paper grain.
+        // 2. Preserves continuous 1px/2px thin strokes (diagonal, curved, low-contrast) connected to strong seeds.
+        // 3. Preserves small genuine disconnected dots/marks (Hindi bindu/nukta, 'i'/'j' dots, periods)
+        //    near handwriting while rejecting isolated margin specks.
+        val visited = BooleanArray(totalPixels)
+        val queue = IntArray(totalPixels)
+        val compMembers = ArrayList<IntArray>()
+        val compStrongCounts = IntArray(totalPixels / 2 + 1)
+        val compMaxDeltas = FloatArray(totalPixels / 2 + 1)
+        val compMinX = IntArray(totalPixels / 2 + 1)
+        val compMaxX = IntArray(totalPixels / 2 + 1)
+        val compMinY = IntArray(totalPixels / 2 + 1)
+        val compMaxY = IntArray(totalPixels / 2 + 1)
+        val compTouchesOuterEdge = BooleanArray(totalPixels / 2 + 1)
 
-        val borderMarginX = (width * 0.02f).toInt().coerceAtLeast(1)
-        val borderMarginY = (height * 0.02f).toInt().coerceAtLeast(1)
-        var minX = width
-        var minY = height
-        var maxX = 0
-        var maxY = 0
-        var verifiedStrokeCount = 0
+        var primaryMinX = width
+        var primaryMinY = height
+        var primaryMaxX = -1
+        var primaryMaxY = -1
+        var hasPrimaryStroke = false
 
-        for (y in 1 until height - 1) {
+        for (y in 0 until height) {
             val yOffset = y * width
-            for (x in 1 until width - 1) {
-                val idx = yOffset + x
-                if (!isInkPixel[idx]) continue
+            for (x in 0 until width) {
+                val startIdx = yOffset + x
+                if (inkState[startIdx].toInt() == 0 || visited[startIdx]) continue
 
-                // Count 3x3 neighborhood ink support to reject isolated single-pixel sensor noise
-                var neighbors = 0
-                for (dy in -1..1) {
-                    val ny = (y + dy) * width
-                    for (dx in -1..1) {
-                        if (isInkPixel[ny + x + dx]) neighbors++
+                var head = 0
+                var tail = 0
+                queue[tail++] = startIdx
+                visited[startIdx] = true
+
+                var strongCount = 0
+                var maxDelta = 0f
+                var cMinX = x
+                var cMaxX = x
+                var cMinY = y
+                var cMaxY = y
+                var borderPixelCount = 0
+
+                while (head < tail) {
+                    val curr = queue[head++]
+                    val cy = curr / width
+                    val cx = curr - cy * width
+
+                    if (inkState[curr].toInt() == 2) strongCount++
+                    val d = localDeltaArr[curr]
+                    if (d > maxDelta) maxDelta = d
+
+                    if (cx < cMinX) cMinX = cx
+                    if (cx > cMaxX) cMaxX = cx
+                    if (cy < cMinY) cMinY = cy
+                    if (cy > cMaxY) cMaxY = cy
+                    if (cx == 0 || cx == width - 1 || cy == 0 || cy == height - 1) {
+                        borderPixelCount++
+                    }
+
+                    val ny0 = max(0, cy - 1)
+                    val ny1 = min(height - 1, cy + 1)
+                    val nx0 = max(0, cx - 1)
+                    val nx1 = min(width - 1, cx + 1)
+                    for (ny in ny0..ny1) {
+                        val nRow = ny * width
+                        for (nx in nx0..nx1) {
+                            val nIdx = nRow + nx
+                            if (!visited[nIdx] && inkState[nIdx].toInt() > 0) {
+                                visited[nIdx] = true
+                                queue[tail++] = nIdx
+                            }
+                        }
                     }
                 }
-                if (neighbors < 2) continue
 
-                cleanBgMask[idx] = false
-                verifiedStrokeCount++
+                val size = tail
+                // Single-pixel isolated sensor noise is always rejected
+                if (size <= 1) continue
 
-                if (x in borderMarginX until (width - borderMarginX) &&
-                    y in borderMarginY until (height - borderMarginY)
-                ) {
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
+                // Reject 1px outer border frame artifacts that hug only the extreme image boundary
+                val spanW = cMaxX - cMinX + 1
+                val spanH = cMaxY - cMinY + 1
+                val isPureEdgeArtifact = borderPixelCount == size && (spanW <= 1 || spanH <= 1)
+                if (isPureEdgeArtifact) continue
+
+                val compIdx = compMembers.size
+                compMembers.add(queue.copyOfRange(0, size))
+                compStrongCounts[compIdx] = strongCount
+                compMaxDeltas[compIdx] = maxDelta
+                compMinX[compIdx] = cMinX
+                compMaxX[compIdx] = cMaxX
+                compMinY[compIdx] = cMinY
+                compMaxY[compIdx] = cMaxY
+                compTouchesOuterEdge[compIdx] = borderPixelCount > (size * 3) / 4 && (spanW <= 2 || spanH <= 2)
+
+                // Primary handwriting stroke/character component
+                val isPrimary = !compTouchesOuterEdge[compIdx] && (
+                    (size >= 6 && (strongCount >= 1 || maxDelta >= 10.0f)) ||
+                        (size in 4..5 && (strongCount >= 1 || maxDelta >= 15.0f))
+                    )
+                if (isPrimary) {
+                    hasPrimaryStroke = true
+                    if (cMinX < primaryMinX) primaryMinX = cMinX
+                    if (cMaxX > primaryMaxX) primaryMaxX = cMaxX
+                    if (cMinY < primaryMinY) primaryMinY = cMinY
+                    if (cMaxY > primaryMaxY) primaryMaxY = cMaxY
                 }
+            }
+        }
 
-                val origColor = pixels[idx]
-                if (!preserveInkColor) {
-                    outPixels[idx] = Color.rgb(18, 18, 22)
+        // Determine proximity margin around primary strokes so genuine Hindi dots (bindu/anusvara),
+        // 'i'/'j' dots, periods, and short marks are preserved while distant margin noise is rejected.
+        val proximityPadX = max((width * 0.12f).roundToInt(), 18)
+        val proximityPadY = max((height * 0.25f).roundToInt(), 20)
+
+        val verifiedInkMask = BooleanArray(totalPixels)
+        var verifiedStrokeCount = 0
+        var minX = width
+        var minY = height
+        var maxX = -1
+        var maxY = -1
+
+        for (compIdx in 0 until compMembers.size) {
+            if (compTouchesOuterEdge[compIdx]) continue
+            val members = compMembers[compIdx]
+            val size = members.size
+            val strongCount = compStrongCounts[compIdx]
+            val maxDelta = compMaxDeltas[compIdx]
+            val cMinX = compMinX[compIdx]
+            val cMaxX = compMaxX[compIdx]
+            val cMinY = compMinY[compIdx]
+            val cMaxY = compMaxY[compIdx]
+
+            val isPrimary = (size >= 6 && (strongCount >= 1 || maxDelta >= 10.0f)) ||
+                (size in 4..5 && (strongCount >= 1 || maxDelta >= 15.0f))
+
+            val isNearPrimary = hasPrimaryStroke &&
+                cMaxX >= (primaryMinX - proximityPadX) &&
+                cMinX <= (primaryMaxX + proximityPadX) &&
+                cMaxY >= (primaryMinY - proximityPadY) &&
+                cMinY <= (primaryMaxY + proximityPadY)
+
+            // 2-to-3 pixel genuine dots/marks must have strong local contrast and be near handwriting
+            val isValidSmallDot = size in 2..3 &&
+                (strongCount >= 2 || maxDelta >= 22.0f) &&
+                (isNearPrimary || (!hasPrimaryStroke && maxDelta >= 32.0f))
+
+            if (!isPrimary && !isValidSmallDot) continue
+
+            for (idx in members) {
+                verifiedInkMask[idx] = true
+            }
+            verifiedStrokeCount += size
+            if (cMinX < minX) minX = cMinX
+            if (cMaxX > maxX) maxX = cMaxX
+            if (cMinY < minY) minY = cMinY
+            if (cMaxY > maxY) maxY = cMaxY
+        }
+
+        val verifiedRatio = verifiedStrokeCount.toFloat() / totalPixels.toFloat()
+        if (verifiedStrokeCount < 8 || verifiedRatio > 0.65f || maxX < minX || maxY < minY) {
+            val fallbackBmp = ImageProcessor.adjustSignatureLighting(
+                src = sourceBitmap,
+                contrastFactor = 1.15f,
+                brightnessOffset = 8f,
+                inkThreshold = 195,
+                preserveInkColor = preserveInkColor
+            )
+            val fallbackBgMask = BooleanArray(totalPixels) { idx -> !verifiedInkMask[idx] }
+            return@measureStage SignatureExtractionResult(
+                processedBitmap = fallbackBmp,
+                inkBoundingBoxPx = Rect(0, 0, width, height),
+                inkPixelRatio = verifiedRatio,
+                backgroundMask = fallbackBgMask,
+                usedAdaptiveSauvola = false,
+                fallbackReason = "Insufficient verified handwriting strokes — applied gentle ink processing fallback.",
+                verifiedInkPixelCount = verifiedStrokeCount,
+                strokeBoundingBoxFound = false,
+                strokeBoxWidthRatio = 0f,
+                strokeBoxHeightRatio = 0f
+            )
+        }
+
+        val outPixels = IntArray(totalPixels) { Color.WHITE }
+        val cleanBgMask = BooleanArray(totalPixels) { true }
+        val clampedBoost = contrastBoost.coerceIn(1.0f, 1.75f)
+        val darkenScale = (0.78f / sqrt(clampedBoost.toDouble()).toFloat()).coerceIn(0.56f, 0.80f)
+
+        for (idx in 0 until totalPixels) {
+            if (!verifiedInkMask[idx]) continue
+            cleanBgMask[idx] = false
+
+            val origColor = pixels[idx]
+            if (!preserveInkColor) {
+                outPixels[idx] = Color.rgb(18, 18, 22)
+            } else {
+                val r = Color.red(origColor)
+                val g = Color.green(origColor)
+                val b = Color.blue(origColor)
+
+                // Detect blue ink across vivid ballpoint, dark blue gel, and low-saturation blue pens
+                val isBlueInk = (b >= r + 5 && b >= g + 3) ||
+                    (b >= r + 4 && b > g && b >= 42 && (r + g) < b * 2 - 6)
+
+                if (isBlueInk) {
+                    val blueAdvantage = max(b - r, b - g)
+                    val warmScale = (darkenScale * 0.80f).coerceIn(0.44f, 0.68f)
+                    var outR = (r * warmScale).roundToInt().coerceIn(0, 128)
+                    var outG = (g * warmScale * 1.03f).roundToInt().coerceIn(0, 136)
+                    // Preserve dark blue gel depth while keeping light/medium ballpoint blue vivid and clear
+                    val minBlueFloor = if (b < 85) 38 else 62
+                    var outB = max((b * 0.90f).roundToInt(), (b * darkenScale + blueAdvantage * 0.65f).roundToInt())
+                        .coerceIn(minBlueFloor, 225)
+
+                    // Ensure blue dominance (outB > outG >= outR) so blue ink never collapses into grey/black
+                    val minAdvantage = max(8, (blueAdvantage * 0.70f).roundToInt().coerceAtMost(42))
+                    if (outB < outR + minAdvantage) {
+                        outR = (outB - minAdvantage).coerceAtLeast(0)
+                    }
+                    if (outB < outG + max(5, minAdvantage - 3)) {
+                        outG = (outB - max(5, minAdvantage - 3)).coerceAtLeast(0)
+                    }
+
+                    // Ensure faint thin strokes have legible contrast on pure white paper (lum <= 178)
+                    val outLum = (outR * 299 + outG * 587 + outB * 114) / 1000
+                    if (outLum > 178) {
+                        val lumScale = 178f / outLum.toFloat()
+                        outR = (outR * lumScale).roundToInt().coerceIn(0, 115)
+                        outG = (outG * lumScale).roundToInt().coerceIn(0, 125)
+                        outB = max((outB * lumScale).roundToInt(), outG + 8).coerceIn(42, 215)
+                    }
+                    outPixels[idx] = Color.rgb(outR, outG, outB)
                 } else {
-                    val r = Color.red(origColor)
-                    val g = Color.green(origColor)
-                    val b = Color.blue(origColor)
-                    // Deepen genuine blue/black ink while preserving natural pen hue
-                    val boost = (1f / contrastBoost.coerceIn(1.0f, 2.0f))
-                    val outR = (r * 0.65f * boost).roundToInt().coerceIn(0, 140)
-                    val outG = (g * 0.65f * boost).roundToInt().coerceIn(0, 140)
-                    val outB = if (b > r + 12 && b > g + 8) {
-                        // Preserve blue ballpoint/gel pen ink richness
-                        (b * 0.85f).roundToInt().coerceIn(45, 210)
-                    } else {
-                        (b * 0.65f * boost).roundToInt().coerceIn(0, 150)
+                    // Black, charcoal, or neutral dark pen ink: deepen naturally without washing out thin strokes
+                    var outR = (r * darkenScale).roundToInt().coerceIn(8, 138)
+                    var outG = (g * darkenScale).roundToInt().coerceIn(8, 138)
+                    var outB = (b * darkenScale).roundToInt().coerceIn(8, 142)
+                    val outLum = (outR * 299 + outG * 587 + outB * 114) / 1000
+                    if (outLum > 168) {
+                        val lumScale = 168f / outLum.toFloat()
+                        outR = (outR * lumScale).roundToInt().coerceIn(8, 130)
+                        outG = (outG * lumScale).roundToInt().coerceIn(8, 130)
+                        outB = (outB * lumScale).roundToInt().coerceIn(8, 134)
                     }
                     outPixels[idx] = Color.rgb(outR, outG, outB)
                 }
@@ -276,13 +516,14 @@ object SignatureVisionProcessor {
         val fullProcessed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         fullProcessed.setPixels(outPixels, 0, width, 0, 0, width, height)
 
-        val validBoundsFound = verifiedStrokeCount >= 10 &&
-            maxX > minX && maxY > minY &&
-            (maxX - minX) >= (width * 0.06f).toInt() &&
-            (maxY - minY) >= (height * 0.05f).toInt()
+        val strokeSpanW = maxX - minX + 1
+        val strokeSpanH = maxY - minY + 1
+        val validBoundsFound = verifiedStrokeCount >= 8 &&
+            strokeSpanW >= max(4, (width * 0.04f).toInt()) &&
+            strokeSpanH >= max(3, (height * 0.03f).toInt())
 
-        val rawBoxWidthRatio = if (maxX > minX) (maxX - minX + 1).toFloat() / width.toFloat() else 0f
-        val rawBoxHeightRatio = if (maxY > minY) (maxY - minY + 1).toFloat() / height.toFloat() else 0f
+        val rawBoxWidthRatio = strokeSpanW.toFloat() / width.toFloat()
+        val rawBoxHeightRatio = strokeSpanH.toFloat() / height.toFloat()
 
         if (!trimMargins || !validBoundsFound) {
             return@measureStage SignatureExtractionResult(
@@ -298,12 +539,14 @@ object SignatureVisionProcessor {
             )
         }
 
-        val padX = ((maxX - minX) * 0.12f).roundToInt().coerceAtLeast(8)
-        val padY = ((maxY - minY) * 0.18f).roundToInt().coerceAtLeast(6)
-        val cropLeft = (minX - padX).coerceAtLeast(0)
-        val cropTop = (minY - padY).coerceAtLeast(0)
-        val cropRight = (maxX + padX).coerceAtMost(width)
-        val cropBottom = (maxY + padY).coerceAtMost(height)
+        // Safe margin padding around the full verified ink bounding box (including dots and edge strokes)
+        // Use maxX + 1 and maxY + 1 because maxX/maxY are inclusive pixel indices.
+        val padX = max((strokeSpanW * 0.12f).roundToInt(), (width * 0.03f).roundToInt()).coerceAtLeast(8)
+        val padY = max((strokeSpanH * 0.20f).roundToInt(), (height * 0.05f).roundToInt()).coerceAtLeast(6)
+        val cropLeft = (minX - padX).coerceIn(0, width - 1)
+        val cropTop = (minY - padY).coerceIn(0, height - 1)
+        val cropRight = (maxX + 1 + padX).coerceIn(cropLeft + 1, width)
+        val cropBottom = (maxY + 1 + padY).coerceIn(cropTop + 1, height)
         val cropW = (cropRight - cropLeft).coerceAtLeast(1)
         val cropH = (cropBottom - cropTop).coerceAtLeast(1)
 
@@ -324,8 +567,8 @@ object SignatureVisionProcessor {
             }
         }
 
-        val croppedBoxW = (maxX - minX + 1).toFloat() / cropW.toFloat()
-        val croppedBoxH = (maxY - minY + 1).toFloat() / cropH.toFloat()
+        val croppedBoxW = strokeSpanW.toFloat() / cropW.toFloat()
+        val croppedBoxH = strokeSpanH.toFloat() / cropH.toFloat()
 
         SignatureExtractionResult(
             processedBitmap = croppedBmp,

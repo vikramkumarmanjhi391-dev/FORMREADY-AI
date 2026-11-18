@@ -4927,5 +4927,278 @@ class Phase05AExportReadinessGateUiTest {
         composeTestRule.onNodeWithTag("share_signature_btn").assertIsEnabled()
         composeTestRule.onNodeWithTag("add_signature_to_locker_btn").assertIsEnabled()
     }
+
+    @Test
+    fun testPhase2ThinOneAndTwoPixelSignatureStrokesAndLowContrastHandwritingPreserved() {
+        val width = 320
+        val height = 140
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+
+        // Uneven paper background (222..246)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val paperLum = (224 + (x * 14) / width + (y * 8) / height).coerceIn(215, 248)
+                bmp.setPixel(x, y, Color.rgb(paperLum, paperLum, (paperLum - 2).coerceAtLeast(210)))
+            }
+        }
+
+        val drawnOnePxDiagonal = mutableListOf<Pair<Int, Int>>()
+        // 1. Thin 1px diagonal stroke (faint blue ballpoint)
+        for (i in 0 until 45) {
+            val x = 28 + i
+            val y = 32 + (i * 2) / 3
+            bmp.setPixel(x, y, Color.rgb(138, 154, 212))
+            drawnOnePxDiagonal.add(x to y)
+        }
+
+        val drawnTwoPxStroke = mutableListOf<Pair<Int, Int>>()
+        // 2. Thin 2px horizontal/curved stroke with parallel separate stroke 4px below (must not join!)
+        for (x in 85..155) {
+            val curveOffset = (kotlin.math.sin((x - 85) * 0.12) * 5.0).toInt()
+            val yTop = 54 + curveOffset
+            bmp.setPixel(x, yTop, Color.rgb(95, 112, 188))
+            bmp.setPixel(x, yTop + 1, Color.rgb(105, 120, 192))
+            drawnTwoPxStroke.add(x to yTop)
+
+            // Parallel thin 1px stroke 4px below yTop+1 (gap at yTop+2, yTop+3, yTop+4 must stay white)
+            val yParallel = yTop + 5
+            bmp.setPixel(x, yParallel, Color.rgb(115, 128, 196))
+        }
+
+        val drawnLowContrast = mutableListOf<Pair<Int, Int>>()
+        // 3. Low-contrast faint handwriting stroke (only ~18 luminance units darker than local paper)
+        for (x in 170..245) {
+            val y = 68 + ((x - 170) % 7) / 2
+            val paperColor = bmp.getPixel(x, y)
+            val pLum = Color.red(paperColor)
+            val faintInk = Color.rgb(pLum - 20, pLum - 19, pLum - 12)
+            bmp.setPixel(x, y, faintInk)
+            if (x % 3 == 0) {
+                bmp.setPixel(x, y + 1, faintInk)
+            }
+            drawnLowContrast.add(x to y)
+        }
+
+        val result = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            sourceBitmap = bmp,
+            preserveInkColor = true,
+            trimMargins = false
+        )
+
+        assertTrue("Expected adaptive Sauvola extraction to succeed", result.usedAdaptiveSauvola)
+        assertTrue("Expected stroke bounding box to be found", result.strokeBoundingBoxFound)
+
+        // Verify 1px diagonal stroke pixels are preserved (>= 85%)
+        val preservedDiagonal = drawnOnePxDiagonal.count { (x, y) ->
+            !result.backgroundMask[y * width + x] && result.processedBitmap.getPixel(x, y) != Color.WHITE
+        }
+        assertTrue(
+            "Expected >= 85% of 1px diagonal faint blue stroke preserved, got $preservedDiagonal/${drawnOnePxDiagonal.size}",
+            preservedDiagonal >= (drawnOnePxDiagonal.size * 0.85).toInt()
+        )
+
+        // Verify 2px curved stroke is preserved and gap between parallel strokes is NOT joined/thickened
+        val preservedTwoPx = drawnTwoPxStroke.count { (x, y) ->
+            !result.backgroundMask[y * width + x]
+        }
+        assertTrue(
+            "Expected >= 90% of 2px curved stroke preserved, got $preservedTwoPx/${drawnTwoPxStroke.size}",
+            preservedTwoPx >= (drawnTwoPxStroke.size * 0.90).toInt()
+        )
+        for ((x, yTop) in drawnTwoPxStroke) {
+            val gapMidY = yTop + 3
+            assertEquals(
+                "Gap between parallel strokes at ($x, $gapMidY) must remain pure white without artificial thickening",
+                Color.WHITE,
+                result.processedBitmap.getPixel(x, gapMidY)
+            )
+        }
+
+        // Verify low-contrast handwriting stroke is preserved (>= 80%)
+        val preservedLowContrast = drawnLowContrast.count { (x, y) ->
+            !result.backgroundMask[y * width + x] && result.processedBitmap.getPixel(x, y) != Color.WHITE
+        }
+        assertTrue(
+            "Expected >= 80% of low-contrast handwriting preserved, got $preservedLowContrast/${drawnLowContrast.size}",
+            preservedLowContrast >= (drawnLowContrast.size * 0.80).toInt()
+        )
+    }
+
+    @Test
+    fun testPhase2BlueBallpointBlackPenDarkBlueGelAndLowSaturationBlueInkPreservation() {
+        val width = 320
+        val height = 140
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(Color.rgb(240, 239, 236))
+
+        // Segment 1: Classic Blue Ballpoint (x = 25..75, y = 55..56)
+        for (x in 25..75) {
+            bmp.setPixel(x, 55, Color.rgb(42, 74, 208))
+            bmp.setPixel(x, 56, Color.rgb(55, 88, 215))
+        }
+        // Segment 2: Dark Blue Gel Pen (x = 95..145, y = 55..56)
+        for (x in 95..145) {
+            bmp.setPixel(x, 55, Color.rgb(18, 28, 76))
+            bmp.setPixel(x, 56, Color.rgb(22, 34, 84))
+        }
+        // Segment 3: Low-Saturation Blue Pen (x = 165..215, y = 55..56)
+        for (x in 165..215) {
+            bmp.setPixel(x, 55, Color.rgb(88, 92, 99))
+            bmp.setPixel(x, 56, Color.rgb(94, 97, 104))
+        }
+        // Segment 4: Neutral Black Pen (x = 235..285, y = 55..56)
+        for (x in 235..285) {
+            bmp.setPixel(x, 55, Color.rgb(34, 35, 35))
+            bmp.setPixel(x, 56, Color.rgb(42, 42, 40))
+        }
+
+        val result = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            sourceBitmap = bmp,
+            preserveInkColor = true,
+            trimMargins = false
+        )
+
+        assertTrue(result.usedAdaptiveSauvola)
+
+        // 1. Classic Blue Ballpoint must stay clearly blue (B > G + 25 and B > R + 35)
+        val ballpointPixel = result.processedBitmap.getPixel(50, 55)
+        assertTrue(
+            "Blue ballpoint must retain strong blue dominance: R=${Color.red(ballpointPixel)}, G=${Color.green(ballpointPixel)}, B=${Color.blue(ballpointPixel)}",
+            Color.blue(ballpointPixel) > Color.red(ballpointPixel) + 35 &&
+                Color.blue(ballpointPixel) > Color.green(ballpointPixel) + 25
+        )
+
+        // 2. Dark Blue Gel Pen must remain dark blue (not pure black, B > R + 12 and B >= 38)
+        val darkGelPixel = result.processedBitmap.getPixel(120, 55)
+        assertTrue(
+            "Dark blue gel pen must retain dark blue hue rather than collapsing to black: R=${Color.red(darkGelPixel)}, G=${Color.green(darkGelPixel)}, B=${Color.blue(darkGelPixel)}",
+            Color.blue(darkGelPixel) >= 38 &&
+                Color.blue(darkGelPixel) > Color.red(darkGelPixel) + 12 &&
+                Color.blue(darkGelPixel) > Color.green(darkGelPixel) + 8
+        )
+
+        // 3. Low-Saturation Blue Ink must preserve its blue tint (B > R + 6 and B > G + 4)
+        val lowSatBluePixel = result.processedBitmap.getPixel(190, 55)
+        assertTrue(
+            "Low-saturation blue ink must retain blue channel lead: R=${Color.red(lowSatBluePixel)}, G=${Color.green(lowSatBluePixel)}, B=${Color.blue(lowSatBluePixel)}",
+            Color.blue(lowSatBluePixel) > Color.red(lowSatBluePixel) + 6 &&
+                Color.blue(lowSatBluePixel) > Color.green(lowSatBluePixel) + 4
+        )
+
+        // 4. Neutral Black Pen must remain neutral dark grey/black (|R - B| <= 8)
+        val blackPenPixel = result.processedBitmap.getPixel(260, 55)
+        assertTrue(
+            "Black pen must remain dark and neutral: R=${Color.red(blackPenPixel)}, G=${Color.green(blackPenPixel)}, B=${Color.blue(blackPenPixel)}",
+            Color.red(blackPenPixel) < 60 &&
+                kotlin.math.abs(Color.blue(blackPenPixel) - Color.red(blackPenPixel)) <= 8
+        )
+    }
+
+    @Test
+    fun testPhase2HindiSignatureDotsDisconnectedMarksNoiseRejectionSafeMarginTrimmingAndBlankFallback() {
+        val width = 340
+        val height = 150
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(Color.rgb(238, 237, 233))
+
+        // Draw Hindi-style signature with shirorekha (top bar), curved characters, matra, and small bindu/nukta dots
+        // Also place a genuine stroke near the left edge (x = 4) to verify outer 2% border strokes are NOT clipped!
+        for (x in 4..18) {
+            bmp.setPixel(x, 72, Color.rgb(35, 65, 195))
+            bmp.setPixel(x, 73, Color.rgb(35, 65, 195))
+        }
+        // Shirorekha top bar (x = 40..210, y = 48)
+        for (x in 40..210) {
+            bmp.setPixel(x, 48, Color.rgb(30, 62, 190))
+        }
+        // Vertical & curved Hindi character strokes under shirorekha
+        for (stemX in listOf(58, 96, 138, 182)) {
+            for (y in 49..86) {
+                bmp.setPixel(stemX, y, Color.rgb(32, 64, 192))
+                if (y in 58..74) {
+                    bmp.setPixel(stemX - 4, y, Color.rgb(42, 75, 198))
+                }
+            }
+        }
+        // Upper matra ascender (y = 34..47)
+        for (i in 0..13) {
+            bmp.setPixel(96 - i / 2, 47 - i, Color.rgb(36, 68, 194))
+        }
+        // Small 2-pixel Hindi bindu (anusvara) above shirorekha at (138..139, 36)
+        bmp.setPixel(138, 36, Color.rgb(28, 58, 188))
+        bmp.setPixel(139, 36, Color.rgb(28, 58, 188))
+
+        // Small 2-pixel nukta dot below character at (96, 94..95)
+        bmp.setPixel(96, 94, Color.rgb(30, 60, 190))
+        bmp.setPixel(96, 95, Color.rgb(30, 60, 190))
+
+        // Disconnected 3-pixel punctuation period near right end of signature at (220..222, 84)
+        bmp.setPixel(220, 84, Color.rgb(32, 62, 190))
+        bmp.setPixel(221, 84, Color.rgb(32, 62, 190))
+        bmp.setPixel(222, 84, Color.rgb(32, 62, 190))
+
+        // Inject 25 isolated 1-pixel dark sensor noise specks across the background
+        for (i in 0 until 25) {
+            val nx = 260 + (i * 3) % 70
+            val ny = 12 + (i * 11) % 125
+            bmp.setPixel(nx, ny, Color.rgb(40, 40, 45))
+        }
+        // Inject a distant 2-pixel margin speck far away from handwriting at (325..326, 138)
+        bmp.setPixel(325, 138, Color.rgb(80, 80, 85))
+        bmp.setPixel(326, 138, Color.rgb(80, 80, 85))
+
+        // First verify untrimmed mask to check exact coordinates of dots and noise specks
+        val untrimmed = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            sourceBitmap = bmp,
+            preserveInkColor = true,
+            trimMargins = false
+        )
+        assertTrue(untrimmed.usedAdaptiveSauvola)
+        // Hindi bindu (138, 36), nukta (96, 94), punctuation dot (221, 84), and edge-near stroke (4, 72) must be preserved
+        assertFalse("Hindi bindu dot must be preserved as ink", untrimmed.backgroundMask[36 * width + 138])
+        assertFalse("Hindi nukta dot must be preserved as ink", untrimmed.backgroundMask[94 * width + 96])
+        assertFalse("Signature period mark must be preserved as ink", untrimmed.backgroundMask[84 * width + 221])
+        assertFalse("Edge-near stroke at x=4 must be preserved as ink", untrimmed.backgroundMask[72 * width + 4])
+
+        // Isolated 1px sensor noise specks and distant margin speck must be rejected as pure white background
+        assertTrue("Isolated 1px sensor noise must be rejected", untrimmed.backgroundMask[12 * width + 260])
+        assertEquals(Color.WHITE, untrimmed.processedBitmap.getPixel(260, 12))
+        assertTrue("Distant margin speck at (325, 138) must be rejected", untrimmed.backgroundMask[138 * width + 325])
+
+        // Now verify safe margin trimming
+        val trimmed = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            sourceBitmap = bmp,
+            preserveInkColor = true,
+            trimMargins = true
+        )
+        assertTrue(trimmed.usedAdaptiveSauvola)
+        assertTrue(trimmed.strokeBoundingBoxFound)
+        val box = trimmed.inkBoundingBoxPx
+        // Bounds must be valid and strictly inside source bitmap
+        assertTrue(box.left >= 0 && box.top >= 0 && box.right <= width && box.bottom <= height)
+        // Must include the left-edge stroke (x=4), upper matra/bindu (y=34), lower nukta (y=95), and right period (x=222)
+        // without clipping any of them, while excluding the distant right margin (x=325)
+        assertEquals("Left crop must clamp safely to 0 without clipping stroke at x=4", 0, box.left)
+        assertTrue("Top crop (${box.top}) must preserve upper matra/bindu at y=34 with white padding", box.top <= 28)
+        assertTrue("Bottom crop (${box.bottom}) must preserve lower nukta at y=95 with white padding", box.bottom >= 102)
+        assertTrue("Right crop (${box.right}) must preserve period at x=222 with white padding", box.right >= 230)
+        assertTrue("Right crop (${box.right}) must trim empty right margin and distant noise", box.right < 290)
+
+        // Finally verify blank / noisy-blank page triggers safe gentle fallback without false bounding box
+        val blankNoisyBmp = Bitmap.createBitmap(240, 100, Bitmap.Config.ARGB_8888)
+        blankNoisyBmp.eraseColor(Color.rgb(236, 236, 234))
+        for (i in 0 until 20) {
+            blankNoisyBmp.setPixel(15 + i * 10, 20 + (i * 7) % 60, Color.rgb(50, 50, 55))
+        }
+        val blankResult = com.example.processing.SignatureVisionProcessor.extractSignatureOrThumb(
+            sourceBitmap = blankNoisyBmp,
+            preserveInkColor = true,
+            trimMargins = true
+        )
+        assertFalse("Blank page with only isolated 1px specks must use safe fallback", blankResult.usedAdaptiveSauvola)
+        assertFalse("Blank page must not report strokeBoundingBoxFound", blankResult.strokeBoundingBoxFound)
+        assertEquals(android.graphics.Rect(0, 0, 240, 100), blankResult.inkBoundingBoxPx)
+    }
 }
+
 
