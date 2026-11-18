@@ -31,34 +31,46 @@ object OneClickPreparationCoordinator {
         userPreviewAccepted: Boolean
     ): ProcessedFileResult {
         val requiresApproval = result.requiresUserPreviewApproval
+        val faceFramingVerified = !result.requiresManualCropConfirmation || result.manualCropConfirmedByUser
+        // Ordinary preview acceptance cannot bypass an unresolved manual face/framing requirement
+        val effectiveAccepted = userPreviewAccepted && faceFramingVerified
         val approvalStatus = when {
             !requiresApproval -> PreviewApprovalStatus.NOT_REQUIRED
-            userPreviewAccepted -> PreviewApprovalStatus.APPROVED_BY_USER
+            effectiveAccepted -> PreviewApprovalStatus.APPROVED_BY_USER
             else -> PreviewApprovalStatus.PENDING_USER_APPROVAL
         }
         val isExportReady =
             result.isCompliant &&
             (!result.requiresWhiteBackground || result.technicalBackgroundCompliant) &&
-            (!requiresApproval || userPreviewAccepted)
+            faceFramingVerified &&
+            (!requiresApproval || effectiveAccepted)
         val updatedStatus = when {
             !result.isCompliant -> result.status
-            requiresApproval && !userPreviewAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
+            !faceFramingVerified -> PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED
+            requiresApproval && !effectiveAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
             else -> PreparationStatus.SUCCESS_PREPARED
         }
         val filteredMessages = result.validationMessages.filterNot {
-            it.startsWith("Preview Approval Pending:") || it.startsWith("Preview Approved:")
+            it.startsWith("Preview Approval Pending:") ||
+                it.startsWith("Preview Approved:") ||
+                it.startsWith("Manual Framing Required:")
         }.toMutableList()
-        if (result.isCompliant && requiresApproval) {
-            if (userPreviewAccepted) {
-                filteredMessages.add("Preview Approved: User reviewed and accepted the processed preview.")
-            } else {
-                filteredMessages.add("Preview Approval Pending: Please review the processed preview and accept it to mark export-ready.")
+        if (result.isCompliant) {
+            if (!faceFramingVerified) {
+                filteredMessages.add("Manual Framing Required: Please select the intended person or confirm manual portrait framing before approving export.")
+            } else if (requiresApproval) {
+                if (effectiveAccepted) {
+                    filteredMessages.add("Preview Approved: User reviewed and accepted the processed preview.")
+                } else {
+                    filteredMessages.add("Preview Approval Pending: Please review the processed preview and accept it to mark export-ready.")
+                }
             }
         }
         @Suppress("DEPRECATION")
-        val legacyVerifiedBg = result.technicalBackgroundCompliant && (!requiresApproval || userPreviewAccepted)
+        val legacyVerifiedBg = result.technicalBackgroundCompliant && (!requiresApproval || effectiveAccepted)
         return result.copy(
-            userPreviewAccepted = userPreviewAccepted,
+            userPreviewAccepted = effectiveAccepted,
+            faceFramingVerified = faceFramingVerified,
             approvalStatus = approvalStatus,
             isExportReady = isExportReady,
             status = updatedStatus,
@@ -75,7 +87,9 @@ object OneClickPreparationCoordinator {
      * 3. Propagates technical background verification signals ([ProcessedFileResult.segmentationExecuted],
      *    [ProcessedFileResult.backgroundReplacementApplied], [ProcessedFileResult.outputBackgroundPixelChecksPassed],
      *    [ProcessedFileResult.subjectMaskConfidence] / [ProcessedFileResult.edgeUncertaintyRatio])
-     *    independently from [ProcessedFileResult.userPreviewAccepted] into [ImageProcessor.processImageForRule].
+     *    and portrait face/framing verification signals ([ProcessedFileResult.requiresManualCropConfirmation],
+     *    [ProcessedFileResult.manualCropConfirmedByUser], [ProcessedFileResult.faceFramingVerified],
+     *    [ProcessedFileResult.portraitFramingState]) independently into [ImageProcessor.processImageForRule].
      * 4. Resizes to exact prescribed dimensions, adds optional Name & DOP strip, and verifies disk output.
      */
     suspend fun autoPreparePhoto(
@@ -90,12 +104,14 @@ object OneClickPreparationCoordinator {
         customTargetKb: Int? = null,
         enforceProportional: Boolean = true,
         cropRectNorm: RectF? = null,
+        selectedFaceIndex: Int? = null,
+        manualCropConfirmedByUser: Boolean = false,
         removeBackgroundToWhite: Boolean = false,
         customDpi: Int? = null,
         requiresUserPreviewApproval: Boolean = true,
         userPreviewAccepted: Boolean = false,
-        faceEngine: PortraitVisionProcessor.FaceDetectionEngine = PortraitVisionProcessor.mlKitFaceDetectionEngine,
-        segmentationEngine: PortraitVisionProcessor.SelfieSegmentationEngine = PortraitVisionProcessor.mlKitSelfieSegmentationEngine
+        faceEngine: PortraitVisionProcessor.FaceDetectionEngine = PortraitVisionProcessor.activeFaceDetectionEngine,
+        segmentationEngine: PortraitVisionProcessor.SelfieSegmentationEngine = PortraitVisionProcessor.activeSelfieSegmentationEngine
     ): ProcessedFileResult? {
         val bitmap = preDecodedBitmap ?: input?.resolveBitmap(context) ?: return null
 
@@ -109,37 +125,58 @@ object OneClickPreparationCoordinator {
             rule = rule,
             applyWhiteBackground = removeBackgroundToWhite || rule.requiresWhiteBackground,
             manualCropRectNorm = effectiveCropRectNorm,
+            selectedFaceIndex = selectedFaceIndex,
+            manualCropConfirmedByUser = manualCropConfirmedByUser,
             faceEngine = faceEngine,
             segmentationEngine = segmentationEngine
         )
 
         val hasVisionSegmentation = visionResult.segmentationExecuted && visionResult.backgroundMask != null
+        val faceFramingVerified = !visionResult.requiresManualCropConfirmation || visionResult.manualCropConfirmedByUser
+        val effectivePreviewAccepted = userPreviewAccepted && faceFramingVerified
 
-        return ImageProcessor.processImageForRule(
-            context = context,
-            originalBitmap = visionResult.preparedBitmap,
-            rule = rule,
-            candidateName = candidateName,
-            dateOfPhoto = dateOfPhoto,
-            customTargetKb = targetKb,
-            customWidthPx = w,
-            customHeightPx = h,
-            enforceProportional = enforceProportional,
-            cropRectNorm = null, // Already framed/cropped by PortraitVisionProcessor
-            removeBackgroundToWhite = removeBackgroundToWhite,
-            customDpi = customDpi ?: rule.dpi,
-            backgroundMask = visionResult.backgroundMask,
-            backgroundMaskWidth = visionResult.preparedBitmap.width,
-            backgroundMaskHeight = visionResult.preparedBitmap.height,
-            alreadyBackgroundReplaced = hasVisionSegmentation && visionResult.backgroundReplacementApplied,
-            segmentationExecuted = visionResult.segmentationExecuted,
-            backgroundReplacementApplied = visionResult.backgroundReplacementApplied || removeBackgroundToWhite,
-            maskConfidencePassed = visionResult.maskConfidencePassed,
-            subjectMaskConfidence = visionResult.subjectMaskConfidence,
-            edgeUncertaintyRatio = visionResult.edgeUncertaintyRatio,
-            requiresUserPreviewApproval = requiresUserPreviewApproval,
-            userPreviewAccepted = userPreviewAccepted
-        )
+        return try {
+            ImageProcessor.processImageForRule(
+                context = context,
+                originalBitmap = visionResult.preparedBitmap,
+                rule = rule,
+                candidateName = candidateName,
+                dateOfPhoto = dateOfPhoto,
+                customTargetKb = targetKb,
+                customWidthPx = w,
+                customHeightPx = h,
+                enforceProportional = enforceProportional,
+                cropRectNorm = null, // Already framed/cropped by PortraitVisionProcessor
+                removeBackgroundToWhite = removeBackgroundToWhite,
+                customDpi = customDpi ?: rule.dpi,
+                backgroundMask = visionResult.backgroundMask,
+                backgroundMaskWidth = visionResult.preparedBitmap.width,
+                backgroundMaskHeight = visionResult.preparedBitmap.height,
+                alreadyBackgroundReplaced = hasVisionSegmentation && visionResult.backgroundReplacementApplied,
+                segmentationExecuted = visionResult.segmentationExecuted,
+                backgroundReplacementApplied = visionResult.backgroundReplacementApplied || removeBackgroundToWhite,
+                maskConfidencePassed = visionResult.maskConfidencePassed,
+                subjectMaskConfidence = visionResult.subjectMaskConfidence,
+                edgeUncertaintyRatio = visionResult.edgeUncertaintyRatio,
+                requiresUserPreviewApproval = requiresUserPreviewApproval,
+                userPreviewAccepted = effectivePreviewAccepted,
+                detectedFaceCount = visionResult.detectedFaceCount,
+                detectedFacesNorm = visionResult.detectedFaces.map { RectF(it.boundingBoxNorm) },
+                selectedFaceIndex = visionResult.selectedFaceIndex,
+                appliedCropRectNorm = RectF(visionResult.computedCropRectNorm),
+                requiresManualCropConfirmation = visionResult.requiresManualCropConfirmation,
+                manualCropConfirmedByUser = visionResult.manualCropConfirmedByUser,
+                portraitFramingState = visionResult.portraitFramingState,
+                portraitDiagnosticMessage = visionResult.diagnosticMessage
+            )
+        } finally {
+            if (visionResult.preparedBitmap !== bitmap &&
+                visionResult.preparedBitmap !== preDecodedBitmap &&
+                !visionResult.preparedBitmap.isRecycled
+            ) {
+                visionResult.preparedBitmap.recycle()
+            }
+        }
     }
 
     /**
@@ -154,6 +191,9 @@ object OneClickPreparationCoordinator {
         candidateName: String = "",
         dateOfPhoto: String = "",
         enforceProportional: Boolean = true,
+        cropRectNorm: RectF? = null,
+        selectedFaceIndex: Int? = null,
+        manualCropConfirmedByUser: Boolean = false,
         removeBackgroundToWhite: Boolean = false,
         requiresUserPreviewApproval: Boolean = true,
         userPreviewAccepted: Boolean = false
@@ -166,6 +206,9 @@ object OneClickPreparationCoordinator {
             dateOfPhoto = dateOfPhoto,
             customTargetKb = targetSizeKb,
             enforceProportional = enforceProportional,
+            cropRectNorm = cropRectNorm,
+            selectedFaceIndex = selectedFaceIndex,
+            manualCropConfirmedByUser = manualCropConfirmedByUser,
             removeBackgroundToWhite = removeBackgroundToWhite,
             customDpi = customDpi,
             requiresUserPreviewApproval = requiresUserPreviewApproval,

@@ -6,6 +6,7 @@ import android.graphics.Matrix
 import android.graphics.PointF
 import android.graphics.RectF
 import com.example.data.model.DocumentRule
+import com.example.data.model.PortraitFramingState
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
@@ -319,10 +320,45 @@ object PortraitVisionProcessor {
         val foregroundAreaRatio: Float,
         val backgroundMask: BooleanArray?,
         val framingProfile: PortraitFramingProfile,
-        val diagnosticMessage: String
+        val diagnosticMessage: String,
+        val detectedFaces: List<DetectedFaceInfo> = emptyList(),
+        val selectedFaceIndex: Int? = null,
+        val manualCropConfirmedByUser: Boolean = false,
+        val framingConfidencePassed: Boolean = detectedFaceCount == 1,
+        val faceFramingVerified: Boolean = !requiresManualCropConfirmation || manualCropConfirmedByUser,
+        val portraitFramingState: PortraitFramingState = when {
+            manualCropConfirmedByUser -> PortraitFramingState.MANUALLY_CONFIRMED
+            requiresManualCropConfirmation && detectedFaceCount == 0 -> PortraitFramingState.NO_FACE_DETECTED
+            requiresManualCropConfirmation && detectedFaceCount > 1 -> PortraitFramingState.MULTIPLE_FACES_DETECTED
+            requiresManualCropConfirmation -> PortraitFramingState.LOW_CONFIDENCE_FRAMING
+            detectedFaceCount == 1 -> PortraitFramingState.VERIFIED_SINGLE_FACE
+            else -> PortraitFramingState.NOT_APPLICABLE
+        }
     ) {
         val preparedBitmap: Bitmap
             get() = croppedPortraitBitmap
+    }
+
+    /**
+     * Evaluates whether a single detected face has reliable portrait framing geometry
+     * (adequate size, not clipped at the image edge, and within levelable head tilt bounds).
+     */
+    fun evaluateFaceFramingConfidence(face: DetectedFaceInfo): Boolean {
+        val box = face.boundingBoxNorm
+        val w = box.width()
+        val h = box.height()
+        val validSize = w in 0.08f..0.92f && h in 0.10f..0.90f
+        val notClippedAtEdge = box.left >= 0.01f && box.top >= 0.01f && box.right <= 0.99f && box.bottom <= 0.99f
+        val validRoll = abs(face.eulerZDegrees) <= 18f
+        return validSize && notClippedAtEdge && validRoll
+    }
+
+    fun sanitizeCropRectNorm(rect: RectF): RectF {
+        val left = rect.left.coerceIn(0f, 0.90f)
+        val top = rect.top.coerceIn(0f, 0.90f)
+        val right = rect.right.coerceIn(left + 0.10f, 1f)
+        val bottom = rect.bottom.coerceIn(top + 0.10f, 1f)
+        return RectF(left, top, right, bottom)
     }
 
     /**
@@ -582,12 +618,21 @@ object PortraitVisionProcessor {
 
     /**
      * Full on-device portrait analysis and segmentation pipeline.
+     *
+     * Handles the 4 portrait face/framing cases explicitly:
+     * A. Zero faces detected -> requires manual framing confirmation.
+     * B. Multiple faces detected -> never silently selects a face; exposes [PortraitPreparationAnalysis.detectedFaces]
+     *    and requires explicit user face selection or manual framing confirmation.
+     * C. One face detected with insufficient framing or segmentation confidence -> requires manual review/confirmation.
+     * D. One face detected with reliable framing and segmentation -> proceeds automatically.
      */
     suspend fun analyzeAndPreparePortrait(
         sourceBitmap: Bitmap,
         rule: DocumentRule,
         applyWhiteBackground: Boolean,
         manualCropRectNorm: RectF? = null,
+        selectedFaceIndex: Int? = null,
+        manualCropConfirmedByUser: Boolean = false,
         faceEngine: FaceDetectionEngine = activeFaceDetectionEngine,
         segmentationEngine: SelfieSegmentationEngine = activeSelfieSegmentationEngine
     ): PortraitPreparationAnalysis {
@@ -622,21 +667,33 @@ object PortraitVisionProcessor {
             }
         }
 
-        val primaryFace = faces.maxByOrNull { it.boundingBoxNorm.width() * it.boundingBoxNorm.height() }
-        val requiresManualConfirmation = faces.size != 1
+        val validSelectedFaceIdx = selectedFaceIndex?.takeIf { it in faces.indices }
+        // Never silently choose a face when multiple faces are detected unless the user explicitly selected one.
+        val chosenFace: DetectedFaceInfo? = when {
+            validSelectedFaceIdx != null -> faces[validSelectedFaceIdx]
+            faces.size == 1 -> faces[0]
+            else -> null
+        }
 
-        if (primaryFace != null && faces.size == 1 && abs(primaryFace.eulerZDegrees) in 2.5f..18f && manualCropRectNorm == null) {
-            val leveled = rotateBitmap(workingBitmap, -primaryFace.eulerZDegrees)
+        val singleFaceFramingOk = when {
+            validSelectedFaceIdx != null && chosenFace != null -> evaluateFaceFramingConfidence(chosenFace)
+            faces.size == 1 && chosenFace != null -> evaluateFaceFramingConfidence(chosenFace)
+            else -> false
+        }
+
+        if (chosenFace != null && faces.size == 1 && abs(chosenFace.eulerZDegrees) in 2.5f..18f && manualCropRectNorm == null) {
+            val leveled = rotateBitmap(workingBitmap, -chosenFace.eulerZDegrees)
             if (workingBitmap !== sourceBitmap && workingBitmap !== leveled && !workingBitmap.isRecycled) {
                 workingBitmap.recycle()
             }
             workingBitmap = leveled
         }
 
+        val sanitizedManualCrop = manualCropRectNorm?.let { sanitizeCropRectNorm(it) }
         val cropRectNorm = when {
-            manualCropRectNorm != null -> manualCropRectNorm
-            primaryFace != null && faces.size == 1 -> computePortraitCropRectFromFace(
-                face = primaryFace,
+            sanitizedManualCrop != null -> sanitizedManualCrop
+            chosenFace != null -> computePortraitCropRectFromFace(
+                face = chosenFace,
                 imageWidth = workingBitmap.width,
                 imageHeight = workingBitmap.height,
                 targetAspectRatio = targetRatio,
@@ -651,25 +708,40 @@ object PortraitVisionProcessor {
         }
 
         val shouldRunSegmentation = applyWhiteBackground || rule.requiresWhiteBackground
-        val rawMask = if (shouldRunSegmentation) {
-            segmentationEngine.segmentPortrait(cropped)
-        } else {
-            null
-        }
+        val rawMask = segmentationEngine.segmentPortrait(cropped)
 
         if (rawMask == null) {
+            val segConfidenceOk = !shouldRunSegmentation
+            val requiresManual = !manualCropConfirmedByUser && (faces.size != 1 || !singleFaceFramingOk || !segConfidenceOk)
+            val framingState = when {
+                manualCropConfirmedByUser -> PortraitFramingState.MANUALLY_CONFIRMED
+                faces.isEmpty() -> PortraitFramingState.NO_FACE_DETECTED
+                faces.size > 1 -> PortraitFramingState.MULTIPLE_FACES_DETECTED
+                !singleFaceFramingOk || !segConfidenceOk -> PortraitFramingState.LOW_CONFIDENCE_FRAMING
+                else -> PortraitFramingState.VERIFIED_SINGLE_FACE
+            }
             val diag = when {
-                faces.isEmpty() -> "No face detected automatically — used centered aspect crop. Adjust crop manually if needed."
-                faces.size > 1 -> "Multiple faces (${faces.size}) detected — please confirm crop region."
-                shouldRunSegmentation -> "Face framed; on-device segmentation mask unavailable — background compliance remains unverified."
-                else -> "Face detected and framed to target aspect ratio."
+                manualCropConfirmedByUser && validSelectedFaceIdx != null ->
+                    "Manual Framing Confirmed: Selected Person #${validSelectedFaceIdx + 1} of ${faces.size} and re-ran portrait preparation."
+                manualCropConfirmedByUser ->
+                    "Manual Framing Confirmed: User-verified portrait crop applied."
+                faces.isEmpty() ->
+                    "No Face Detected: Automatic portrait framing could not find a face. Manual crop/framing confirmation is required."
+                faces.size > 1 ->
+                    "Multiple Faces Detected (${faces.size}): Please select the intended person or manually frame and confirm the crop."
+                !singleFaceFramingOk ->
+                    "Low Framing Confidence: Detected face is near the boundary or out of standard proportions. Please review and confirm framing."
+                shouldRunSegmentation ->
+                    "Low Segmentation Confidence: On-device segmentation mask unavailable — manual review required and background compliance remains unverified."
+                else ->
+                    "Single Face Verified: Face detected and framed to target aspect ratio."
             }
             return PortraitPreparationAnalysis(
                 croppedPortraitBitmap = cropped,
                 computedCropRectNorm = cropRectNorm,
                 detectedFaceCount = faces.size,
-                primaryFace = primaryFace,
-                requiresManualCropConfirmation = requiresManualConfirmation,
+                primaryFace = chosenFace,
+                requiresManualCropConfirmation = requiresManual,
                 segmentationExecuted = false,
                 backgroundReplacementApplied = false,
                 maskConfidencePassed = false,
@@ -678,7 +750,13 @@ object PortraitVisionProcessor {
                 foregroundAreaRatio = 0f,
                 backgroundMask = null,
                 framingProfile = framingProfile,
-                diagnosticMessage = diag
+                diagnosticMessage = diag,
+                detectedFaces = faces,
+                selectedFaceIndex = validSelectedFaceIdx,
+                manualCropConfirmedByUser = manualCropConfirmedByUser,
+                framingConfidencePassed = singleFaceFramingOk,
+                faceFramingVerified = !requiresManual || manualCropConfirmedByUser,
+                portraitFramingState = framingState
             )
         }
 
@@ -691,21 +769,40 @@ object PortraitVisionProcessor {
             cropped.recycle()
         }
 
+        val requiresManual = !manualCropConfirmedByUser &&
+            (faces.size != 1 || !singleFaceFramingOk || !segOutcome.maskConfidencePassed)
+
+        val framingState = when {
+            manualCropConfirmedByUser -> PortraitFramingState.MANUALLY_CONFIRMED
+            faces.isEmpty() -> PortraitFramingState.NO_FACE_DETECTED
+            faces.size > 1 -> PortraitFramingState.MULTIPLE_FACES_DETECTED
+            !singleFaceFramingOk || !segOutcome.maskConfidencePassed -> PortraitFramingState.LOW_CONFIDENCE_FRAMING
+            else -> PortraitFramingState.VERIFIED_SINGLE_FACE
+        }
+
         val diag = when {
-            requiresManualConfirmation ->
-                "Portrait segmented, but ${if (faces.isEmpty()) "no single face" else "multiple faces"} detected — please review crop."
+            manualCropConfirmedByUser && validSelectedFaceIdx != null ->
+                "Manual Framing Confirmed: Selected Person #${validSelectedFaceIdx + 1} of ${faces.size} and re-ran portrait pipeline."
+            manualCropConfirmedByUser ->
+                "Manual Framing Confirmed: User-verified portrait crop applied."
+            faces.isEmpty() ->
+                "No Face Detected: Portrait segmented, but no face was found. Please manually frame and confirm the portrait crop."
+            faces.size > 1 ->
+                "Multiple Faces Detected (${faces.size}): Please select the intended person or manually frame and confirm the crop."
+            !singleFaceFramingOk ->
+                "Low Framing Confidence: Detected face is near the boundary or tilted — please review and confirm portrait framing."
             !segOutcome.maskConfidencePassed ->
-                "Background segmented with boundary uncertainty (confidence ${(segOutcome.subjectMaskConfidence * 100).toInt()}%, edge uncertainty ${(segOutcome.edgeUncertaintyRatio * 100).toInt()}%) — please review preview before saving."
+                "Low Segmentation Confidence (confidence ${(segOutcome.subjectMaskConfidence * 100).toInt()}%, edge uncertainty ${(segOutcome.edgeUncertaintyRatio * 100).toInt()}%) — manual review and confirmation required before export."
             else ->
-                "Face framed & background segmented (confidence ${(segOutcome.subjectMaskConfidence * 100).toInt()}%, edge uncertainty ${(segOutcome.edgeUncertaintyRatio * 100).toInt()}%)."
+                "Single Face Verified: Face framed & background segmented (confidence ${(segOutcome.subjectMaskConfidence * 100).toInt()}%, edge uncertainty ${(segOutcome.edgeUncertaintyRatio * 100).toInt()}%)."
         }
 
         return PortraitPreparationAnalysis(
             croppedPortraitBitmap = segOutcome.outputBitmap,
             computedCropRectNorm = cropRectNorm,
             detectedFaceCount = faces.size,
-            primaryFace = primaryFace,
-            requiresManualCropConfirmation = requiresManualConfirmation || !segOutcome.maskConfidencePassed,
+            primaryFace = chosenFace,
+            requiresManualCropConfirmation = requiresManual,
             segmentationExecuted = true,
             backgroundReplacementApplied = applyWhiteBackground,
             maskConfidencePassed = segOutcome.maskConfidencePassed,
@@ -714,7 +811,13 @@ object PortraitVisionProcessor {
             foregroundAreaRatio = segOutcome.foregroundAreaRatio,
             backgroundMask = segOutcome.backgroundMask,
             framingProfile = framingProfile,
-            diagnosticMessage = diag
+            diagnosticMessage = diag,
+            detectedFaces = faces,
+            selectedFaceIndex = validSelectedFaceIdx,
+            manualCropConfirmedByUser = manualCropConfirmedByUser,
+            framingConfidencePassed = singleFaceFramingOk,
+            faceFramingVerified = !requiresManual || manualCropConfirmedByUser,
+            portraitFramingState = framingState
         )
     }
 

@@ -223,7 +223,15 @@ object ImageProcessor {
         edgeUncertaintyRatio: Float = 0f,
         requiresUserPreviewApproval: Boolean = true,
         userPreviewAccepted: Boolean = false,
-        signatureExtractionResult: SignatureVisionProcessor.SignatureExtractionResult? = null
+        signatureExtractionResult: SignatureVisionProcessor.SignatureExtractionResult? = null,
+        detectedFaceCount: Int = 0,
+        detectedFacesNorm: List<RectF> = emptyList(),
+        selectedFaceIndex: Int? = null,
+        appliedCropRectNorm: RectF? = null,
+        requiresManualCropConfirmation: Boolean = false,
+        manualCropConfirmedByUser: Boolean = false,
+        portraitFramingState: com.example.data.model.PortraitFramingState = com.example.data.model.PortraitFramingState.NOT_APPLICABLE,
+        portraitDiagnosticMessage: String? = null
     ): ProcessedFileResult = withContext(Dispatchers.Default) {
         var workingBitmap: Bitmap = originalBitmap
         var scaled: Bitmap? = null
@@ -644,18 +652,29 @@ object ImageProcessor {
             whiteBgMet &&
             dpiVerified
 
+        val faceFramingVerified = !requiresManualCropConfirmation || manualCropConfirmedByUser
+        val effectiveUserPreviewAccepted = userPreviewAccepted && faceFramingVerified
+
+        if (!portraitDiagnosticMessage.isNullOrBlank()) {
+            validationMessages.add(portraitDiagnosticMessage)
+        }
+        if (isCompliant && !faceFramingVerified) {
+            validationMessages.add("Manual Framing Required: Please select the intended person or confirm manual portrait framing before approving export.")
+        }
+
         val approvalStatus = when {
             !requiresUserPreviewApproval -> com.example.data.model.PreviewApprovalStatus.NOT_REQUIRED
-            userPreviewAccepted -> com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER
+            effectiveUserPreviewAccepted -> com.example.data.model.PreviewApprovalStatus.APPROVED_BY_USER
             else -> com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL
         }
 
         val isExportReady =
             isCompliant &&
             (!rule.requiresWhiteBackground || technicalBackgroundCompliant) &&
-            (!requiresUserPreviewApproval || userPreviewAccepted)
+            faceFramingVerified &&
+            (!requiresUserPreviewApproval || effectiveUserPreviewAccepted)
 
-        if (isCompliant && requiresUserPreviewApproval && !userPreviewAccepted) {
+        if (isCompliant && faceFramingVerified && requiresUserPreviewApproval && !effectiveUserPreviewAccepted) {
             validationMessages.add("Preview Approval Pending: Please review the processed preview and accept it to mark export-ready.")
         }
 
@@ -667,7 +686,8 @@ object ImageProcessor {
             !exactDimsMet || !boundedDimsMet -> PreparationStatus.DIMENSIONS_MISMATCH
             !whiteBgMet -> if (!measuredNearWhite) PreparationStatus.BACKGROUND_NOT_WHITE else PreparationStatus.BACKGROUND_UNVERIFIED
             !dpiVerified -> PreparationStatus.DPI_MISMATCH
-            requiresUserPreviewApproval && !userPreviewAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
+            !faceFramingVerified -> PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED
+            requiresUserPreviewApproval && !effectiveUserPreviewAccepted -> PreparationStatus.PENDING_PREVIEW_APPROVAL
             else -> PreparationStatus.SUCCESS_PREPARED
         }
 
@@ -694,7 +714,7 @@ object ImageProcessor {
             requiresWhiteBackground = rule.requiresWhiteBackground,
             technicalBackgroundCompliant = technicalBackgroundCompliant,
             requiresUserPreviewApproval = requiresUserPreviewApproval,
-            userPreviewAccepted = userPreviewAccepted,
+            userPreviewAccepted = effectiveUserPreviewAccepted,
             approvalStatus = approvalStatus,
             isExportReady = isExportReady,
             verifiedBackgroundCompliance = legacyVerifiedBackgroundCompliance,
@@ -708,7 +728,16 @@ object ImageProcessor {
             outputBackgroundPixelChecksPassed = measuredNearWhite,
             subjectMaskConfidence = if (isSignatureOrThumbRule) 0f else subjectMaskConfidence,
             edgeUncertaintyRatio = if (isSignatureOrThumbRule) 0f else edgeUncertaintyRatio,
-            signatureEvidence = signatureEvidence
+            signatureEvidence = signatureEvidence,
+            detectedFaceCount = if (isSignatureOrThumbRule) 0 else detectedFaceCount,
+            detectedFacesNorm = if (isSignatureOrThumbRule) emptyList() else detectedFacesNorm.map { RectF(it) },
+            selectedFaceIndex = if (isSignatureOrThumbRule) null else selectedFaceIndex,
+            appliedCropRectNorm = if (isSignatureOrThumbRule) null else appliedCropRectNorm?.let { RectF(it) },
+            requiresManualCropConfirmation = if (isSignatureOrThumbRule) false else requiresManualCropConfirmation,
+            manualCropConfirmedByUser = if (isSignatureOrThumbRule) false else manualCropConfirmedByUser,
+            faceFramingVerified = if (isSignatureOrThumbRule) true else faceFramingVerified,
+            portraitFramingState = if (isSignatureOrThumbRule) com.example.data.model.PortraitFramingState.NOT_APPLICABLE else portraitFramingState,
+            portraitDiagnosticMessage = if (isSignatureOrThumbRule) null else portraitDiagnosticMessage
         )
     }
 

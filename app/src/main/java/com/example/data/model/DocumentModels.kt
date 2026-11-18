@@ -1,5 +1,6 @@
 package com.example.data.model
 
+import android.graphics.RectF
 import android.net.Uri
 
 enum class DocumentType(val displayName: String, val category: String) {
@@ -68,6 +69,7 @@ enum class VerificationStatus(val label: String, val isOfficiallyVerified: Boole
 enum class PreparationStatus(val label: String) {
     SUCCESS_PREPARED("Successfully Prepared"),
     PENDING_PREVIEW_APPROVAL("Technically Compliant — Pending Preview Approval"),
+    FACE_FRAMING_CONFIRMATION_REQUIRED("Manual Face / Framing Confirmation Required"),
     SIZE_EXCEEDED("File Size Exceeded"),
     SIZE_BELOW_MIN("File Size Too Small"),
     DIMENSIONS_MISMATCH("Dimensions Mismatch"),
@@ -76,6 +78,15 @@ enum class PreparationStatus(val label: String) {
     DPI_MISMATCH("DPI Metadata Mismatch"),
     CONFLICT_LIMITS("Requirements Conflict"),
     FAILED("Processing Failed")
+}
+
+enum class PortraitFramingState(val label: String) {
+    NOT_APPLICABLE("Not Applicable"),
+    VERIFIED_SINGLE_FACE("Single Face Framed & Verified"),
+    NO_FACE_DETECTED("No Face Detected — Manual Framing Required"),
+    MULTIPLE_FACES_DETECTED("Multiple Faces Detected — Select or Frame Person"),
+    LOW_CONFIDENCE_FRAMING("Low Framing/Segmentation Confidence — Manual Review Required"),
+    MANUALLY_CONFIRMED("Manual Framing Confirmed by User")
 }
 
 enum class PreviewApprovalStatus {
@@ -181,14 +192,31 @@ data class ProcessedFileResult(
     val technicalBackgroundCompliant: Boolean = false,
     val requiresUserPreviewApproval: Boolean = true,
     val userPreviewAccepted: Boolean = false,
+    val detectedFaceCount: Int = 0,
+    val detectedFacesNorm: List<RectF> = emptyList(),
+    val selectedFaceIndex: Int? = null,
+    val appliedCropRectNorm: RectF? = null,
+    val requiresManualCropConfirmation: Boolean = false,
+    val manualCropConfirmedByUser: Boolean = false,
+    val faceFramingVerified: Boolean = !requiresManualCropConfirmation || manualCropConfirmedByUser,
+    val portraitFramingState: PortraitFramingState = when {
+        manualCropConfirmedByUser -> PortraitFramingState.MANUALLY_CONFIRMED
+        requiresManualCropConfirmation && detectedFaceCount == 0 -> PortraitFramingState.NO_FACE_DETECTED
+        requiresManualCropConfirmation && detectedFaceCount > 1 -> PortraitFramingState.MULTIPLE_FACES_DETECTED
+        requiresManualCropConfirmation -> PortraitFramingState.LOW_CONFIDENCE_FRAMING
+        detectedFaceCount == 1 -> PortraitFramingState.VERIFIED_SINGLE_FACE
+        else -> PortraitFramingState.NOT_APPLICABLE
+    },
+    val portraitDiagnosticMessage: String? = null,
     val approvalStatus: PreviewApprovalStatus = when {
         !requiresUserPreviewApproval -> PreviewApprovalStatus.NOT_REQUIRED
-        userPreviewAccepted -> PreviewApprovalStatus.APPROVED_BY_USER
+        userPreviewAccepted && (!requiresManualCropConfirmation || manualCropConfirmedByUser) -> PreviewApprovalStatus.APPROVED_BY_USER
         else -> PreviewApprovalStatus.PENDING_USER_APPROVAL
     },
     val isExportReady: Boolean =
         isCompliant &&
         (!requiresWhiteBackground || technicalBackgroundCompliant) &&
+        (!requiresManualCropConfirmation || manualCropConfirmedByUser) &&
         (!requiresUserPreviewApproval || userPreviewAccepted),
     @Deprecated(
         message = "Legacy combined field retained for backward compatibility. Use technicalBackgroundCompliant, approvalStatus, and isExportReady in all new code."

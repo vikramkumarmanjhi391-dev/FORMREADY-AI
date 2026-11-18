@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.RectF
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -83,11 +84,13 @@ import com.example.data.model.ColorMode
 import com.example.data.model.DocumentRule
 import com.example.data.model.DocumentType
 import com.example.data.model.FileFormat
+import com.example.data.model.PortraitFramingState
 import com.example.data.model.PreparationStatus
 import com.example.data.model.ProcessedFileResult
 import com.example.data.repository.DocumentLockerRepository
 import com.example.processing.ImageProcessor
 import com.example.processing.OneClickPreparationCoordinator
+import com.example.processing.PortraitVisionProcessor
 import com.example.processing.QualityInspector
 import com.example.ui.components.PortalPresetSelectorBar
 import com.example.ui.theme.EmeraldTertiary
@@ -188,8 +191,34 @@ fun PhotoStudioScreen(
     var isCameraOpen by remember { mutableStateOf(false) }
     var currentMediaInput by remember { mutableStateOf<UnifiedMediaInput?>(null) }
     var showAdjustSheet by remember { mutableStateOf(false) }
-    var userPreviewAccepted by remember { mutableStateOf(initialProcessedResult?.userPreviewAccepted ?: false) }
+    var userPreviewAccepted by remember {
+        mutableStateOf(
+            (initialProcessedResult?.userPreviewAccepted == true) &&
+                (initialProcessedResult.faceFramingVerified)
+        )
+    }
     var cameraGeometryUnavailable by remember { mutableStateOf(false) }
+    var showManualFramingCard by remember {
+        mutableStateOf(
+            initialProcessedResult?.let {
+                it.requiresManualCropConfirmation && !it.manualCropConfirmedByUser
+            } ?: false
+        )
+    }
+    var selectedFaceIndex by remember { mutableStateOf<Int?>(initialProcessedResult?.selectedFaceIndex) }
+
+    LaunchedEffect(processedResult) {
+        val res = processedResult
+        if (res != null) {
+            if (!res.faceFramingVerified) {
+                userPreviewAccepted = false
+                showManualFramingCard = true
+            }
+            if (res.selectedFaceIndex != null) {
+                selectedFaceIndex = res.selectedFaceIndex
+            }
+        }
+    }
 
     // Apply initialRule if navigated from Portals tab
     LaunchedEffect(initialRule) {
@@ -208,6 +237,7 @@ fun PhotoStudioScreen(
         val w = customWidthPx.toIntOrNull()?.coerceAtLeast(50) ?: 350
         val h = customHeightPx.toIntOrNull()?.coerceAtLeast(50) ?: 450
         userPreviewAccepted = false
+        selectedFaceIndex = null
         processedResult = processedResult?.let { currentRes ->
             OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, false)
         }
@@ -253,12 +283,73 @@ fun PhotoStudioScreen(
                 customHeightPx = h,
                 enforceProportional = lockAspectRatio,
                 cropRectNorm = cropRect,
+                selectedFaceIndex = null,
+                manualCropConfirmedByUser = false,
                 removeBackgroundToWhite = autoWhiteBackground,
                 customDpi = customDpi,
                 requiresUserPreviewApproval = true,
                 userPreviewAccepted = false
             )
             isProcessing = false
+        }
+    }
+
+    val applyManualPortraitFraming: (RectF, Int?) -> Unit = { manualCropRect, chosenFaceIdx ->
+        val bmp = sourceBitmap
+        if (bmp != null) {
+            val w = customWidthPx.toIntOrNull()?.coerceAtLeast(50) ?: 350
+            val h = customHeightPx.toIntOrNull()?.coerceAtLeast(50) ?: 450
+            userPreviewAccepted = false
+            selectedFaceIndex = chosenFaceIdx
+            coroutineScope.launch {
+                isProcessing = true
+                saveStatusMessage = null
+                showOriginalBefore = false
+                val rule = DocumentRule(
+                    id = "photo_manual_rule_${System.currentTimeMillis()}",
+                    documentType = DocumentType.PASSPORT_PHOTO,
+                    allowedFormats = listOf(selectedFormat),
+                    minKb = targetMinKb,
+                    maxKb = targetMaxKb,
+                    exactWidthPx = w,
+                    exactHeightPx = h,
+                    dpi = customDpi,
+                    targetAspectRatio = selectedCropRatio.ratio ?: (w.toFloat() / h.toFloat()),
+                    requiresWhiteBackground = autoWhiteBackground,
+                    requiresNameAndDateStrip = addNameDateStrip,
+                    colorMode = colorMode
+                )
+                processedResult = OneClickPreparationCoordinator.autoPreparePhoto(
+                    context = context,
+                    input = currentMediaInput,
+                    rule = rule,
+                    preDecodedBitmap = bmp,
+                    candidateName = candidateName,
+                    dateOfPhoto = dateOfPhoto,
+                    customTargetKb = targetMaxKb,
+                    customWidthPx = w,
+                    customHeightPx = h,
+                    enforceProportional = lockAspectRatio,
+                    cropRectNorm = manualCropRect,
+                    selectedFaceIndex = chosenFaceIdx,
+                    manualCropConfirmedByUser = true,
+                    removeBackgroundToWhite = autoWhiteBackground,
+                    customDpi = customDpi,
+                    requiresUserPreviewApproval = true,
+                    userPreviewAccepted = false
+                )
+                showManualFramingCard = false
+                isProcessing = false
+                withContext(Dispatchers.Main) {
+                    runCatching {
+                        Toast.makeText(
+                            context,
+                            "Manual portrait framing applied! Please review and approve the updated preview.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
         }
     }
 
@@ -598,19 +689,34 @@ fun PhotoStudioScreen(
                         }
 
                         // Status badge (top-end)
+                        val badgeRes = processedResult
+                        val badgeColor = when {
+                            badgeRes == null -> NavyPrimary
+                            badgeRes.isExportReady -> EmeraldTertiary
+                            else -> SaffronSecondary
+                        }
+                        val badgeLabel = when {
+                            badgeRes == null -> "Original Selected"
+                            badgeRes.isExportReady -> "1-Click Ready"
+                            !badgeRes.faceFramingVerified -> "Framing Review Required"
+                            !badgeRes.isCompliant -> "Action Needed"
+                            else -> "Review Pending"
+                        }
                         Surface(
-                            color = if (processedResult != null) EmeraldTertiary else NavyPrimary,
+                            color = badgeColor,
                             shape = RoundedCornerShape(6.dp),
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
                                 .padding(10.dp)
                         ) {
                             Text(
-                                text = if (processedResult != null) "1-Click Ready" else "Original Selected",
+                                text = badgeLabel,
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                modifier = Modifier
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("photo_status_badge")
                             )
                         }
                     } else {
@@ -662,8 +768,40 @@ fun PhotoStudioScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 3. Explicit User Preview Approval Gate & Immediate Results Card
+            // 3. Explicit User Preview Approval Gate, Manual Portrait Framing Card & Immediate Results Card
             processedResult?.let { res ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    OutlinedButton(
+                        onClick = { showManualFramingCard = !showManualFramingCard },
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.testTag("toggle_portrait_manual_crop_btn")
+                    ) {
+                        Text(
+                            text = if (showManualFramingCard) "Hide Manual Framing" else "Adjust Portrait Framing / Face",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+
+                if (showManualFramingCard || (res.requiresManualCropConfirmation && !res.manualCropConfirmedByUser)) {
+                    PortraitManualFramingCard(
+                        result = res,
+                        targetAspectRatio = selectedCropRatio.ratio
+                            ?: ((customWidthPx.toFloatOrNull() ?: 350f) / (customHeightPx.toFloatOrNull() ?: 450f)),
+                        initialSelectedFaceIndex = selectedFaceIndex,
+                        onApplyManualFraming = { rectNorm, chosenFaceIdx ->
+                            applyManualPortraitFraming(rectNorm, chosenFaceIdx)
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -680,10 +818,21 @@ fun PhotoStudioScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Checkbox(
-                            checked = userPreviewAccepted,
+                            checked = userPreviewAccepted && res.faceFramingVerified,
                             onCheckedChange = { accepted ->
-                                userPreviewAccepted = accepted
-                                processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(res, accepted)
+                                if (accepted && !res.faceFramingVerified) {
+                                    userPreviewAccepted = false
+                                    showManualFramingCard = true
+                                    processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(res, false)
+                                    Toast.makeText(
+                                        context,
+                                        "Manual portrait framing confirmation is required before approving the preview.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    userPreviewAccepted = accepted
+                                    processedResult = OneClickPreparationCoordinator.updateUserPreviewAcceptance(res, accepted)
+                                }
                             },
                             modifier = Modifier.testTag("photo_preview_acceptance_checkbox")
                         )
@@ -693,6 +842,15 @@ fun PhotoStudioScreen(
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
+                            if (!res.faceFramingVerified) {
+                                Text(
+                                    text = "Manual framing confirmation required above before preview approval can unlock export.",
+                                    fontSize = 11.sp,
+                                    color = SaffronSecondary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.testTag("portrait_manual_gate_warning_text")
+                                )
+                            }
                             if (res.segmentationExecuted) {
                                 Text(
                                     text = "Mask Confidence: ${(res.subjectMaskConfidence * 100).toInt()}% • Edge Uncertainty: ${(res.edgeUncertaintyRatio * 100).toInt()}%",
@@ -745,6 +903,58 @@ fun PhotoStudioScreen(
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.sp
                         )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        // 5 Separate Verification States
+                        Surface(
+                            color = Color.White.copy(alpha = 0.78f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("portrait_five_state_summary")
+                        ) {
+                            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                                Text(
+                                    text = "1. Technical Compliance: ${if (res.isCompliant) "PASS" else "FAIL"}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "2. Background Verification: ${
+                                        when {
+                                            !res.requiresWhiteBackground -> "NOT REQUIRED"
+                                            res.technicalBackgroundCompliant -> "VERIFIED (${res.backgroundVerificationState})"
+                                            else -> "UNVERIFIED (${res.backgroundVerificationState})"
+                                        }
+                                    }",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "3. Face / Framing Check: ${
+                                        when {
+                                            res.manualCropConfirmedByUser -> "MANUALLY CONFIRMED"
+                                            res.faceFramingVerified -> "VERIFIED (${res.detectedFaceCount} face)"
+                                            else -> "MANUAL REVIEW REQUIRED (${res.portraitFramingState})"
+                                        }
+                                    }",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "4. User Preview Approval: ${if (res.userPreviewAccepted) "APPROVED" else "PENDING"}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "5. Final Export Readiness: ${if (res.isExportReady) "READY" else "BLOCKED"}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (res.isExportReady) EmeraldTertiary else SaffronSecondary
+                                )
+                            }
+                        }
 
                         Spacer(modifier = Modifier.height(6.dp))
 
@@ -1426,6 +1636,255 @@ fun PhotoStudioScreen(
             }
 
             Spacer(modifier = Modifier.height(80.dp))
+        }
+    }
+}
+
+@Composable
+fun PortraitManualFramingCard(
+    result: ProcessedFileResult,
+    targetAspectRatio: Float,
+    initialSelectedFaceIndex: Int? = null,
+    onApplyManualFraming: (RectF, Int?) -> Unit
+) {
+    val initialRect = result.appliedCropRectNorm ?: RectF(0.08f, 0.06f, 0.92f, 0.94f)
+    var cropLeft by remember(result.processedFilePath) {
+        mutableStateOf(initialRect.left.coerceIn(0f, 0.80f))
+    }
+    var cropTop by remember(result.processedFilePath) {
+        mutableStateOf(initialRect.top.coerceIn(0f, 0.80f))
+    }
+    var cropRight by remember(result.processedFilePath) {
+        mutableStateOf(initialRect.right.coerceIn((cropLeft + 0.15f).coerceAtMost(1f), 1f))
+    }
+    var cropBottom by remember(result.processedFilePath) {
+        mutableStateOf(initialRect.bottom.coerceIn((cropTop + 0.15f).coerceAtMost(1f), 1f))
+    }
+    var chosenFaceIndex by remember(result.processedFilePath, initialSelectedFaceIndex) {
+        mutableStateOf(initialSelectedFaceIndex ?: result.selectedFaceIndex)
+    }
+
+    val headerTitle = when (result.portraitFramingState) {
+        PortraitFramingState.NO_FACE_DETECTED ->
+            "No Face Detected — Manual Framing Required"
+        PortraitFramingState.MULTIPLE_FACES_DETECTED ->
+            "Multiple Faces Detected (${result.detectedFaceCount}) — Select Person or Frame Manually"
+        PortraitFramingState.LOW_CONFIDENCE_FRAMING ->
+            "Uncertain Portrait Framing — Manual Review Required"
+        PortraitFramingState.MANUALLY_CONFIRMED ->
+            "Manual Portrait Framing Confirmed"
+        PortraitFramingState.VERIFIED_SINGLE_FACE ->
+            "Single Face Framing Verified (Manual Override)"
+        PortraitFramingState.NOT_APPLICABLE ->
+            "Manual Portrait Framing Adjustment"
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("portrait_manual_framing_card"),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (result.faceFramingVerified) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
+        ),
+        border = BorderStroke(
+            width = 1.2.dp,
+            color = if (result.faceFramingVerified) EmeraldTertiary else SaffronSecondary
+        )
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = if (result.faceFramingVerified) Icons.Default.CheckCircle else Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = if (result.faceFramingVerified) EmeraldTertiary else SaffronSecondary,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = headerTitle,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    color = if (result.faceFramingVerified) EmeraldTertiary else SaffronSecondary,
+                    modifier = Modifier.testTag("portrait_framing_state_header")
+                )
+            }
+
+            if (!result.portraitDiagnosticMessage.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = result.portraitDiagnosticMessage,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+
+            if (result.detectedFacesNorm.size > 1) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Select the intended candidate face (${result.detectedFacesNorm.size} detected):",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(result.detectedFacesNorm.indices.toList()) { idx ->
+                        val faceBox = result.detectedFacesNorm[idx]
+                        FilterChip(
+                            selected = chosenFaceIndex == idx,
+                            onClick = {
+                                chosenFaceIndex = idx
+                                val faceInfo = PortraitVisionProcessor.DetectedFaceInfo(
+                                    boundingBoxNorm = RectF(faceBox)
+                                )
+                                val suggested = PortraitVisionProcessor.computePortraitCropRectFromFace(
+                                    face = faceInfo,
+                                    imageWidth = result.widthPx.coerceAtLeast(350),
+                                    imageHeight = result.heightPx.coerceAtLeast(450),
+                                    targetAspectRatio = targetAspectRatio.coerceIn(0.5f, 1.5f)
+                                )
+                                cropLeft = suggested.left.coerceIn(0f, 0.80f)
+                                cropTop = suggested.top.coerceIn(0f, 0.80f)
+                                cropRight = suggested.right.coerceIn((cropLeft + 0.15f).coerceAtMost(1f), 1f)
+                                cropBottom = suggested.bottom.coerceIn((cropTop + 0.15f).coerceAtMost(1f), 1f)
+                            },
+                            label = {
+                                Text(
+                                    text = "Person ${idx + 1}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            },
+                            modifier = Modifier.testTag("select_detected_face_$idx")
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = String.format(
+                    Locale.US,
+                    "Crop Region: Left %.0f%% • Top %.0f%% • Right %.0f%% • Bottom %.0f%%",
+                    cropLeft * 100f,
+                    cropTop * 100f,
+                    cropRight * 100f,
+                    cropBottom * 100f
+                ),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        cropLeft = 0.0f
+                        cropTop = 0.0f
+                        cropRight = 1.0f
+                        cropBottom = 1.0f
+                    },
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_preset_full_btn"),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Full Frame", fontSize = 10.sp)
+                }
+                OutlinedButton(
+                    onClick = {
+                        cropLeft = 0.10f
+                        cropTop = 0.06f
+                        cropRight = 0.90f
+                        cropBottom = 0.94f
+                    },
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_preset_center_btn"),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Center Passport", fontSize = 10.sp)
+                }
+                OutlinedButton(
+                    onClick = {
+                        cropLeft = 0.18f
+                        cropTop = 0.10f
+                        cropRight = 0.82f
+                        cropBottom = 0.88f
+                    },
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_preset_tight_btn"),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Tight Frame", fontSize = 10.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Left", fontSize = 11.sp, modifier = Modifier.width(46.dp))
+                Slider(
+                    value = cropLeft,
+                    onValueChange = { v ->
+                        cropLeft = v.coerceIn(0f, (cropRight - 0.15f).coerceAtLeast(0f))
+                    },
+                    valueRange = 0f..0.80f,
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_left_slider")
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Right", fontSize = 11.sp, modifier = Modifier.width(46.dp))
+                Slider(
+                    value = cropRight,
+                    onValueChange = { v ->
+                        cropRight = v.coerceIn((cropLeft + 0.15f).coerceAtMost(1f), 1f)
+                    },
+                    valueRange = 0.20f..1f,
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_right_slider")
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Top", fontSize = 11.sp, modifier = Modifier.width(46.dp))
+                Slider(
+                    value = cropTop,
+                    onValueChange = { v ->
+                        cropTop = v.coerceIn(0f, (cropBottom - 0.15f).coerceAtLeast(0f))
+                    },
+                    valueRange = 0f..0.80f,
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_top_slider")
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Bottom", fontSize = 11.sp, modifier = Modifier.width(46.dp))
+                Slider(
+                    value = cropBottom,
+                    onValueChange = { v ->
+                        cropBottom = v.coerceIn((cropTop + 0.15f).coerceAtMost(1f), 1f)
+                    },
+                    valueRange = 0.20f..1f,
+                    modifier = Modifier.weight(1f).testTag("portrait_crop_bottom_slider")
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    val sanitized = PortraitVisionProcessor.sanitizeCropRectNorm(
+                        RectF(cropLeft, cropTop, cropRight, cropBottom)
+                    ) ?: RectF(0.08f, 0.06f, 0.92f, 0.94f)
+                    onApplyManualFraming(sanitized, chosenFaceIndex)
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = NavyPrimary),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(46.dp)
+                    .testTag("apply_manual_portrait_crop_btn")
+            ) {
+                Text(
+                    text = "Confirm & Apply Manual Framing",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            }
         }
     }
 }

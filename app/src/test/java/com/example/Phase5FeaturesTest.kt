@@ -29,8 +29,10 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -1640,15 +1642,38 @@ class Phase5FeaturesTest {
             requiresWhiteBackground = false
         )
 
+        val singleFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.28f, 0.20f, 0.72f, 0.56f),
+                    leftEyeNorm = android.graphics.PointF(0.40f, 0.34f),
+                    rightEyeNorm = android.graphics.PointF(0.60f, 0.34f)
+                )
+            )
+        }
+        val cleanSegEngine = com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { bmp ->
+            val w = bmp.width
+            val h = bmp.height
+            val mask = FloatArray(w * h) { idx ->
+                val x = idx % w
+                val y = idx / w
+                if (x in (w * 0.22).toInt()..(w * 0.78).toInt() && y in (h * 0.16).toInt()..(h * 0.95).toInt()) 0.96f else 0.02f
+            }
+            com.example.processing.PortraitVisionProcessor.RawSegmentationMask(w, h, mask)
+        }
+
         // 1. Initial preparation must default to userPreviewAccepted == false and status == PENDING_PREVIEW_APPROVAL
         val initialResult = OneClickPreparationCoordinator.autoPreparePhoto(
             context = context,
             input = null,
             rule = rule,
-            preDecodedBitmap = sampleBmp
+            preDecodedBitmap = sampleBmp,
+            faceEngine = singleFaceEngine,
+            segmentationEngine = cleanSegEngine
         )
         assertNotNull(initialResult)
         assertTrue(initialResult!!.isCompliant)
+        assertTrue(initialResult.faceFramingVerified)
         assertFalse("Initial preparation must start with userPreviewAccepted = false", initialResult.userPreviewAccepted)
         assertFalse("Initial preparation must start with isExportReady = false", initialResult.isExportReady)
         assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, initialResult.status)
@@ -1667,7 +1692,9 @@ class Phase5FeaturesTest {
             rule = rule,
             preDecodedBitmap = sampleBmp,
             candidateName = "UPDATED NAME",
-            dateOfPhoto = "07/11/2026"
+            dateOfPhoto = "07/11/2026",
+            faceEngine = singleFaceEngine,
+            segmentationEngine = cleanSegEngine
         )
         assertNotNull(reprocessed)
         assertFalse("Re-processing must reset userPreviewAccepted to false", reprocessed!!.userPreviewAccepted)
@@ -5199,6 +5226,578 @@ class Phase05AExportReadinessGateUiTest {
         assertFalse("Blank page must not report strokeBoundingBoxFound", blankResult.strokeBoundingBoxFound)
         assertEquals(android.graphics.Rect(0, 0, 240, 100), blankResult.inkBoundingBoxPx)
     }
+
+    // =========================================================================
+    // PHOTO STUDIO FIX 01 — PORTRAIT FACE DETECTION, FRAMING CONFIDENCE & MANUAL REVIEW GATE
+    // =========================================================================
+
+    private fun createPortraitTestBitmap(width: Int = 350, height: Int = 450): Bitmap {
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val isSubject = x in (width * 0.24).toInt()..(width * 0.76).toInt() &&
+                    y in (height * 0.18).toInt()..(height * 0.94).toInt()
+                if (isSubject) {
+                    val r = (90 + (x * 13 + y * 7) % 110).coerceIn(50, 210)
+                    val g = (70 + (x * 17 + y * 11) % 100).coerceIn(40, 195)
+                    val b = (60 + (x * 19 + y * 5) % 95).coerceIn(35, 185)
+                    bmp.setPixel(x, y, Color.rgb(r, g, b))
+                } else {
+                    bmp.setPixel(x, y, Color.WHITE)
+                }
+            }
+        }
+        return bmp
+    }
+
+    private fun buildCleanSegmentationEngine(): com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine =
+        com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { bmp ->
+            val w = bmp.width
+            val h = bmp.height
+            val mask = FloatArray(w * h) { idx ->
+                val x = idx % w
+                val y = idx / w
+                if (x in (w * 0.22).toInt()..(w * 0.78).toInt() && y in (h * 0.16).toInt()..(h * 0.95).toInt()) 0.96f else 0.02f
+            }
+            com.example.processing.PortraitVisionProcessor.RawSegmentationMask(w, h, mask)
+        }
+
+    private fun buildLowConfidenceSegmentationEngine(): com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine =
+        com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { bmp ->
+            val w = bmp.width
+            val h = bmp.height
+            val mask = FloatArray(w * h) { idx ->
+                val x = idx % w
+                val y = idx / w
+                when {
+                    x < w * 0.15 || x > w * 0.85 || y < h * 0.12 -> 0.03f
+                    x in (w * 0.40).toInt()..(w * 0.60).toInt() && y in (h * 0.35).toInt()..(h * 0.75).toInt() -> 0.88f
+                    else -> 0.50f // Wide ambiguous boundary halo triggers maskConfidencePassed = false
+                }
+            }
+            com.example.processing.PortraitVisionProcessor.RawSegmentationMask(w, h, mask)
+        }
+
+    @Test
+    fun testPhotoStudioFix01Scenario1ZeroDetectedFacesRequiresManualFraming() = kotlinx.coroutines.runBlocking {
+        val bmp = createPortraitTestBitmap()
+        val rule = DocumentRule(
+            id = "fix01_zero_faces",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = true
+        )
+        val zeroFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine { emptyList() }
+
+        val res = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = bmp,
+            removeBackgroundToWhite = true,
+            userPreviewAccepted = true, // Even if caller passes true, unresolved 0-face framing must block it
+            faceEngine = zeroFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(res)
+        assertEquals(0, res!!.detectedFaceCount)
+        assertEquals(com.example.data.model.PortraitFramingState.NO_FACE_DETECTED, res.portraitFramingState)
+        assertTrue("Zero faces must set requiresManualCropConfirmation = true", res.requiresManualCropConfirmation)
+        assertFalse(res.manualCropConfirmedByUser)
+        assertFalse("Zero faces without manual confirmation must set faceFramingVerified = false", res.faceFramingVerified)
+        assertEquals(com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED, res.status)
+        assertFalse("Zero faces must NOT be export-ready before manual confirmation", res.isExportReady)
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario2MultipleDetectedFacesNeverSilentlyChoosesOne() = kotlinx.coroutines.runBlocking {
+        // Draw two distinct color patches so we can verify that multi-face detection never silently crops to face 0
+        val bmp = Bitmap.createBitmap(400, 450, Bitmap.Config.ARGB_8888)
+        for (y in 0 until 450) {
+            for (x in 0 until 400) {
+                val noise = ((x * 13 + y * 7) % 55)
+                val color = if (x < 200) {
+                    Color.rgb(180 + noise, 40 + noise, 40 + noise) // Left person region (reddish)
+                } else {
+                    Color.rgb(35 + noise, 60 + noise, 185 + noise) // Right person region (bluish)
+                }
+                bmp.setPixel(x, y, color)
+            }
+        }
+
+        val twoFacesEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.10f, 0.22f, 0.38f, 0.54f),
+                    leftEyeNorm = android.graphics.PointF(0.18f, 0.34f),
+                    rightEyeNorm = android.graphics.PointF(0.30f, 0.34f)
+                ),
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.62f, 0.24f, 0.88f, 0.54f),
+                    leftEyeNorm = android.graphics.PointF(0.70f, 0.35f),
+                    rightEyeNorm = android.graphics.PointF(0.80f, 0.35f)
+                )
+            )
+        }
+
+        val rule = DocumentRule(
+            id = "fix01_multi_faces",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+
+        val unconfirmed = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = bmp,
+            faceEngine = twoFacesEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(unconfirmed)
+        assertEquals(2, unconfirmed!!.detectedFaceCount)
+        assertEquals(2, unconfirmed.detectedFacesNorm.size)
+        assertNull("Unconfirmed multi-face result must not silently select a face index", unconfirmed.selectedFaceIndex)
+        assertEquals(com.example.data.model.PortraitFramingState.MULTIPLE_FACES_DETECTED, unconfirmed.portraitFramingState)
+        assertTrue(unconfirmed.requiresManualCropConfirmation)
+        assertFalse(unconfirmed.faceFramingVerified)
+        assertFalse(unconfirmed.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED, unconfirmed.status)
+
+        // Now user explicitly selects Person 2 (index 1) and confirms manual framing
+        val person2Confirmed = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = bmp,
+            selectedFaceIndex = 1,
+            manualCropConfirmedByUser = true,
+            faceEngine = twoFacesEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(person2Confirmed)
+        assertEquals(1, person2Confirmed!!.selectedFaceIndex)
+        assertTrue(person2Confirmed.manualCropConfirmedByUser)
+        assertTrue(person2Confirmed.faceFramingVerified)
+        assertEquals(com.example.data.model.PortraitFramingState.MANUALLY_CONFIRMED, person2Confirmed.portraitFramingState)
+        assertNotNull(person2Confirmed.appliedCropRectNorm)
+        assertTrue(
+            "Selecting Person 2 (right side) must center the crop on the right half of the image",
+            person2Confirmed.appliedCropRectNorm!!.centerX() > 0.55f
+        )
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario3SingleFaceWithLowSegmentationOrFramingConfidence() = kotlinx.coroutines.runBlocking {
+        val bmp = createPortraitTestBitmap()
+        // Rule with requiresWhiteBackground = false: low segmentation confidence must STILL require manual framing confirmation!
+        val ruleNoWhiteBg = DocumentRule(
+            id = "fix01_low_seg_conf",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = false
+        )
+        val validSingleFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.28f, 0.20f, 0.72f, 0.56f),
+                    leftEyeNorm = android.graphics.PointF(0.40f, 0.34f),
+                    rightEyeNorm = android.graphics.PointF(0.60f, 0.34f)
+                )
+            )
+        }
+
+        val lowSegResult = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = ruleNoWhiteBg,
+            preDecodedBitmap = bmp,
+            faceEngine = validSingleFaceEngine,
+            segmentationEngine = buildLowConfidenceSegmentationEngine()
+        )
+        assertNotNull(lowSegResult)
+        assertEquals(1, lowSegResult!!.detectedFaceCount)
+        assertEquals(com.example.data.model.PortraitFramingState.LOW_CONFIDENCE_FRAMING, lowSegResult.portraitFramingState)
+        assertTrue("1 face with low segmentation confidence must require manual crop confirmation", lowSegResult.requiresManualCropConfirmation)
+        assertFalse(lowSegResult.faceFramingVerified)
+        assertFalse(lowSegResult.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED, lowSegResult.status)
+
+        // Sub-case: 1 face that is severely clipped against the top-left corner (low framing confidence)
+        val clippedFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.002f, 0.002f, 0.12f, 0.11f)
+                )
+            )
+        }
+        val lowFramingResult = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = ruleNoWhiteBg,
+            preDecodedBitmap = bmp,
+            faceEngine = clippedFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(lowFramingResult)
+        assertEquals(1, lowFramingResult!!.detectedFaceCount)
+        assertEquals(com.example.data.model.PortraitFramingState.LOW_CONFIDENCE_FRAMING, lowFramingResult.portraitFramingState)
+        assertTrue("Severely clipped/tiny face must require manual framing confirmation", lowFramingResult.requiresManualCropConfirmation)
+        assertFalse(lowFramingResult.faceFramingVerified)
+        assertFalse(lowFramingResult.isExportReady)
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario4SingleFaceWithReliableFramingAndSegmentation() = kotlinx.coroutines.runBlocking {
+        val bmp = createPortraitTestBitmap()
+        val rule = DocumentRule(
+            id = "fix01_reliable_single",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = true
+        )
+        val reliableFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.28f, 0.20f, 0.72f, 0.56f),
+                    leftEyeNorm = android.graphics.PointF(0.40f, 0.34f),
+                    rightEyeNorm = android.graphics.PointF(0.60f, 0.34f)
+                )
+            )
+        }
+
+        val res = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = bmp,
+            removeBackgroundToWhite = true,
+            userPreviewAccepted = false,
+            faceEngine = reliableFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(res)
+        assertEquals(1, res!!.detectedFaceCount)
+        assertEquals(com.example.data.model.PortraitFramingState.VERIFIED_SINGLE_FACE, res.portraitFramingState)
+        assertFalse("Reliable single face must not require manual crop confirmation", res.requiresManualCropConfirmation)
+        assertTrue(res.faceFramingVerified)
+        assertTrue(res.technicalBackgroundCompliant)
+        assertTrue(res.isCompliant)
+        assertFalse("Before user preview approval, isExportReady must be false", res.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, res.status)
+
+        val afterApproval = OneClickPreparationCoordinator.updateUserPreviewAcceptance(res, true)
+        assertTrue(afterApproval.userPreviewAccepted)
+        assertTrue("Reliable single face + technical compliance + preview approval must be export-ready", afterApproval.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.SUCCESS_PREPARED, afterApproval.status)
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario5PreviewAcceptanceCannotBypassUnresolvedManualFraming() {
+        val dummyFile = createDummyProcessedFile("fix01_unverified_face.jpg")
+        val sampleBmp = createPortraitTestBitmap()
+
+        val unconfirmedResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "fix01_bypass_test",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = dummyFile.length(),
+            fileSizeKb = dummyFile.length() / 1024.0,
+            widthPx = 350,
+            heightPx = 450,
+            isCompliant = true,
+            validationMessages = listOf("No face detected in photo; framed using center passport crop."),
+            status = com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false,
+            detectedFaceCount = 0,
+            requiresManualCropConfirmation = true,
+            manualCropConfirmedByUser = false,
+            faceFramingVerified = false,
+            portraitFramingState = com.example.data.model.PortraitFramingState.NO_FACE_DETECTED,
+            portraitDiagnosticMessage = "No face detected in photo; framed using center passport crop."
+        )
+
+        // 1. Coordinator-level bypass attempt
+        val bypassAttempt = OneClickPreparationCoordinator.updateUserPreviewAcceptance(unconfirmedResult, true)
+        assertFalse("updateUserPreviewAcceptance(true) must NOT set userPreviewAccepted when faceFramingVerified is false", bypassAttempt.userPreviewAccepted)
+        assertEquals(com.example.data.model.PreviewApprovalStatus.PENDING_USER_APPROVAL, bypassAttempt.approvalStatus)
+        assertEquals(com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED, bypassAttempt.status)
+        assertFalse("updateUserPreviewAcceptance(true) must NEVER make an unconfirmed portrait export-ready", bypassAttempt.isExportReady)
+
+        // 2. UI-level bypass attempt in PhotoStudioScreen
+        composeTestRule.setContent {
+            com.example.ui.screens.PhotoStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = unconfirmedResult
+            )
+        }
+
+        composeTestRule.onNodeWithTag("photo_status_badge").assertTextContains("Framing Review Required")
+        composeTestRule.onNodeWithTag("portrait_manual_framing_card").assertExists()
+
+        // Tap the preview acceptance checkbox directly without confirming manual framing
+        composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        // Checkbox must remain OFF and all export buttons must remain disabled
+        composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").assertIsOff()
+        composeTestRule.onNodeWithTag("instant_gallery_download_photo_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("save_photo_device_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("share_photo_btn").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("add_photo_to_locker_btn").assertIsNotEnabled()
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario6ManualCropCorrectionAndReprocessingResetsPreviewApproval() = kotlinx.coroutines.runBlocking {
+        val bmp = createPortraitTestBitmap(400, 500)
+        val rule = DocumentRule(
+            id = "fix01_manual_reprocess",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = true
+        )
+        val zeroFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine { emptyList() }
+
+        val initial = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = bmp,
+            removeBackgroundToWhite = true,
+            faceEngine = zeroFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(initial)
+        assertTrue(initial!!.requiresManualCropConfirmation)
+        assertFalse(initial.manualCropConfirmedByUser)
+        assertFalse(initial.faceFramingVerified)
+        assertFalse(initial.isExportReady)
+
+        // Apply manual crop coordinates and re-run pipeline with manualCropConfirmedByUser = true
+        val correctedRect = android.graphics.RectF(0.12f, 0.08f, 0.88f, 0.92f)
+        val reprocessed = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = rule,
+            preDecodedBitmap = bmp,
+            cropRectNorm = correctedRect,
+            manualCropConfirmedByUser = true,
+            removeBackgroundToWhite = true,
+            userPreviewAccepted = false, // Must require fresh preview approval after manual crop
+            faceEngine = zeroFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(reprocessed)
+        assertTrue(reprocessed!!.manualCropConfirmedByUser)
+        assertTrue("Manual confirmation must satisfy faceFramingVerified", reprocessed.faceFramingVerified)
+        assertEquals(com.example.data.model.PortraitFramingState.MANUALLY_CONFIRMED, reprocessed.portraitFramingState)
+        assertEquals(0.12f, reprocessed.appliedCropRectNorm!!.left, 0.01f)
+        assertEquals(0.88f, reprocessed.appliedCropRectNorm!!.right, 0.01f)
+        assertFalse("Reprocessed output must require fresh user preview approval", reprocessed.userPreviewAccepted)
+        assertFalse("Reprocessed output must not be export-ready until preview is approved", reprocessed.isExportReady)
+        assertEquals(com.example.data.model.PreparationStatus.PENDING_PREVIEW_APPROVAL, reprocessed.status)
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario7ExportReadinessAfterManualCorrectionAndPreviewApprovalInUi() {
+        val dummyFile = createDummyProcessedFile("fix01_ui_flow.jpg")
+        val sampleBmp = createPortraitTestBitmap(400, 500)
+
+        val origFaceEngine = com.example.processing.PortraitVisionProcessor.activeFaceDetectionEngine
+        val origSegEngine = com.example.processing.PortraitVisionProcessor.activeSelfieSegmentationEngine
+        try {
+            com.example.processing.PortraitVisionProcessor.activeFaceDetectionEngine =
+                com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+                    listOf(
+                        com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                            boundingBoxNorm = android.graphics.RectF(0.10f, 0.22f, 0.38f, 0.54f)
+                        ),
+                        com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                            boundingBoxNorm = android.graphics.RectF(0.60f, 0.22f, 0.88f, 0.54f)
+                        )
+                    )
+                }
+            com.example.processing.PortraitVisionProcessor.activeSelfieSegmentationEngine = buildCleanSegmentationEngine()
+
+            val initialMultiFaceResult = com.example.data.model.ProcessedFileResult(
+                ruleId = "fix01_ui_multi",
+                documentType = DocumentType.PASSPORT_PHOTO,
+                originalFileName = dummyFile.name,
+                processedFilePath = dummyFile.absolutePath,
+                fileFormat = FileFormat.JPG,
+                fileSizeBytes = 25 * 1024L,
+                fileSizeKb = 25.0,
+                widthPx = 350,
+                heightPx = 450,
+                isCompliant = true,
+                validationMessages = listOf("Multiple faces detected (2)."),
+                status = com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED,
+                dpi = 300,
+                requiresWhiteBackground = true,
+                technicalBackgroundCompliant = true,
+                outputBackgroundPixelChecksPassed = true,
+                backgroundReplacementApplied = true,
+                requiresUserPreviewApproval = true,
+                userPreviewAccepted = false,
+                detectedFaceCount = 2,
+                detectedFacesNorm = listOf(
+                    android.graphics.RectF(0.10f, 0.22f, 0.38f, 0.54f),
+                    android.graphics.RectF(0.60f, 0.22f, 0.88f, 0.54f)
+                ),
+                requiresManualCropConfirmation = true,
+                manualCropConfirmedByUser = false,
+                faceFramingVerified = false,
+                portraitFramingState = com.example.data.model.PortraitFramingState.MULTIPLE_FACES_DETECTED,
+                portraitDiagnosticMessage = "Multiple faces detected (2). Select the intended person or confirm manual portrait framing."
+            )
+
+            val permissiveRule = DocumentRule(
+                id = "fix01_ui_rule",
+                documentType = DocumentType.PASSPORT_PHOTO,
+                allowedFormats = listOf(FileFormat.JPG),
+                minKb = 1,
+                maxKb = 100,
+                exactWidthPx = 350,
+                exactHeightPx = 450,
+                dpi = 300,
+                requiresWhiteBackground = true
+            )
+
+            composeTestRule.setContent {
+                com.example.ui.screens.PhotoStudioScreen(
+                    initialRule = permissiveRule,
+                    initialSourceBitmap = sampleBmp,
+                    initialProcessedResult = initialMultiFaceResult
+                )
+            }
+
+            // 1. Multi-face selection chips and manual framing card are shown; export is blocked
+            composeTestRule.onNodeWithTag("portrait_manual_framing_card").assertExists()
+            composeTestRule.onNodeWithTag("select_detected_face_1").performScrollTo().performClick()
+            composeTestRule.waitForIdle()
+
+            // 2. Apply manual framing -> re-runs processing pipeline and resets preview approval
+            composeTestRule.onNodeWithTag("apply_manual_portrait_crop_btn").performScrollTo().performClick()
+            composeTestRule.waitUntil(timeoutMillis = 5_000) {
+                composeTestRule.onAllNodesWithTag("portrait_manual_framing_card").fetchSemanticsNodes().isEmpty()
+            }
+            composeTestRule.waitForIdle()
+
+            // Export buttons are still disabled until the user approves the newly reprocessed preview
+            composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").assertIsOff()
+            composeTestRule.onNodeWithTag("instant_gallery_download_photo_btn").assertIsNotEnabled()
+
+            // 3. Approve the updated preview -> all export controls unlock and status badge shows "1-Click Ready"
+            composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").performScrollTo().performClick()
+            composeTestRule.waitForIdle()
+
+            composeTestRule.onNodeWithTag("photo_preview_acceptance_checkbox").assertIsOn()
+            composeTestRule.onNodeWithTag("photo_status_badge").assertTextContains("1-Click Ready")
+            composeTestRule.onNodeWithTag("instant_gallery_download_photo_btn").assertIsEnabled()
+            composeTestRule.onNodeWithTag("save_photo_device_btn").assertIsEnabled()
+            composeTestRule.onNodeWithTag("share_photo_btn").assertIsEnabled()
+            composeTestRule.onNodeWithTag("add_photo_to_locker_btn").assertIsEnabled()
+        } finally {
+            com.example.processing.PortraitVisionProcessor.activeFaceDetectionEngine = origFaceEngine
+            com.example.processing.PortraitVisionProcessor.activeSelfieSegmentationEngine = origSegEngine
+        }
+    }
+
+    @Test
+    fun testPhotoStudioFix01Scenario8BackgroundVerificationRemainsIndependentOfFaceVerification() = kotlinx.coroutines.runBlocking {
+        val bmp = createPortraitTestBitmap()
+        val whiteBgRule = DocumentRule(
+            id = "fix01_indep_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 80,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            requiresWhiteBackground = true
+        )
+
+        // Case A: Background passes (clean segmentation + white background) while Face fails (0 faces)
+        val bgPassFaceFail = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = whiteBgRule,
+            preDecodedBitmap = bmp,
+            removeBackgroundToWhite = true,
+            faceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine { emptyList() },
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(bgPassFaceFail)
+        assertTrue("Background verification must pass independently even when 0 faces are detected", bgPassFaceFail!!.technicalBackgroundCompliant)
+        assertTrue("Technical image compliance must pass independently of face verification", bgPassFaceFail.isCompliant)
+        assertFalse("Face framing verification must be false when 0 faces are detected", bgPassFaceFail.faceFramingVerified)
+        assertFalse("Export readiness must be false when face framing is unverified", bgPassFaceFail.isExportReady)
+
+        // Case B: Face passes (1 reliable face + manual confirmation) while Background fails (non-white background, no segmentation)
+        val blueBgBmp = Bitmap.createBitmap(350, 450, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(30, 80, 200))
+        }
+        val facePassBgFail = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = whiteBgRule,
+            preDecodedBitmap = blueBgBmp,
+            manualCropConfirmedByUser = true,
+            removeBackgroundToWhite = false,
+            userPreviewAccepted = true,
+            faceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+                listOf(
+                    com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                        boundingBoxNorm = android.graphics.RectF(0.28f, 0.20f, 0.72f, 0.56f),
+                        leftEyeNorm = android.graphics.PointF(0.40f, 0.34f),
+                        rightEyeNorm = android.graphics.PointF(0.60f, 0.34f)
+                    )
+                )
+            },
+            segmentationEngine = com.example.processing.PortraitVisionProcessor.SelfieSegmentationEngine { null }
+        )
+        assertNotNull(facePassBgFail)
+        assertTrue("Face verification must remain true when manually confirmed", facePassBgFail!!.faceFramingVerified)
+        assertFalse("Background verification must fail independently when background is blue", facePassBgFail.technicalBackgroundCompliant)
+        assertFalse("Technical compliance must be false when required white background fails", facePassBgFail.isCompliant)
+        assertFalse("Export readiness must be false when background compliance fails", facePassBgFail.isExportReady)
+    }
 }
+
 
 

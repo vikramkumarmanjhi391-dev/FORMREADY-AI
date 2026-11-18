@@ -3,6 +3,7 @@ package com.example.ui.screens
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.PointF
+import android.graphics.RectF
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -133,8 +134,21 @@ fun PortalDocumentPrepareScreen(
     var showOriginalBefore by remember { mutableStateOf(false) }
     var showAdjustSheet by remember { mutableStateOf(false) }
     var showCornerOverlay by remember { mutableStateOf(false) }
+    var showManualPortraitCard by remember {
+        mutableStateOf(
+            initialProcessedResult?.let {
+                isPhotoRule && it.requiresManualCropConfirmation && !it.manualCropConfirmedByUser
+            } ?: false
+        )
+    }
+    var selectedFaceIndex by remember { mutableStateOf<Int?>(initialProcessedResult?.selectedFaceIndex) }
 
-    var userPreviewAccepted by remember { mutableStateOf(initialProcessedResult?.userPreviewAccepted ?: false) }
+    var userPreviewAccepted by remember {
+        mutableStateOf(
+            (initialProcessedResult?.userPreviewAccepted == true) &&
+                (initialProcessedResult.faceFramingVerified)
+        )
+    }
     var detectedCornersNorm by remember { mutableStateOf<List<PointF>>(emptyList()) }
     var detectedCornerConfidence by remember { mutableFloatStateOf(0f) }
 
@@ -200,6 +214,8 @@ fun PortalDocumentPrepareScreen(
                         customHeightPx = h,
                         customTargetKb = targetMaxKb,
                         enforceProportional = lockAspectRatio,
+                        selectedFaceIndex = null,
+                        manualCropConfirmedByUser = false,
                         removeBackgroundToWhite = autoWhiteBackground,
                         customDpi = customDpi,
                         requiresUserPreviewApproval = true,
@@ -207,6 +223,7 @@ fun PortalDocumentPrepareScreen(
                     )
                     if (res != null) {
                         processedResult = res
+                        showManualPortraitCard = res.requiresManualCropConfirmation && !res.manualCropConfirmedByUser
                         onDocumentPrepared(res)
                     }
                 }
@@ -621,8 +638,68 @@ fun PortalDocumentPrepareScreen(
                 }
             }
 
+            // Manual Portrait Framing Card for Photo rules
+            if (isPhotoRule && sourceBitmap != null && processedResult != null) {
+                val res = processedResult!!
+                if (showManualPortraitCard || (res.requiresManualCropConfirmation && !res.manualCropConfirmedByUser)) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    PortraitManualFramingCard(
+                        result = res,
+                        targetAspectRatio = rule.targetAspectRatio
+                            ?: ((customWidthPx.toFloatOrNull() ?: 350f) / (customHeightPx.toFloatOrNull() ?: 450f)),
+                        initialSelectedFaceIndex = selectedFaceIndex,
+                        onApplyManualFraming = { rectNorm, chosenFaceIdx ->
+                            val bmp = sourceBitmap ?: return@PortraitManualFramingCard
+                            userPreviewAccepted = false
+                            selectedFaceIndex = chosenFaceIdx
+                            coroutineScope.launch {
+                                isProcessing = true
+                                val w = customWidthPx.toIntOrNull()?.coerceAtLeast(30) ?: (rule.exactWidthPx ?: 350)
+                                val h = customHeightPx.toIntOrNull()?.coerceAtLeast(20) ?: (rule.exactHeightPx ?: 450)
+                                val effectiveRule = rule.copy(
+                                    minKb = targetMinKb,
+                                    maxKb = targetMaxKb,
+                                    exactWidthPx = if (rule.exactWidthPx != null) w else null,
+                                    exactHeightPx = if (rule.exactHeightPx != null) h else null,
+                                    dpi = customDpi,
+                                    requiresWhiteBackground = autoWhiteBackground,
+                                    requiresNameAndDateStrip = addNameDateStrip
+                                )
+                                val updated = OneClickPreparationCoordinator.autoPreparePhoto(
+                                    context = context,
+                                    input = currentMediaInput,
+                                    rule = effectiveRule,
+                                    preDecodedBitmap = bmp,
+                                    candidateName = candidateName,
+                                    dateOfPhoto = dateOfPhoto,
+                                    customWidthPx = w,
+                                    customHeightPx = h,
+                                    customTargetKb = targetMaxKb,
+                                    enforceProportional = lockAspectRatio,
+                                    cropRectNorm = rectNorm,
+                                    selectedFaceIndex = chosenFaceIdx,
+                                    manualCropConfirmedByUser = true,
+                                    removeBackgroundToWhite = autoWhiteBackground,
+                                    customDpi = customDpi,
+                                    requiresUserPreviewApproval = true,
+                                    userPreviewAccepted = false
+                                )
+                                if (updated != null) {
+                                    processedResult = updated
+                                    showManualPortraitCard = false
+                                    onDocumentPrepared(updated)
+                                }
+                                isProcessing = false
+                            }
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+            }
+
             // Explicit User Preview Approval Gate (Independent of Technical Compliance)
             if (sourceBitmap != null && processedResult != null) {
+                val resForCheck = processedResult!!
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -639,11 +716,22 @@ fun PortalDocumentPrepareScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Checkbox(
-                            checked = userPreviewAccepted,
+                            checked = userPreviewAccepted && resForCheck.faceFramingVerified,
                             onCheckedChange = { accepted ->
-                                userPreviewAccepted = accepted
-                                processedResult?.let { currentRes ->
-                                    val updated = OneClickPreparationCoordinator.updateUserPreviewAcceptance(currentRes, accepted)
+                                if (accepted && !resForCheck.faceFramingVerified) {
+                                    userPreviewAccepted = false
+                                    showManualPortraitCard = true
+                                    val updated = OneClickPreparationCoordinator.updateUserPreviewAcceptance(resForCheck, false)
+                                    processedResult = updated
+                                    onDocumentPrepared(updated)
+                                    Toast.makeText(
+                                        context,
+                                        "Manual portrait framing confirmation is required before approving the preview.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    userPreviewAccepted = accepted
+                                    val updated = OneClickPreparationCoordinator.updateUserPreviewAcceptance(resForCheck, accepted)
                                     processedResult = updated
                                     onDocumentPrepared(updated)
                                 }
@@ -657,6 +745,14 @@ fun PortalDocumentPrepareScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                             processedResult?.let { res ->
+                                if (!res.faceFramingVerified) {
+                                    Text(
+                                        text = "Manual framing confirmation required above before preview approval can unlock export.",
+                                        fontSize = 11.sp,
+                                        color = SaffronSecondary,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
                                 if (res.segmentationExecuted) {
                                     Text(
                                         text = "Mask Confidence: ${(res.subjectMaskConfidence * 100).toInt()}% • Edge Uncertainty: ${(res.edgeUncertaintyRatio * 100).toInt()}%",
