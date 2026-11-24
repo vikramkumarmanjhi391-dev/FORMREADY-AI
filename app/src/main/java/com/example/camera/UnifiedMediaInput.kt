@@ -433,8 +433,21 @@ data class UnifiedMediaInput(
                     else -> return decoded
                 }
                 val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
-                if (rotated != decoded) decoded.recycle()
-                rotated
+                val safeRotated = try {
+                    if (rotated.width > 0 && rotated.height > 0) {
+                        rotated.getPixel(0, 0)
+                    }
+                    rotated
+                } catch (_: NullPointerException) {
+                    val w = rotated.width.coerceAtLeast(1)
+                    val h = rotated.height.coerceAtLeast(1)
+                    if (rotated !== decoded && !rotated.isRecycled) rotated.recycle()
+                    Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                        eraseColor(android.graphics.Color.WHITE)
+                    }
+                }
+                if (safeRotated != decoded && !decoded.isRecycled) decoded.recycle()
+                safeRotated
             } catch (e: Exception) {
                 e.printStackTrace()
                 null

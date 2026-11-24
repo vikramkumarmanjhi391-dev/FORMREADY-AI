@@ -5678,6 +5678,8 @@ class Phase05AExportReadinessGateUiTest {
                     android.graphics.RectF(0.10f, 0.22f, 0.38f, 0.54f),
                     android.graphics.RectF(0.60f, 0.22f, 0.88f, 0.54f)
                 ),
+                detectionBitmapWidthPx = 400,
+                detectionBitmapHeightPx = 500,
                 requiresManualCropConfirmation = true,
                 manualCropConfirmedByUser = false,
                 faceFramingVerified = false,
@@ -5797,7 +5799,470 @@ class Phase05AExportReadinessGateUiTest {
         assertFalse("Technical compliance must be false when required white background fails", facePassBgFail.isCompliant)
         assertFalse("Export readiness must be false when background compliance fails", facePassBgFail.isExportReady)
     }
+
+    // =========================================================================
+    // PHOTO STUDIO FIX 02 — DETECTED-FACE CROP COORDINATE & DIMENSION SPACE REGRESSION TESTS
+    // =========================================================================
+
+    @Test
+    fun testPhotoStudioFix02LandscapeSourceWithPortraitOutputPresetPreservesTrueCropAspectRatioAndContainsSelectedFace() = kotlinx.coroutines.runBlocking {
+        // Realistic landscape photo (1600 x 900) prepared for a standard portrait passport preset (350 x 450)
+        val srcW = 1600
+        val srcH = 900
+        val landscapeBmp = createPortraitTestBitmap(srcW, srcH)
+
+        val person1Face = android.graphics.RectF(0.16f, 0.24f, 0.28f, 0.52f)
+        val person2Face = android.graphics.RectF(0.66f, 0.26f, 0.78f, 0.54f)
+        val twoFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(boundingBoxNorm = person1Face),
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(boundingBoxNorm = person2Face)
+            )
+        }
+
+        val passportRule = DocumentRule(
+            id = "fix02_landscape_to_portrait",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 100,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            targetAspectRatio = 350f / 450f,
+            requiresWhiteBackground = false
+        )
+
+        val res = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = passportRule,
+            preDecodedBitmap = landscapeBmp,
+            faceEngine = twoFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(res)
+        // Processed output dimensions are 350x450, whereas detection dimensions MUST be 1600x900
+        assertEquals(350, res!!.widthPx)
+        assertEquals(450, res.heightPx)
+        assertEquals("Detection width must match the 1600px landscape bitmap used for face detection", srcW, res.detectionBitmapWidthPx)
+        assertEquals("Detection height must match the 900px landscape bitmap used for face detection", srcH, res.detectionBitmapHeightPx)
+
+        val targetRatio = 350f / 450f
+
+        // Suggest crop for Person 1 (left side)
+        val crop1 = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = res.detectedFacesNorm,
+            selectedFaceIndex = 0,
+            detectionBitmapWidthPx = res.detectionBitmapWidthPx,
+            detectionBitmapHeightPx = res.detectionBitmapHeightPx,
+            targetAspectRatio = targetRatio
+        )
+        assertNotNull(crop1)
+        assertTrue(crop1!!.left >= 0f && crop1.top >= 0f && crop1.right <= 1f && crop1.bottom <= 1f)
+        // Selected face 1 must be completely inside crop1
+        assertTrue("Person 1 face left (${person1Face.left}) must be >= crop1.left (${crop1.left})", crop1.left <= person1Face.left + 1e-4f)
+        assertTrue("Person 1 face top (${person1Face.top}) must be >= crop1.top (${crop1.top})", crop1.top <= person1Face.top + 1e-4f)
+        assertTrue("Person 1 face right (${person1Face.right}) must be <= crop1.right (${crop1.right})", crop1.right >= person1Face.right - 1e-4f)
+        assertTrue("Person 1 face bottom (${person1Face.bottom}) must be <= crop1.bottom (${crop1.bottom})", crop1.bottom >= person1Face.bottom - 1e-4f)
+        // True pixel aspect ratio on the 1600x900 detection bitmap must match 350:450 (0.7778), NOT 1600:900 (1.78)
+        val crop1PixelAspect = (crop1.width() * srcW) / (crop1.height() * srcH)
+        assertEquals("Suggested crop on landscape source must respect target 350:450 pixel aspect ratio", targetRatio, crop1PixelAspect, 0.015f)
+        assertTrue("Person 1 crop must not include Person 2 on the right half", crop1.right < person2Face.left)
+
+        // Suggest crop for Person 2 (right side)
+        val crop2 = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = res.detectedFacesNorm,
+            selectedFaceIndex = 1,
+            detectionBitmapWidthPx = res.detectionBitmapWidthPx,
+            detectionBitmapHeightPx = res.detectionBitmapHeightPx,
+            targetAspectRatio = targetRatio
+        )
+        assertNotNull(crop2)
+        assertTrue(crop2!!.left >= 0f && crop2.top >= 0f && crop2.right <= 1f && crop2.bottom <= 1f)
+        assertTrue(crop2.left <= person2Face.left + 1e-4f)
+        assertTrue(crop2.top <= person2Face.top + 1e-4f)
+        assertTrue(crop2.right >= person2Face.right - 1e-4f)
+        assertTrue(crop2.bottom >= person2Face.bottom - 1e-4f)
+        val crop2PixelAspect = (crop2.width() * srcW) / (crop2.height() * srcH)
+        assertEquals("Suggested crop for Person 2 must respect target 350:450 pixel aspect ratio", targetRatio, crop2PixelAspect, 0.015f)
+        assertTrue("Person 2 crop must not include Person 1 on the left half", crop2.left > person1Face.right)
+    }
+
+    @Test
+    fun testPhotoStudioFix02PortraitSourceWithDifferentTargetAspectRatiosSquareAndSsc() = kotlinx.coroutines.runBlocking {
+        // Portrait source image (1080 x 1920, 9:16 aspect = 0.5625) with 1:1 Square (UPSC/PAN) and 200:230 (SSC) targets
+        val srcW = 1080
+        val srcH = 1920
+        val portraitBmp = createPortraitTestBitmap(srcW, srcH)
+
+        val faceA = android.graphics.RectF(0.24f, 0.18f, 0.62f, 0.38f)
+        val faceB = android.graphics.RectF(0.30f, 0.54f, 0.68f, 0.74f)
+        val twoFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(boundingBoxNorm = faceA),
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(boundingBoxNorm = faceB)
+            )
+        }
+
+        val squareRule = DocumentRule(
+            id = "fix02_upsc_square",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 100,
+            exactWidthPx = 500,
+            exactHeightPx = 500,
+            dpi = 300,
+            targetAspectRatio = 1.0f,
+            requiresWhiteBackground = false
+        )
+
+        val res = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = squareRule,
+            preDecodedBitmap = portraitBmp,
+            faceEngine = twoFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(res)
+        assertEquals(500, res!!.widthPx)
+        assertEquals(500, res.heightPx)
+        assertEquals(srcW, res.detectionBitmapWidthPx)
+        assertEquals(srcH, res.detectionBitmapHeightPx)
+
+        // 1. Target 1:1 Square preset on 1080x1920 portrait source
+        val squareCropA = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = res.detectedFacesNorm,
+            selectedFaceIndex = 0,
+            detectionBitmapWidthPx = res.detectionBitmapWidthPx,
+            detectionBitmapHeightPx = res.detectionBitmapHeightPx,
+            targetAspectRatio = 1.0f
+        )
+        assertNotNull(squareCropA)
+        val squarePixelAspect = (squareCropA!!.width() * srcW) / (squareCropA.height() * srcH)
+        assertEquals("1:1 square target on 1080x1920 portrait image must produce 1:1 pixel crop", 1.0f, squarePixelAspect, 0.015f)
+        assertTrue(squareCropA.left <= faceA.left + 1e-4f && squareCropA.right >= faceA.right - 1e-4f)
+        assertTrue(squareCropA.top <= faceA.top + 1e-4f && squareCropA.bottom >= faceA.bottom - 1e-4f)
+
+        // 2. Target 200:230 SSC preset (0.8696) on 1080x1920 portrait source for Person 2
+        val sscRatio = 200f / 230f
+        val sscCropB = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = res.detectedFacesNorm,
+            selectedFaceIndex = 1,
+            detectionBitmapWidthPx = res.detectionBitmapWidthPx,
+            detectionBitmapHeightPx = res.detectionBitmapHeightPx,
+            targetAspectRatio = sscRatio
+        )
+        assertNotNull(sscCropB)
+        val sscPixelAspect = (sscCropB!!.width() * srcW) / (sscCropB.height() * srcH)
+        assertEquals("200:230 SSC target on 1080x1920 portrait image must produce 200:230 pixel crop", sscRatio, sscPixelAspect, 0.015f)
+        assertTrue(sscCropB.left <= faceB.left + 1e-4f && sscCropB.right >= faceB.right - 1e-4f)
+        assertTrue(sscCropB.top <= faceB.top + 1e-4f && sscCropB.bottom >= faceB.bottom - 1e-4f)
+    }
+
+    @Test
+    fun testPhotoStudioFix02ImageDimensionsChangedByExifOrientationAndInPipelineRotation() = kotlinx.coroutines.runBlocking {
+        val passportRule = DocumentRule(
+            id = "fix02_rotation_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            allowedFormats = listOf(FileFormat.JPG),
+            minKb = 2,
+            maxKb = 100,
+            exactWidthPx = 350,
+            exactHeightPx = 450,
+            dpi = 300,
+            targetAspectRatio = 350f / 450f,
+            requiresWhiteBackground = false
+        )
+
+        // Part A: Raw 800x600 JPEG on disk with EXIF ORIENTATION_ROTATE_90 -> decoded to 600x800 upright bitmap
+        val exifFile = File(testDir, "exif_rotated_source.jpg")
+        val rawSensorBmp = createPortraitTestBitmap(800, 600)
+        java.io.FileOutputStream(exifFile).use { out ->
+            rawSensorBmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+        }
+        val exif = ExifInterface(exifFile.absolutePath)
+        exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_ROTATE_90.toString())
+        exif.saveAttributes()
+
+        val mediaInput = UnifiedMediaInput.fromCameraFile(
+            file = exifFile,
+            mode = CameraCaptureMode.PASSPORT_PHOTO,
+            rotationDegrees = 90
+        )
+        val decodedUpright = mediaInput.resolveBitmap(context)
+        assertNotNull(decodedUpright)
+        assertEquals("EXIF 90-degree rotation must swap width from 800 to 600", 600, decodedUpright!!.width)
+        assertEquals("EXIF 90-degree rotation must swap height from 600 to 800", 800, decodedUpright.height)
+
+        val twoFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine {
+            listOf(
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.14f, 0.22f, 0.42f, 0.50f)
+                ),
+                com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                    boundingBoxNorm = android.graphics.RectF(0.56f, 0.24f, 0.84f, 0.52f)
+                )
+            )
+        }
+
+        val exifRes = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = mediaInput,
+            rule = passportRule,
+            faceEngine = twoFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(exifRes)
+        assertEquals("Detection width must match post-EXIF upright width (600), not raw 800 or output 350", 600, exifRes!!.detectionBitmapWidthPx)
+        assertEquals("Detection height must match post-EXIF upright height (800), not raw 600 or output 450", 800, exifRes.detectionBitmapHeightPx)
+
+        // Part B: In-pipeline 90-degree rotation inside PortraitVisionProcessor.analyzeAndPreparePortrait
+        // Source bitmap is 960x540 (sideways). Face detector finds 0 faces at 0° (width=960, height=540),
+        // and finds 2 faces when rotated 90° (width=540, height=960).
+        val sidewaysBmp = createPortraitTestBitmap(960, 540)
+        val rotationAwareFaceEngine = com.example.processing.PortraitVisionProcessor.FaceDetectionEngine { candidateBmp ->
+            if (candidateBmp.height > candidateBmp.width) {
+                // Upright 540x960 coordinate space after 90° rotation
+                listOf(
+                    com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                        boundingBoxNorm = android.graphics.RectF(0.15f, 0.20f, 0.44f, 0.40f)
+                    ),
+                    com.example.processing.PortraitVisionProcessor.DetectedFaceInfo(
+                        boundingBoxNorm = android.graphics.RectF(0.54f, 0.52f, 0.84f, 0.72f)
+                    )
+                )
+            } else {
+                emptyList()
+            }
+        }
+
+        val rotatedRes = OneClickPreparationCoordinator.autoPreparePhoto(
+            context = context,
+            input = null,
+            rule = passportRule,
+            preDecodedBitmap = sidewaysBmp,
+            faceEngine = rotationAwareFaceEngine,
+            segmentationEngine = buildCleanSegmentationEngine()
+        )
+        assertNotNull(rotatedRes)
+        // Must record the rotated detection bitmap dimensions (540x960), NOT the unrotated sourceBitmap (960x540)!
+        assertEquals("Detection width must be 540 (rotated detection space), not 960 (unrotated source)", 540, rotatedRes!!.detectionBitmapWidthPx)
+        assertEquals("Detection height must be 960 (rotated detection space), not 540 (unrotated source)", 960, rotatedRes.detectionBitmapHeightPx)
+        assertEquals(90f, rotatedRes.detectionRotationDegrees, 0.01f)
+
+        val suggestedRotatedCrop = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = rotatedRes.detectedFacesNorm,
+            selectedFaceIndex = 1,
+            detectionBitmapWidthPx = rotatedRes.detectionBitmapWidthPx,
+            detectionBitmapHeightPx = rotatedRes.detectionBitmapHeightPx,
+            targetAspectRatio = 350f / 450f
+        )
+        assertNotNull(suggestedRotatedCrop)
+        val rotatedPixelAspect = (suggestedRotatedCrop!!.width() * 540f) / (suggestedRotatedCrop.height() * 960f)
+        assertEquals("Crop in rotated 540x960 space must have 350:450 pixel aspect ratio", 350f / 450f, rotatedPixelAspect, 0.015f)
+        assertTrue(suggestedRotatedCrop.left <= 0.54f + 1e-4f && suggestedRotatedCrop.right >= 0.84f - 1e-4f)
+        assertTrue(suggestedRotatedCrop.top <= 0.52f + 1e-4f && suggestedRotatedCrop.bottom >= 0.72f - 1e-4f)
+    }
+
+    @Test
+    fun testPhotoStudioFix02SelectingDifferentFacesInUiUpdatesSuggestedCropAndKeepsEdgeFacesInsideBounds() {
+        // 1. Verify boundary/edge faces remain inside the crop and within [0, 1] image bounds
+        val edgeFaces = listOf(
+            android.graphics.RectF(0.01f, 0.02f, 0.16f, 0.24f), // Top-left corner face
+            android.graphics.RectF(0.83f, 0.03f, 0.98f, 0.25f), // Top-right corner face
+            android.graphics.RectF(0.02f, 0.72f, 0.18f, 0.96f), // Bottom-left corner face
+            android.graphics.RectF(0.80f, 0.74f, 0.97f, 0.98f), // Bottom-right corner face
+            android.graphics.RectF(0.32f, 0.30f, 0.68f, 0.65f)  // Wide central face (576px wide within 700px max portrait crop)
+        )
+        for ((idx, faceRect) in edgeFaces.withIndex()) {
+            val crop = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+                detectedFacesNorm = edgeFaces,
+                selectedFaceIndex = idx,
+                detectionBitmapWidthPx = 1600,
+                detectionBitmapHeightPx = 900,
+                targetAspectRatio = 350f / 450f
+            )
+            assertNotNull("Edge face $idx must produce a valid crop", crop)
+            assertTrue("Edge face $idx crop must stay within [0, 1] bounds: $crop",
+                crop!!.left >= 0f && crop.top >= 0f && crop.right <= 1f && crop.bottom <= 1f
+            )
+            assertTrue("Edge face $idx must remain horizontally inside crop ($crop vs $faceRect)",
+                crop.left <= faceRect.left + 1e-4f && crop.right >= faceRect.right - 1e-4f
+            )
+            assertTrue("Edge face $idx must remain vertically inside crop ($crop vs $faceRect)",
+                crop.top <= faceRect.top + 1e-4f && crop.bottom >= faceRect.bottom - 1e-4f
+            )
+        }
+
+        // 2. Verify selecting Person 1 vs Person 2 in PhotoStudioScreen uses 1600x900 detection dimensions (NOT 350x450 output dimensions)
+        val dummyFile = createDummyProcessedFile("fix02_ui_landscape.jpg")
+        val landscapeBmp = createPortraitTestBitmap(1600, 900)
+        val face1 = android.graphics.RectF(0.16f, 0.24f, 0.28f, 0.52f)
+        val face2 = android.graphics.RectF(0.66f, 0.26f, 0.78f, 0.54f)
+
+        val multiFaceLandscapeResult = com.example.data.model.ProcessedFileResult(
+            ruleId = "fix02_ui_landscape_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = 25 * 1024L,
+            fileSizeKb = 25.0,
+            widthPx = 350,
+            heightPx = 450,
+            isCompliant = true,
+            validationMessages = listOf("Multiple faces detected (2)."),
+            status = com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false,
+            detectedFaceCount = 2,
+            detectedFacesNorm = listOf(face1, face2),
+            detectionBitmapWidthPx = 1600,
+            detectionBitmapHeightPx = 900,
+            appliedCropRectNorm = android.graphics.RectF(0.08f, 0.06f, 0.92f, 0.94f),
+            requiresManualCropConfirmation = true,
+            manualCropConfirmedByUser = false,
+            faceFramingVerified = false,
+            portraitFramingState = com.example.data.model.PortraitFramingState.MULTIPLE_FACES_DETECTED
+        )
+
+        val expectedCrop1 = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = listOf(face1, face2),
+            selectedFaceIndex = 0,
+            detectionBitmapWidthPx = 1600,
+            detectionBitmapHeightPx = 900,
+            targetAspectRatio = 350f / 450f
+        )!!
+        val expectedCrop2 = com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+            detectedFacesNorm = listOf(face1, face2),
+            selectedFaceIndex = 1,
+            detectionBitmapWidthPx = 1600,
+            detectionBitmapHeightPx = 900,
+            targetAspectRatio = 350f / 450f
+        )!!
+
+        composeTestRule.setContent {
+            com.example.ui.screens.PhotoStudioScreen(
+                initialSourceBitmap = landscapeBmp,
+                initialProcessedResult = multiFaceLandscapeResult
+            )
+        }
+
+        // Select Person 1 -> UI crop summary must match expectedCrop1 from 1600x900 space
+        composeTestRule.onNodeWithTag("select_detected_face_0").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        val expectedSummary1 = String.format(
+            java.util.Locale.US,
+            "Crop Region: Left %.0f%% • Top %.0f%% • Right %.0f%% • Bottom %.0f%%",
+            expectedCrop1.left * 100f,
+            expectedCrop1.top * 100f,
+            expectedCrop1.right * 100f,
+            expectedCrop1.bottom * 100f
+        )
+        composeTestRule.onNodeWithTag("portrait_crop_region_summary_text").assertTextContains(expectedSummary1)
+
+        // Select Person 2 -> UI crop summary must match expectedCrop2 from 1600x900 space
+        composeTestRule.onNodeWithTag("select_detected_face_1").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        val expectedSummary2 = String.format(
+            java.util.Locale.US,
+            "Crop Region: Left %.0f%% • Top %.0f%% • Right %.0f%% • Bottom %.0f%%",
+            expectedCrop2.left * 100f,
+            expectedCrop2.top * 100f,
+            expectedCrop2.right * 100f,
+            expectedCrop2.bottom * 100f
+        )
+        composeTestRule.onNodeWithTag("portrait_crop_region_summary_text").assertTextContains(expectedSummary2)
+    }
+
+    @Test
+    fun testPhotoStudioFix02MissingDetectionDimensionMetadataDoesNotProduceMisleadingAutoCropAndKeepsManualControls() {
+        val faces = listOf(
+            android.graphics.RectF(0.16f, 0.24f, 0.28f, 0.52f),
+            android.graphics.RectF(0.66f, 0.26f, 0.78f, 0.54f)
+        )
+
+        // 1. Helper must return null when detection dimensions are missing/0 (never fall back to output dims)
+        assertNull(
+            "computeSuggestedCropForSelectedFace must return null when detectionBitmapWidthPx is 0",
+            com.example.processing.PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+                detectedFacesNorm = faces,
+                selectedFaceIndex = 0,
+                detectionBitmapWidthPx = 0,
+                detectionBitmapHeightPx = 0,
+                targetAspectRatio = 350f / 450f
+            )
+        )
+
+        // 2. UI must not overwrite manual crop with a misleading output-dimension crop when detectionBitmapWidthPx == 0
+        val dummyFile = createDummyProcessedFile("fix02_missing_dims.jpg")
+        val sampleBmp = createPortraitTestBitmap(1600, 900)
+        val resultWithoutDetectionDims = com.example.data.model.ProcessedFileResult(
+            ruleId = "fix02_missing_dims_rule",
+            documentType = DocumentType.PASSPORT_PHOTO,
+            originalFileName = dummyFile.name,
+            processedFilePath = dummyFile.absolutePath,
+            fileFormat = FileFormat.JPG,
+            fileSizeBytes = 25 * 1024L,
+            fileSizeKb = 25.0,
+            widthPx = 350,
+            heightPx = 450,
+            isCompliant = true,
+            validationMessages = listOf("Multiple faces detected (2)."),
+            status = com.example.data.model.PreparationStatus.FACE_FRAMING_CONFIRMATION_REQUIRED,
+            dpi = 300,
+            requiresWhiteBackground = true,
+            technicalBackgroundCompliant = true,
+            outputBackgroundPixelChecksPassed = true,
+            backgroundReplacementApplied = true,
+            requiresUserPreviewApproval = true,
+            userPreviewAccepted = false,
+            detectedFaceCount = 2,
+            detectedFacesNorm = faces,
+            detectionBitmapWidthPx = 0,
+            detectionBitmapHeightPx = 0,
+            appliedCropRectNorm = android.graphics.RectF(0.12f, 0.10f, 0.88f, 0.90f),
+            requiresManualCropConfirmation = true,
+            manualCropConfirmedByUser = false,
+            faceFramingVerified = false,
+            portraitFramingState = com.example.data.model.PortraitFramingState.MULTIPLE_FACES_DETECTED
+        )
+
+        composeTestRule.setContent {
+            com.example.ui.screens.PhotoStudioScreen(
+                initialSourceBitmap = sampleBmp,
+                initialProcessedResult = resultWithoutDetectionDims
+            )
+        }
+
+        // Initial crop region is 12%, 10%, 88%, 90%
+        composeTestRule.onNodeWithTag("portrait_crop_region_summary_text")
+            .assertTextContains("Crop Region: Left 12% • Top 10% • Right 88% • Bottom 90%")
+
+        // Clicking Person 2 when detection dimensions are missing must NOT overwrite the crop with a 350x450-derived crop
+        composeTestRule.onNodeWithTag("select_detected_face_1").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("portrait_missing_detection_dims_notice").assertExists()
+        composeTestRule.onNodeWithTag("portrait_crop_region_summary_text")
+            .assertTextContains("Crop Region: Left 12% • Top 10% • Right 88% • Bottom 90%")
+
+        // Manual crop controls (presets and sliders) must remain functional
+        composeTestRule.onNodeWithTag("portrait_crop_preset_tight_btn").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("portrait_crop_region_summary_text")
+            .assertTextContains("Crop Region: Left 18% • Top 10% • Right 82% • Bottom 88%")
+    }
 }
+
 
 
 

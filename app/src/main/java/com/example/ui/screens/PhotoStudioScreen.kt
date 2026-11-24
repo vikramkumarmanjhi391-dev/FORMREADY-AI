@@ -1649,19 +1649,26 @@ fun PortraitManualFramingCard(
 ) {
     val initialRect = result.appliedCropRectNorm ?: RectF(0.08f, 0.06f, 0.92f, 0.94f)
     var cropLeft by remember(result.processedFilePath) {
-        mutableStateOf(initialRect.left.coerceIn(0f, 0.80f))
+        mutableStateOf(initialRect.left.coerceIn(0f, 0.90f))
     }
     var cropTop by remember(result.processedFilePath) {
-        mutableStateOf(initialRect.top.coerceIn(0f, 0.80f))
+        mutableStateOf(initialRect.top.coerceIn(0f, 0.90f))
     }
     var cropRight by remember(result.processedFilePath) {
-        mutableStateOf(initialRect.right.coerceIn((cropLeft + 0.15f).coerceAtMost(1f), 1f))
+        mutableStateOf(initialRect.right.coerceIn((cropLeft + 0.10f).coerceAtMost(1f), 1f))
     }
     var cropBottom by remember(result.processedFilePath) {
-        mutableStateOf(initialRect.bottom.coerceIn((cropTop + 0.15f).coerceAtMost(1f), 1f))
+        mutableStateOf(initialRect.bottom.coerceIn((cropTop + 0.10f).coerceAtMost(1f), 1f))
     }
     var chosenFaceIndex by remember(result.processedFilePath, initialSelectedFaceIndex) {
         mutableStateOf(initialSelectedFaceIndex ?: result.selectedFaceIndex)
+    }
+    var missingDetectionDimsNotice by remember(
+        result.processedFilePath,
+        result.detectionBitmapWidthPx,
+        result.detectionBitmapHeightPx
+    ) {
+        mutableStateOf(false)
     }
 
     val headerTitle = when (result.portraitFramingState) {
@@ -1727,26 +1734,31 @@ fun PortraitManualFramingCard(
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(6.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(result.detectedFacesNorm.indices.toList()) { idx ->
-                        val faceBox = result.detectedFacesNorm[idx]
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    for (idx in result.detectedFacesNorm.indices) {
                         FilterChip(
                             selected = chosenFaceIndex == idx,
                             onClick = {
                                 chosenFaceIndex = idx
-                                val faceInfo = PortraitVisionProcessor.DetectedFaceInfo(
-                                    boundingBoxNorm = RectF(faceBox)
-                                )
-                                val suggested = PortraitVisionProcessor.computePortraitCropRectFromFace(
-                                    face = faceInfo,
-                                    imageWidth = result.widthPx.coerceAtLeast(350),
-                                    imageHeight = result.heightPx.coerceAtLeast(450),
+                                val suggested = PortraitVisionProcessor.computeSuggestedCropForSelectedFace(
+                                    detectedFacesNorm = result.detectedFacesNorm,
+                                    selectedFaceIndex = idx,
+                                    detectionBitmapWidthPx = result.detectionBitmapWidthPx,
+                                    detectionBitmapHeightPx = result.detectionBitmapHeightPx,
                                     targetAspectRatio = targetAspectRatio.coerceIn(0.5f, 1.5f)
                                 )
-                                cropLeft = suggested.left.coerceIn(0f, 0.80f)
-                                cropTop = suggested.top.coerceIn(0f, 0.80f)
-                                cropRight = suggested.right.coerceIn((cropLeft + 0.15f).coerceAtMost(1f), 1f)
-                                cropBottom = suggested.bottom.coerceIn((cropTop + 0.15f).coerceAtMost(1f), 1f)
+                                if (suggested != null) {
+                                    cropLeft = suggested.left.coerceIn(0f, 0.90f)
+                                    cropTop = suggested.top.coerceIn(0f, 0.90f)
+                                    cropRight = suggested.right.coerceIn((cropLeft + 0.10f).coerceAtMost(1f), 1f)
+                                    cropBottom = suggested.bottom.coerceIn((cropTop + 0.10f).coerceAtMost(1f), 1f)
+                                    missingDetectionDimsNotice = false
+                                } else {
+                                    missingDetectionDimsNotice = true
+                                }
                             },
                             label = {
                                 Text(
@@ -1758,6 +1770,16 @@ fun PortraitManualFramingCard(
                             modifier = Modifier.testTag("select_detected_face_$idx")
                         )
                     }
+                }
+                if (missingDetectionDimsNotice) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Detection image dimensions unavailable for automatic face crop; adjust manual framing sliders below.",
+                        fontSize = 11.sp,
+                        color = SaffronSecondary,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.testTag("portrait_missing_detection_dims_notice")
+                    )
                 }
             }
 
@@ -1772,7 +1794,8 @@ fun PortraitManualFramingCard(
                     cropBottom * 100f
                 ),
                 fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.testTag("portrait_crop_region_summary_text")
             )
 
             Spacer(modifier = Modifier.height(6.dp))
@@ -1824,9 +1847,9 @@ fun PortraitManualFramingCard(
                 Slider(
                     value = cropLeft,
                     onValueChange = { v ->
-                        cropLeft = v.coerceIn(0f, (cropRight - 0.15f).coerceAtLeast(0f))
+                        cropLeft = v.coerceIn(0f, (cropRight - 0.10f).coerceAtLeast(0f))
                     },
-                    valueRange = 0f..0.80f,
+                    valueRange = 0f..0.90f,
                     modifier = Modifier.weight(1f).testTag("portrait_crop_left_slider")
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -1834,9 +1857,9 @@ fun PortraitManualFramingCard(
                 Slider(
                     value = cropRight,
                     onValueChange = { v ->
-                        cropRight = v.coerceIn((cropLeft + 0.15f).coerceAtMost(1f), 1f)
+                        cropRight = v.coerceIn((cropLeft + 0.10f).coerceAtMost(1f), 1f)
                     },
-                    valueRange = 0.20f..1f,
+                    valueRange = 0.10f..1f,
                     modifier = Modifier.weight(1f).testTag("portrait_crop_right_slider")
                 )
             }
@@ -1846,9 +1869,9 @@ fun PortraitManualFramingCard(
                 Slider(
                     value = cropTop,
                     onValueChange = { v ->
-                        cropTop = v.coerceIn(0f, (cropBottom - 0.15f).coerceAtLeast(0f))
+                        cropTop = v.coerceIn(0f, (cropBottom - 0.10f).coerceAtLeast(0f))
                     },
-                    valueRange = 0f..0.80f,
+                    valueRange = 0f..0.90f,
                     modifier = Modifier.weight(1f).testTag("portrait_crop_top_slider")
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -1856,9 +1879,9 @@ fun PortraitManualFramingCard(
                 Slider(
                     value = cropBottom,
                     onValueChange = { v ->
-                        cropBottom = v.coerceIn((cropTop + 0.15f).coerceAtMost(1f), 1f)
+                        cropBottom = v.coerceIn((cropTop + 0.10f).coerceAtMost(1f), 1f)
                     },
-                    valueRange = 0.20f..1f,
+                    valueRange = 0.10f..1f,
                     modifier = Modifier.weight(1f).testTag("portrait_crop_bottom_slider")
                 )
             }

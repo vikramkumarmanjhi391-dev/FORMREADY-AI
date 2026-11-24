@@ -110,10 +110,23 @@ object ImageProcessor {
                     decodedBitmap.width, decodedBitmap.height,
                     rotationMatrix, true
                 )
-                if (rotated != decodedBitmap) {
+                val safeRotated = try {
+                    if (rotated.width > 0 && rotated.height > 0) {
+                        rotated.getPixel(0, 0)
+                    }
+                    rotated
+                } catch (_: NullPointerException) {
+                    val w = rotated.width.coerceAtLeast(1)
+                    val h = rotated.height.coerceAtLeast(1)
+                    if (rotated !== decodedBitmap && !rotated.isRecycled) rotated.recycle()
+                    Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                        eraseColor(Color.WHITE)
+                    }
+                }
+                if (safeRotated != decodedBitmap && !decodedBitmap.isRecycled) {
                     decodedBitmap.recycle()
                 }
-                rotated
+                safeRotated
             } else {
                 decodedBitmap
             }
@@ -226,6 +239,9 @@ object ImageProcessor {
         signatureExtractionResult: SignatureVisionProcessor.SignatureExtractionResult? = null,
         detectedFaceCount: Int = 0,
         detectedFacesNorm: List<RectF> = emptyList(),
+        detectionBitmapWidthPx: Int = 0,
+        detectionBitmapHeightPx: Int = 0,
+        detectionRotationDegrees: Float = 0f,
         selectedFaceIndex: Int? = null,
         appliedCropRectNorm: RectF? = null,
         requiresManualCropConfirmation: Boolean = false,
@@ -731,6 +747,9 @@ object ImageProcessor {
             signatureEvidence = signatureEvidence,
             detectedFaceCount = if (isSignatureOrThumbRule) 0 else detectedFaceCount,
             detectedFacesNorm = if (isSignatureOrThumbRule) emptyList() else detectedFacesNorm.map { RectF(it) },
+            detectionBitmapWidthPx = if (isSignatureOrThumbRule) 0 else detectionBitmapWidthPx,
+            detectionBitmapHeightPx = if (isSignatureOrThumbRule) 0 else detectionBitmapHeightPx,
+            detectionRotationDegrees = if (isSignatureOrThumbRule) 0f else detectionRotationDegrees,
             selectedFaceIndex = if (isSignatureOrThumbRule) null else selectedFaceIndex,
             appliedCropRectNorm = if (isSignatureOrThumbRule) null else appliedCropRectNorm?.let { RectF(it) },
             requiresManualCropConfirmation = if (isSignatureOrThumbRule) false else requiresManualCropConfirmation,

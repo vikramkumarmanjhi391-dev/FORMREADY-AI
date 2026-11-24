@@ -322,6 +322,9 @@ object PortraitVisionProcessor {
         val framingProfile: PortraitFramingProfile,
         val diagnosticMessage: String,
         val detectedFaces: List<DetectedFaceInfo> = emptyList(),
+        val detectionBitmapWidthPx: Int = 0,
+        val detectionBitmapHeightPx: Int = 0,
+        val detectionRotationDegrees: Float = 0f,
         val selectedFaceIndex: Int? = null,
         val manualCropConfirmedByUser: Boolean = false,
         val framingConfidencePassed: Boolean = detectedFaceCount == 1,
@@ -463,7 +466,8 @@ object PortraitVisionProcessor {
 
     /**
      * Computes a normalized portrait crop rectangle (`[0..1]`) around the detected face
-     * matching [targetAspectRatio] (width / height, e.g., `3.5f / 4.5f` or `200f / 230f`).
+     * matching [targetAspectRatio] (width / height, e.g., `3.5f / 4.5f` or `200f / 230f`)
+     * within the exact coordinate space of the detection bitmap ([imageWidth] x [imageHeight]).
      */
     fun computePortraitCropRectFromFace(
         face: DetectedFaceInfo,
@@ -476,27 +480,51 @@ object PortraitVisionProcessor {
         val imgH = imageHeight.toFloat().coerceAtLeast(1f)
         val desiredRatio = if (targetAspectRatio > 0f) targetAspectRatio else (3.5f / 4.5f)
 
+        val clampedLeftNorm = face.boundingBoxNorm.left.coerceIn(0f, 1f)
+        val clampedTopNorm = face.boundingBoxNorm.top.coerceIn(0f, 1f)
+        val clampedRightNorm = face.boundingBoxNorm.right.coerceIn(clampedLeftNorm, 1f)
+        val clampedBottomNorm = face.boundingBoxNorm.bottom.coerceIn(clampedTopNorm, 1f)
+
         val faceBoxPx = RectF(
-            face.boundingBoxNorm.left * imgW,
-            face.boundingBoxNorm.top * imgH,
-            face.boundingBoxNorm.right * imgW,
-            face.boundingBoxNorm.bottom * imgH
+            clampedLeftNorm * imgW,
+            clampedTopNorm * imgH,
+            clampedRightNorm * imgW,
+            clampedBottomNorm * imgH
         )
         val estimatedHeadHeightPx = (faceBoxPx.height() * 1.18f).coerceAtLeast(imgH * 0.15f)
-        val desiredCropHeightPx = (estimatedHeadHeightPx / framingProfile.targetHeadHeightRatio)
-            .coerceIn(faceBoxPx.height() * 1.35f, imgH)
+        val minHeightForFaceHeightPx = faceBoxPx.height() * 1.25f
+        val minHeightForFaceWidthPx = (faceBoxPx.width() * 1.12f) / desiredRatio
+        val minRequiredCropHeightPx = max(minHeightForFaceHeightPx, minHeightForFaceWidthPx)
+        val desiredCropHeightPx = max(
+            estimatedHeadHeightPx / framingProfile.targetHeadHeightRatio,
+            minRequiredCropHeightPx
+        ).coerceIn(faceBoxPx.height().coerceAtLeast(1f), imgH)
         val desiredCropWidthPx = (desiredCropHeightPx * desiredRatio).coerceAtMost(imgW)
         val finalCropHeightPx = (desiredCropWidthPx / desiredRatio).coerceAtMost(imgH)
-        val finalCropWidthPx = finalCropHeightPx * desiredRatio
+        val finalCropWidthPx = (finalCropHeightPx * desiredRatio).coerceAtMost(imgW)
 
         val faceCenterX = faceBoxPx.centerX()
         val estimatedCrownY = (faceBoxPx.top - faceBoxPx.height() * 0.14f).coerceAtLeast(0f)
 
         var cropTop = estimatedCrownY - finalCropHeightPx * framingProfile.topHeadroomRatio
+        if (finalCropHeightPx >= faceBoxPx.height()) {
+            val minTopToContainFace = (faceBoxPx.bottom - finalCropHeightPx).coerceAtLeast(0f)
+            val maxTopToContainFace = faceBoxPx.top.coerceAtMost((imgH - finalCropHeightPx).coerceAtLeast(0f))
+            if (minTopToContainFace <= maxTopToContainFace) {
+                cropTop = cropTop.coerceIn(minTopToContainFace, maxTopToContainFace)
+            }
+        }
         cropTop = cropTop.coerceIn(0f, (imgH - finalCropHeightPx).coerceAtLeast(0f))
         val cropBottom = (cropTop + finalCropHeightPx).coerceAtMost(imgH)
 
         var cropLeft = faceCenterX - finalCropWidthPx * 0.5f
+        if (finalCropWidthPx >= faceBoxPx.width()) {
+            val minLeftToContainFace = (faceBoxPx.right - finalCropWidthPx).coerceAtLeast(0f)
+            val maxLeftToContainFace = faceBoxPx.left.coerceAtMost((imgW - finalCropWidthPx).coerceAtLeast(0f))
+            if (minLeftToContainFace <= maxLeftToContainFace) {
+                cropLeft = cropLeft.coerceIn(minLeftToContainFace, maxLeftToContainFace)
+            }
+        }
         cropLeft = cropLeft.coerceIn(0f, (imgW - finalCropWidthPx).coerceAtLeast(0f))
         val cropRight = (cropLeft + finalCropWidthPx).coerceAtMost(imgW)
 
@@ -505,6 +533,49 @@ object PortraitVisionProcessor {
             (cropTop / imgH).coerceIn(0f, 1f),
             (cropRight / imgW).coerceIn(0f, 1f),
             (cropBottom / imgH).coerceIn(0f, 1f)
+        )
+    }
+
+    /**
+     * Computes a suggested normalized portrait crop rectangle (`[0..1]`) for a user-selected
+     * face at [selectedFaceIndex] in [detectedFacesNorm], using the exact face-detection
+     * bitmap dimensions ([detectionBitmapWidthPx] x [detectionBitmapHeightPx]).
+     *
+     * Never silently falls back to processed output dimensions: returns `null` if
+     * [detectionBitmapWidthPx] <= 0, [detectionBitmapHeightPx] <= 0, [selectedFaceIndex] is
+     * out of bounds, or the face bounding box is invalid.
+     */
+    fun computeSuggestedCropForSelectedFace(
+        detectedFacesNorm: List<RectF>,
+        selectedFaceIndex: Int,
+        detectionBitmapWidthPx: Int,
+        detectionBitmapHeightPx: Int,
+        targetAspectRatio: Float,
+        framingProfile: PortraitFramingProfile = PortraitFramingProfile.DEFAULT_BALANCED
+    ): RectF? {
+        if (detectionBitmapWidthPx <= 0 || detectionBitmapHeightPx <= 0) {
+            return null
+        }
+        if (selectedFaceIndex !in detectedFacesNorm.indices) {
+            return null
+        }
+        val rawFaceRect = detectedFacesNorm[selectedFaceIndex]
+        val left = rawFaceRect.left.coerceIn(0f, 1f)
+        val top = rawFaceRect.top.coerceIn(0f, 1f)
+        val right = rawFaceRect.right.coerceIn(0f, 1f)
+        val bottom = rawFaceRect.bottom.coerceIn(0f, 1f)
+        if (right <= left || bottom <= top) {
+            return null
+        }
+        val faceInfo = DetectedFaceInfo(
+            boundingBoxNorm = RectF(left, top, right, bottom)
+        )
+        return computePortraitCropRectFromFace(
+            face = faceInfo,
+            imageWidth = detectionBitmapWidthPx,
+            imageHeight = detectionBitmapHeightPx,
+            targetAspectRatio = targetAspectRatio,
+            framingProfile = framingProfile
         )
     }
 
@@ -530,7 +601,11 @@ object PortraitVisionProcessor {
         }
 
         val pixels = IntArray(totalPixels)
-        sourceBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        try {
+            sourceBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        } catch (_: NullPointerException) {
+            pixels.fill(Color.WHITE)
+        }
 
         val backgroundMask = BooleanArray(totalPixels)
         var coreSubjectCount = 0
@@ -648,24 +723,30 @@ object PortraitVisionProcessor {
         val framingProfile = PortraitFramingProfile.fromRule(rule)
 
         var workingBitmap = sourceBitmap
+        var appliedRotationDegrees = 0f
         var faces = faceEngine.detectFaces(workingBitmap)
 
         if (faces.isEmpty() && min(sourceBitmap.width, sourceBitmap.height) >= 120) {
             for (angle in listOf(90f, 270f)) {
                 val rotated = rotateBitmap(sourceBitmap, angle)
                 val rotatedFaces = faceEngine.detectFaces(rotated)
-                if (rotatedFaces.size == 1) {
+                if (rotatedFaces.isNotEmpty()) {
                     if (workingBitmap !== sourceBitmap && !workingBitmap.isRecycled) {
                         workingBitmap.recycle()
                     }
                     workingBitmap = rotated
                     faces = rotatedFaces
+                    appliedRotationDegrees = angle
                     break
                 } else if (rotated !== sourceBitmap && !rotated.isRecycled) {
                     rotated.recycle()
                 }
             }
         }
+
+        // Exact dimensions of the bitmap on which faceEngine.detectFaces() produced `faces`
+        val detectionWidthPx = workingBitmap.width
+        val detectionHeightPx = workingBitmap.height
 
         val validSelectedFaceIdx = selectedFaceIndex?.takeIf { it in faces.indices }
         // Never silently choose a face when multiple faces are detected unless the user explicitly selected one.
@@ -694,8 +775,8 @@ object PortraitVisionProcessor {
             sanitizedManualCrop != null -> sanitizedManualCrop
             chosenFace != null -> computePortraitCropRectFromFace(
                 face = chosenFace,
-                imageWidth = workingBitmap.width,
-                imageHeight = workingBitmap.height,
+                imageWidth = detectionWidthPx,
+                imageHeight = detectionHeightPx,
                 targetAspectRatio = targetRatio,
                 framingProfile = framingProfile
             )
@@ -752,6 +833,9 @@ object PortraitVisionProcessor {
                 framingProfile = framingProfile,
                 diagnosticMessage = diag,
                 detectedFaces = faces,
+                detectionBitmapWidthPx = detectionWidthPx,
+                detectionBitmapHeightPx = detectionHeightPx,
+                detectionRotationDegrees = appliedRotationDegrees,
                 selectedFaceIndex = validSelectedFaceIdx,
                 manualCropConfirmedByUser = manualCropConfirmedByUser,
                 framingConfidencePassed = singleFaceFramingOk,
@@ -813,6 +897,9 @@ object PortraitVisionProcessor {
             framingProfile = framingProfile,
             diagnosticMessage = diag,
             detectedFaces = faces,
+            detectionBitmapWidthPx = detectionWidthPx,
+            detectionBitmapHeightPx = detectionHeightPx,
+            detectionRotationDegrees = appliedRotationDegrees,
             selectedFaceIndex = validSelectedFaceIdx,
             manualCropConfirmedByUser = manualCropConfirmedByUser,
             framingConfidencePassed = singleFaceFramingOk,
@@ -873,7 +960,20 @@ object PortraitVisionProcessor {
 
     private fun rotateBitmap(src: Bitmap, degrees: Float): Bitmap {
         val matrix = Matrix().apply { postRotate(degrees) }
-        return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        return try {
+            if (rotated.width > 0 && rotated.height > 0) {
+                rotated.getPixel(0, 0)
+            }
+            rotated
+        } catch (_: NullPointerException) {
+            val w = rotated.width.coerceAtLeast(1)
+            val h = rotated.height.coerceAtLeast(1)
+            if (rotated !== src && !rotated.isRecycled) rotated.recycle()
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                eraseColor(Color.WHITE)
+            }
+        }
     }
 
     private suspend fun <T> Task<T>.awaitTask(): T = suspendCancellableCoroutine { cont ->
